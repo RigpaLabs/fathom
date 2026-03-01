@@ -19,6 +19,6 @@ USER appuser
 ENV RUST_LOG=fathom=info
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
-    CMD find /app/data/metadata/status.json -mmin -3 2>/dev/null | grep -q . || exit 1
+    CMD find /app/data -name status.json -mmin -3 2>/dev/null | grep -q . || exit 1
 
 ENTRYPOINT ["fathom"]
