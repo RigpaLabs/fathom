@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.data_dir.clone(),
         raw_rx,
         RAW_FLUSH_INTERVAL_S,
+        cfg.raw_rotate_hours,
     ));
     let snap_handle = tokio::spawn(run_snap_writer(cfg.data_dir.clone(), snap_rx));
     let mon_handle = tokio::spawn(monitor::run_monitor(

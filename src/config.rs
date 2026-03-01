@@ -30,7 +30,15 @@ pub struct ConnectionConfig {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
+    /// How often to rotate raw parquet files, in hours.  Must divide 24 evenly.
+    /// Default: 1.
+    #[serde(default = "default_raw_rotate_hours")]
+    pub raw_rotate_hours: u32,
     pub connections: Vec<ConnectionConfig>,
+}
+
+fn default_raw_rotate_hours() -> u32 {
+    1
 }
 
 impl Config {

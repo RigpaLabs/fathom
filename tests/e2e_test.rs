@@ -190,7 +190,7 @@ async fn test_e2e_reconnect_after_ws_close() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();
@@ -286,7 +286,7 @@ async fn test_e2e_multi_symbol_single_connection() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();
@@ -364,7 +364,7 @@ async fn test_e2e_snapshot_http_error_then_retry() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();
@@ -457,7 +457,7 @@ async fn test_e2e_gap_triggers_reconnect() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();
@@ -578,7 +578,7 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();
@@ -668,7 +668,7 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();
@@ -761,7 +761,7 @@ async fn test_e2e_snap_parquet_created() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();

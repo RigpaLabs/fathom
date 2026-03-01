@@ -120,6 +120,41 @@ depth_ms = 100
 }
 
 #[test]
+fn test_raw_rotate_hours_default() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+
+[[connections]]
+name     = "spot"
+exchange = "binance_spot"
+symbols  = ["ETHUSDT"]
+depth_ms = 100
+"#,
+    );
+    let cfg = Config::load(f.path().to_str().unwrap()).unwrap();
+    assert_eq!(cfg.raw_rotate_hours, 1, "default should be 1 hour");
+}
+
+#[test]
+fn test_raw_rotate_hours_explicit() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+raw_rotate_hours = 6
+
+[[connections]]
+name     = "spot"
+exchange = "binance_spot"
+symbols  = ["ETHUSDT"]
+depth_ms = 100
+"#,
+    );
+    let cfg = Config::load(f.path().to_str().unwrap()).unwrap();
+    assert_eq!(cfg.raw_rotate_hours, 6);
+}
+
+#[test]
 fn test_load_missing_file() {
     let result = Config::load("/tmp/this_file_definitely_does_not_exist_fathom.toml");
     assert!(result.is_err());

@@ -6,8 +6,13 @@ use std::path::PathBuf;
 
 use fathom::{
     accumulator::Snapshot1s,
-    writer::{raw::RawDiff, raw::run_raw_writer, snap_1s::run_snap_writer},
+    writer::{
+        raw::RawDiff,
+        raw::{bucket_open, run_raw_writer},
+        snap_1s::run_snap_writer,
+    },
 };
+use chrono::Timelike;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -22,7 +27,7 @@ async fn test_raw_writer_creates_file() {
     let (tx, rx) = mpsc::channel::<RawDiff>(64);
 
     // Spawn writer with very short flush interval (1s for test)
-    let writer = tokio::spawn(run_raw_writer(data_dir.clone(), rx, 1));
+    let writer = tokio::spawn(run_raw_writer(data_dir.clone(), rx, 1, 1));
 
     // Send 5 events
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -76,7 +81,7 @@ async fn test_raw_writer_creates_file() {
 async fn test_raw_writer_multiple_symbols() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = mpsc::channel::<RawDiff>(64);
-    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1));
+    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
 
     let now_us = chrono::Utc::now().timestamp_micros();
     for sym in &["ETHUSDT", "BTCUSDT"] {
@@ -109,7 +114,7 @@ async fn test_raw_writer_multiple_symbols() {
 async fn test_raw_writer_empty_channel() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = mpsc::channel::<RawDiff>(64);
-    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1));
+    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
 
     // Close immediately without sending anything
     drop(tx);
@@ -250,6 +255,132 @@ async fn test_snap_writer_multiple_symbols() {
         files.len() >= 3,
         "separate file per symbol: got {} files",
         files.len()
+    );
+}
+
+// ── bucket_open / rotation tests ─────────────────────────────────────────────
+
+#[test]
+fn test_bucket_open_1h() {
+    // Every hour is its own bucket
+    for h in 0..24 {
+        assert_eq!(bucket_open(h, 1), h);
+    }
+}
+
+#[test]
+fn test_bucket_open_6h() {
+    assert_eq!(bucket_open(0, 6), 0);
+    assert_eq!(bucket_open(5, 6), 0);
+    assert_eq!(bucket_open(6, 6), 6);
+    assert_eq!(bucket_open(11, 6), 6);
+    assert_eq!(bucket_open(12, 6), 12);
+    assert_eq!(bucket_open(17, 6), 12);
+    assert_eq!(bucket_open(18, 6), 18);
+    assert_eq!(bucket_open(23, 6), 18);
+}
+
+#[test]
+fn test_bucket_open_all_valid_intervals() {
+    let valid: &[u32] = &[1, 2, 3, 4, 6, 8, 12, 24];
+    for &interval in valid {
+        for h in 0..24 {
+            let bucket = bucket_open(h, interval);
+            assert!(bucket <= h, "bucket {bucket} > hour {h} for interval {interval}");
+            assert_eq!(bucket % interval, 0, "bucket {bucket} not aligned to interval {interval}");
+            // Next bucket boundary is > current hour (no missed rotation)
+            assert!(bucket + interval > h, "hour {h} past bucket end for interval {interval}");
+        }
+    }
+}
+
+#[test]
+fn test_bucket_open_rotation_triggers_at_boundary() {
+    // Simulate hour-by-hour: rotation happens when bucket changes
+    for interval in [1, 2, 3, 4, 6, 8, 12, 24] {
+        let mut rotations = 0;
+        let mut prev_bucket = bucket_open(0, interval);
+        for h in 1..24 {
+            let cur = bucket_open(h, interval);
+            if cur != prev_bucket {
+                rotations += 1;
+                prev_bucket = cur;
+            }
+        }
+        let expected_rotations = (24 / interval) - 1; // first bucket doesn't rotate
+        assert_eq!(
+            rotations, expected_rotations,
+            "interval={interval}: expected {expected_rotations} rotations, got {rotations}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_raw_writer_rotate_hours_1_creates_correct_bucket_file() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = mpsc::channel::<RawDiff>(64);
+    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
+
+    let now = chrono::Utc::now();
+    let now_us = now.timestamp_micros();
+    tx.send(RawDiff {
+        timestamp_us: now_us,
+        exchange: "binance_spot".to_string(),
+        symbol: "ETHUSDT".to_string(),
+        seq_id: 100,
+        prev_seq_id: 99,
+        bids: vec![(3000.0, 1.0)],
+        asks: vec![(3001.0, 1.0)],
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    writer.await.unwrap();
+
+    // With rotate_hours=1, the bucket open_hhmm should be the current hour
+    let expected_prefix = format!("depth_{:02}00_", now.hour());
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(files.len(), 1);
+    let filename = files[0].file_name().unwrap().to_str().unwrap();
+    assert!(
+        filename.starts_with(&expected_prefix),
+        "expected file starting with {expected_prefix}, got {filename}"
+    );
+}
+
+#[tokio::test]
+async fn test_raw_writer_rotate_hours_6_creates_correct_bucket_file() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = mpsc::channel::<RawDiff>(64);
+    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 6));
+
+    let now = chrono::Utc::now();
+    let now_us = now.timestamp_micros();
+    tx.send(RawDiff {
+        timestamp_us: now_us,
+        exchange: "binance_spot".to_string(),
+        symbol: "ETHUSDT".to_string(),
+        seq_id: 100,
+        prev_seq_id: 99,
+        bids: vec![(3000.0, 1.0)],
+        asks: vec![(3001.0, 1.0)],
+    })
+    .await
+    .unwrap();
+
+    drop(tx);
+    writer.await.unwrap();
+
+    // With rotate_hours=6, bucket aligns to 0/6/12/18
+    let bucket = (now.hour() / 6) * 6;
+    let expected_prefix = format!("depth_{:02}00_", bucket);
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(files.len(), 1);
+    let filename = files[0].file_name().unwrap().to_str().unwrap();
+    assert!(
+        filename.starts_with(&expected_prefix),
+        "expected file starting with {expected_prefix}, got {filename}"
     );
 }
 

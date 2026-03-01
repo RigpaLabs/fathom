@@ -211,7 +211,7 @@ async fn test_integration_binance_spot_pipeline() {
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(64);
 
     // flush_interval_s=60: writers buffer in memory, flush on channel close
-    let raw_writer = tokio::spawn(run_raw_writer(data_dir.clone(), raw_rx, 60));
+    let raw_writer = tokio::spawn(run_raw_writer(data_dir.clone(), raw_rx, 60, 1));
     let snap_writer = tokio::spawn(run_snap_writer(data_dir.clone(), snap_rx));
 
     // ── Connection task with mock URL overrides ───────────────────────────────
@@ -326,7 +326,7 @@ async fn test_integration_monitor_state_updated() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(64);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(64);
-    let _raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let _raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let _snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let conn = ConnectionConfig {

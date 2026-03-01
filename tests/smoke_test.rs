@@ -108,7 +108,7 @@ async fn live_spot_ethusdt_pipeline() {
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(1_024);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(1_024);
 
-    let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();
@@ -181,7 +181,7 @@ async fn live_spot_multi_symbol() {
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(1_024);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(1_024);
 
-    let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();
@@ -252,7 +252,7 @@ async fn live_perp_ethusdt_pipeline() {
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(1_024);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(1_024);
 
-    let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
 
     let state = monitor::new_state();

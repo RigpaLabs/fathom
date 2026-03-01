@@ -42,10 +42,10 @@ impl From<DepthDiff> for RawDiff {
     }
 }
 
-/// Which 6-hour bucket does a UTC hour belong to?
-/// Returns the bucket open hour: 0, 6, 12, or 18.
-fn bucket_open(hour: u32) -> u32 {
-    (hour / 6) * 6
+/// Which hourly bucket does a UTC hour belong to?
+/// `interval` must divide 24 evenly (1, 2, 3, 4, 6, 8, 12, 24).
+pub fn bucket_open(hour: u32, interval: u32) -> u32 {
+    (hour / interval) * interval
 }
 
 struct SymbolWriter {
@@ -65,10 +65,11 @@ impl SymbolWriter {
         symbol: &str,
         exchange: &str,
         now_utc: chrono::DateTime<Utc>,
+        rotate_hours: u32,
     ) -> Result<Self> {
         let date_str = now_utc.format("%Y-%m-%d").to_string();
         let open_hour = now_utc.hour();
-        let bucket = bucket_open(open_hour);
+        let bucket = bucket_open(open_hour, rotate_hours);
         let open_hhmm = format!("{:02}{:02}", bucket, 0);
 
         let sym_dir = dir.join(exchange).join(symbol).join(&date_str);
@@ -92,8 +93,8 @@ impl SymbolWriter {
         })
     }
 
-    fn should_rotate(&self, now_utc: chrono::DateTime<Utc>) -> bool {
-        bucket_open(now_utc.hour()) != self.bucket_open_hour
+    fn should_rotate(&self, now_utc: chrono::DateTime<Utc>, rotate_hours: u32) -> bool {
+        bucket_open(now_utc.hour(), rotate_hours) != self.bucket_open_hour
     }
 
     fn close_and_rename(&mut self, end_utc: chrono::DateTime<Utc>) -> Result<()> {
@@ -173,11 +174,12 @@ where
     builder.finish()
 }
 
-/// Raw Parquet writer — receives RawDiff via channel, buffers, flushes every 5 min, rotates every 6h.
+/// Raw Parquet writer — receives RawDiff via channel, buffers, flushes periodically, rotates on hour boundary.
 pub async fn run_raw_writer(
     data_dir: PathBuf,
     mut rx: mpsc::Receiver<RawDiff>,
     flush_interval_s: u64,
+    rotate_hours: u32,
 ) {
     let mut writers: HashMap<String, SymbolWriter> = HashMap::new();
     let mut last_flush = tokio::time::Instant::now();
@@ -198,7 +200,7 @@ pub async fn run_raw_writer(
 
                 // Check rotation
                 if let Some(sw) = writers.get_mut(&key)
-                    && sw.should_rotate(now_utc)
+                    && sw.should_rotate(now_utc, rotate_hours)
                 {
                     if let Err(e) = sw.close_and_rename(now_utc) {
                         warn!(error = %e, "failed to rotate raw file");
@@ -208,7 +210,7 @@ pub async fn run_raw_writer(
 
                 // Open writer if needed
                 if !writers.contains_key(&key) {
-                    match SymbolWriter::open(&data_dir.join("raw"), &symbol, &exchange, now_utc) {
+                    match SymbolWriter::open(&data_dir.join("raw"), &symbol, &exchange, now_utc, rotate_hours) {
                         Ok(sw) => {
                             writers.insert(key.clone(), sw);
                         }
