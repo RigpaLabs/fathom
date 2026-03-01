@@ -4,6 +4,7 @@
 /// await task completion, read Parquet back and assert.
 use std::path::PathBuf;
 
+use chrono::Timelike;
 use fathom::{
     accumulator::Snapshot1s,
     writer::{
@@ -12,7 +13,6 @@ use fathom::{
         snap_1s::run_snap_writer,
     },
 };
-use chrono::Timelike;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -286,10 +286,20 @@ fn test_bucket_open_all_valid_intervals() {
     for &interval in valid {
         for h in 0..24 {
             let bucket = bucket_open(h, interval);
-            assert!(bucket <= h, "bucket {bucket} > hour {h} for interval {interval}");
-            assert_eq!(bucket % interval, 0, "bucket {bucket} not aligned to interval {interval}");
+            assert!(
+                bucket <= h,
+                "bucket {bucket} > hour {h} for interval {interval}"
+            );
+            assert_eq!(
+                bucket % interval,
+                0,
+                "bucket {bucket} not aligned to interval {interval}"
+            );
             // Next bucket boundary is > current hour (no missed rotation)
-            assert!(bucket + interval > h, "hour {h} past bucket end for interval {interval}");
+            assert!(
+                bucket + interval > h,
+                "hour {h} past bucket end for interval {interval}"
+            );
         }
     }
 }

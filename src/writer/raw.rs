@@ -210,7 +210,13 @@ pub async fn run_raw_writer(
 
                 // Open writer if needed
                 if !writers.contains_key(&key) {
-                    match SymbolWriter::open(&data_dir.join("raw"), &symbol, &exchange, now_utc, rotate_hours) {
+                    match SymbolWriter::open(
+                        &data_dir.join("raw"),
+                        &symbol,
+                        &exchange,
+                        now_utc,
+                        rotate_hours,
+                    ) {
                         Ok(sw) => {
                             writers.insert(key.clone(), sw);
                         }
