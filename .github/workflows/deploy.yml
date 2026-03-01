@@ -81,16 +81,7 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Sync compose file
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          source: "docker-compose.prod.yml"
-          target: ${{ secrets.VPS_DEPLOY_DIR }}
-
-      - name: Deploy
+      - name: Deploy (blue-green)
         run: |
           ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} "
             set -e
@@ -98,23 +89,30 @@ jobs:
 
             echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-            # Tag current as rollback before pulling new
-            docker tag ghcr.io/${GITHUB_REPO}:latest ghcr.io/${GITHUB_REPO}:rollback 2>/dev/null || true
-
+            # Pull new image while old container is still running
             docker pull ghcr.io/${GITHUB_REPO}:${IMAGE_TAG}
 
-            # Graceful stop (30s for writers to flush) then start new
-            export GITHUB_REPO=${GITHUB_REPO}
-            export IMAGE_TAG=${IMAGE_TAG}
-            docker compose -f docker-compose.prod.yml down --timeout 30
-            docker compose -f docker-compose.prod.yml up -d
+            # Start new container alongside old one (versioned data dir = no file conflicts)
+            docker rm -f fathom-new 2>/dev/null || true
+            docker run -d \
+              --name fathom-new \
+              --restart unless-stopped \
+              --stop-timeout 30 \
+              -e RUST_LOG=fathom=info \
+              -e DATA_DIR=/app/data/${IMAGE_TAG} \
+              -v fathom-data:/app/data \
+              -v ${{ secrets.VPS_DEPLOY_DIR }}/config.toml:/app/config.toml:ro \
+              --log-driver json-file \
+              --log-opt max-size=50m \
+              --log-opt max-file=5 \
+              ghcr.io/${GITHUB_REPO}:${IMAGE_TAG}
 
-            # Wait for status.json inside container (monitor writes every 30s)
-            echo 'Waiting for fathom to start...'
+            # Wait for new container to write status.json (monitor writes every 30s)
+            echo 'Waiting for new container to become healthy...'
             HEALTHY=false
             for i in \$(seq 1 8); do
               sleep 15
-              if docker exec fathom find /app/data/metadata/status.json -mmin -3 2>/dev/null | grep -q .; then
+              if docker exec fathom-new find /app/data/${IMAGE_TAG}/metadata/status.json -mmin -3 2>/dev/null | grep -q .; then
                 HEALTHY=true
                 echo \"  -> healthy after \$((i * 15))s\"
                 break
@@ -122,14 +120,19 @@ jobs:
               echo \"  -> waiting... (\$((i * 15))s elapsed)\"
             done
 
-            if [ \"\$HEALTHY\" = true ]; then
-              echo 'Deploy OK: ${IMAGE_TAG}'
-              docker ps --filter name=fathom --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
-            else
-              echo 'Deploy FAILED — rolling back'
-              docker logs fathom --tail 30 2>&1 || true
-              export IMAGE_TAG=rollback
-              docker compose -f docker-compose.prod.yml up -d
+            if [ \"\$HEALTHY\" = false ]; then
+              echo 'ERROR: new container not healthy after 120s — rolling back'
+              docker logs fathom-new --tail 30 2>&1 || true
+              docker stop fathom-new && docker rm fathom-new
               exit 1
             fi
+
+            # New container is healthy — stop old one gracefully (30s for writers to flush)
+            docker stop -t 30 fathom 2>/dev/null && docker rm fathom 2>/dev/null || true
+
+            # Promote new container to canonical name
+            docker rename fathom-new fathom
+
+            echo 'Deploy OK: ${IMAGE_TAG}'
+            docker ps --filter name=fathom --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
           "

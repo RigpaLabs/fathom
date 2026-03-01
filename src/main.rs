@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{path::PathBuf, time::Instant};
 
 use fathom::{
     config::{Config, Exchange},
@@ -40,7 +40,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = Config::load("config.toml")?;
-    std::fs::create_dir_all(&cfg.data_dir)?;
+    let data_dir = std::env::var("DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(cfg.data_dir);
+    std::fs::create_dir_all(&data_dir)?;
 
     let monitor_state = monitor::new_state();
     let start = Instant::now();
@@ -49,14 +52,14 @@ async fn main() -> anyhow::Result<()> {
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(CHANNEL_BUFFER);
 
     let raw_handle = tokio::spawn(fathom::writer::raw::run_raw_writer(
-        cfg.data_dir.clone(),
+        data_dir.clone(),
         raw_rx,
         RAW_FLUSH_INTERVAL_S,
         cfg.raw_rotate_hours,
     ));
-    let snap_handle = tokio::spawn(run_snap_writer(cfg.data_dir.clone(), snap_rx));
+    let snap_handle = tokio::spawn(run_snap_writer(data_dir.clone(), snap_rx));
     let mon_handle = tokio::spawn(monitor::run_monitor(
-        cfg.data_dir.clone(),
+        data_dir.clone(),
         monitor_state.clone(),
         start,
     ));
@@ -64,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let mut handles = Vec::new();
     for conn in cfg.connections {
         let adapter = make_adapter(&conn.exchange);
-        let data_dir = cfg.data_dir.clone();
+        let data_dir = data_dir.clone();
         let mon = monitor_state.clone();
         let rtx = raw_tx.clone();
         let stx = snap_tx.clone();

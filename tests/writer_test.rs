@@ -394,6 +394,74 @@ async fn test_raw_writer_rotate_hours_6_creates_correct_bucket_file() {
     );
 }
 
+// ── Blue-green data isolation test ────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_two_writers_different_data_dirs_no_interference() {
+    // Simulates blue-green deploy: two raw writers for the same symbol
+    // writing to different data_dir subdirs simultaneously.
+    let dir = TempDir::new().unwrap();
+    let dir_old = dir.path().join("v1");
+    let dir_new = dir.path().join("v2");
+
+    let (tx_old, rx_old) = mpsc::channel::<RawDiff>(64);
+    let (tx_new, rx_new) = mpsc::channel::<RawDiff>(64);
+
+    let w_old = tokio::spawn(run_raw_writer(dir_old.clone(), rx_old, 1, 1));
+    let w_new = tokio::spawn(run_raw_writer(dir_new.clone(), rx_new, 1, 1));
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+
+    // Old writer: 3 events
+    for i in 0..3u64 {
+        tx_old
+            .send(RawDiff {
+                timestamp_us: now_us + i as i64 * 100_000,
+                exchange: "binance_spot".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                seq_id: 100 + i as i64,
+                prev_seq_id: 99 + i as i64,
+                bids: vec![(3000.0, 1.0)],
+                asks: vec![(3001.0, 1.0)],
+            })
+            .await
+            .unwrap();
+    }
+
+    // New writer: 5 events (different count proves isolation)
+    for i in 0..5u64 {
+        tx_new
+            .send(RawDiff {
+                timestamp_us: now_us + i as i64 * 100_000,
+                exchange: "binance_spot".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                seq_id: 200 + i as i64,
+                prev_seq_id: 199 + i as i64,
+                bids: vec![(3000.0, 2.0)],
+                asks: vec![(3001.0, 2.0)],
+            })
+            .await
+            .unwrap();
+    }
+
+    drop(tx_old);
+    drop(tx_new);
+    w_old.await.unwrap();
+    w_new.await.unwrap();
+
+    // Each dir has its own parquet — no cross-contamination
+    let files_old = find_parquets(&dir_old);
+    let files_new = find_parquets(&dir_new);
+    assert_eq!(files_old.len(), 1, "old writer: 1 file");
+    assert_eq!(files_new.len(), 1, "new writer: 1 file");
+
+    // Verify row counts are independent
+    let rows_old = count_parquet_rows(&files_old[0]);
+    let rows_new = count_parquet_rows(&files_new[0]);
+    assert_eq!(rows_old, 3, "old writer: 3 rows");
+    assert_eq!(rows_new, 5, "new writer: 5 rows");
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn make_snap(exchange: &str, symbol: &str, ts_us: i64) -> Snapshot1s {
@@ -421,6 +489,16 @@ fn make_snap(exchange: &str, symbol: &str, ts_us: i64) -> Snapshot1s {
         close_px: Some(3001.0),
         n_events: 7,
     }
+}
+
+fn count_parquet_rows(path: &PathBuf) -> usize {
+    let file = std::fs::File::open(path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let mut rows = 0;
+    for batch in reader.build().unwrap() {
+        rows += batch.unwrap().num_rows();
+    }
+    rows
 }
 
 /// Recursively find all .parquet files under `dir`.
