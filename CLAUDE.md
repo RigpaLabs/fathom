@@ -22,12 +22,14 @@ WebSocket stream
   → apply diff to BTreeMap L2 book (src/orderbook/mod.rs)
   → OFI / churn / microprice accumulation in 1s windows (src/accumulator.rs)
   → two parallel writers:
-      raw diff  → {data_dir}/{exchange}/{symbol}/raw/*.parquet   (flush every 5 min)
-      1s snap   → {data_dir}/{exchange}/{symbol}/1s/*.parquet    (60 columns)
+      raw diff  → {data_dir}/raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet  (flush every 5 min, rotate every 6h)
+      1s snap   → {data_dir}/1s/{exchange}/{symbol}/{date}.parquet                    (60 columns, 1 row/sec)
 ```
 
-**1s snapshot columns:** `ts_us`, `bid_px_0..9`, `ask_px_0..9`, `bid_qty_0..9`, `ask_qty_0..9`,
-`mid_px`, `ofi_l1`, `churn_bid`, `churn_ask`, `spread_bps`, `imbalance_l1`, `imbalance_l5`, `imbalance_l10`, and derived metrics.
+**1s snapshot columns:** `ts_us`, `exchange`, `symbol`, `bid_px_0..9`, `ask_px_0..9`, `bid_sz_0..9`, `ask_sz_0..9`,
+`mid_px`, `microprice`, `spread_bps`, `imbalance_l1`, `imbalance_l5`, `imbalance_l10`,
+`bid_depth_l5`, `bid_depth_l10`, `ask_depth_l5`, `ask_depth_l10`,
+`ofi_l1`, `churn_bid`, `churn_ask`, `intra_sigma`, `open_px`, `close_px`, `n_events`.
 
 ## Key source files
 
@@ -57,6 +59,6 @@ pu == last_update_id   ← CORRECT for perp
 ## Testing conventions
 
 - Unit tests: `mod tests` inside `src/` files
-- Integration / e2e tests: `tests/` directory (e2e uses an axum mock server, 5 scenarios)
+- Integration / e2e tests: `tests/` directory (e2e uses an axum mock server, 7 scenarios)
 - Smoke tests: `tests/smoke_test.rs`, all marked `#[ignore]` — run manually with `make smoke`
 - Never auto-commit without explicit user approval

@@ -13,7 +13,7 @@ pub struct DepthDiff {
     pub symbol: String,
     pub timestamp_us: i64,
     pub seq_id: i64,      // u (final update id)
-    pub prev_seq_id: i64, // U (first update id) — used for sync check on first event
+    pub prev_seq_id: i64, // U (first update id) — used for initial sync and spot ongoing gap check
     /// Binance USDM Futures only: `pu` field (prev final update id).
     /// When present, the ongoing gap check uses `pu == last_update_id` instead of
     /// the spot rule `U == last_update_id + 1`.
@@ -332,9 +332,6 @@ mod tests {
         }
     }
 
-    /// Bug C: when a price level is removed (qty=0), bid_last must NOT retain a
-    /// tombstone entry.  Before the fix, `bid_last.insert(key, 0.0)` was called
-    /// unconditionally, so every removed level accumulated forever.
     /// Binance USDM Futures perp events carry `pu` (prev_final_update_id).
     /// An event where U != prev_u + 1 but pu == prev_u must NOT trigger a gap.
     /// This exercises the perp-specific gap check branch.

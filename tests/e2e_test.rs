@@ -526,9 +526,9 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
 
 /// Verifies that the 1s snapshot parquet file is written with the correct schema.
 ///
-/// Mechanism: `last_1s_flush` in connection_task persists across reconnects.
-/// Round 1 sets the flush timer at t≈0 s.  The ~1 s backoff advances real time.
-/// Round 2's first processed event fires the 1 s flush boundary (≥ 1 s elapsed).
+/// Mechanism: connection_task does an on-disconnect flush when the WS closes,
+/// preserving any partially-accumulated 1s window before clearing state.
+/// Round 2's events are flushed when the WS closes after sending its messages.
 /// After abort the snap_writer closes and writes the parquet.
 ///
 /// Marked multi_thread so the axum mock server can run concurrently.
@@ -571,7 +571,8 @@ async fn test_e2e_snap_parquet_created() {
         snap_tx,
     ));
 
-    // Round 1 (~50 ms) + backoff (~1 000–1 250 ms) + round 2 flush (~50 ms) + slack.
+    // Round 1 (~50 ms) + backoff (~1 000–1 250 ms) + round 2 (~50 ms) + slack.
+    // On-disconnect flush fires immediately when WS closes after round 2 messages.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     task.abort();
     let _ = task.await;
@@ -604,7 +605,7 @@ async fn test_e2e_snap_parquet_created() {
     schema.field_with_name("ofi_l1").expect("ofi_l1 field");
     schema.field_with_name("bid_px_0").expect("bid_px_0 field");
 
-    // At least one row written (the flush from round 2's first event).
+    // At least one row written (the on-disconnect flush after round 2).
     let rows: usize = builder
         .build()
         .unwrap()

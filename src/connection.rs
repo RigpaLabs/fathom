@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::Utc;
+
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::Deserialize;
@@ -83,7 +85,6 @@ pub async fn connection_task(
         .map(|s| (s.clone(), OrderBook::new()))
         .collect();
     let mut accumulators: HashMap<String, WindowAccumulator> = HashMap::new();
-    let mut last_1s_flush: HashMap<String, Instant> = HashMap::new();
 
     {
         let mut state = monitor.lock().unwrap();
@@ -201,87 +202,107 @@ pub async fn connection_task(
             }
         }
 
-        loop {
-            let text = match fwd_rx.recv().await {
-                None => break, // forwarder closed (stream ended, timeout, or error)
-                Some(t) => t,
-            };
+        // 1s ticker for uniform snapshot sampling, independent of WS event rate.
+        // Consume the immediate first tick so the first flush fires ~1s after connect.
+        let mut snap_ticker = tokio::time::interval(Duration::from_secs(1));
+        snap_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        snap_ticker.tick().await;
 
-            let combined: WsCombined = match serde_json::from_str(&text) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+        'inner: loop {
+            tokio::select! {
+                msg = fwd_rx.recv() => {
+                    let text = match msg {
+                        None => break 'inner, // forwarder closed (stream ended, timeout, or error)
+                        Some(t) => t,
+                    };
 
-            let sym_lower = combined.stream.split('@').next().unwrap_or("").to_string();
-            let symbol = sym_lower.to_uppercase();
-            if !symbols.contains(&symbol) { continue; }
+                    let combined: WsCombined = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
 
-            let depth: DepthUpdate = match serde_json::from_value(combined.data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+                    let sym_lower = combined.stream.split('@').next().unwrap_or("").to_string();
+                    let symbol = sym_lower.to_uppercase();
+                    if !symbols.contains(&symbol) { continue; }
 
-            let bids: Vec<(f64, f64)> = depth.bids.iter().filter_map(parse_level).collect();
-            let asks: Vec<(f64, f64)> = depth.asks.iter().filter_map(parse_level).collect();
-            let timestamp_us = depth.event_time_ms * 1_000;
+                    let depth: DepthUpdate = match serde_json::from_value(combined.data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
 
-            let diff = DepthDiff {
-                exchange: adapter.name().to_string(),
-                symbol: symbol.clone(),
-                timestamp_us,
-                seq_id: depth.final_update_id,
-                prev_seq_id: depth.first_update_id,
-                prev_final_update_id: depth.prev_final_update_id,
-                bids: bids.clone(),
-                asks: asks.clone(),
-            };
+                    let bids: Vec<(f64, f64)> = depth.bids.iter().filter_map(parse_level).collect();
+                    let asks: Vec<(f64, f64)> = depth.asks.iter().filter_map(parse_level).collect();
+                    let timestamp_us = depth.event_time_ms * 1_000;
 
-            let book = books.entry(symbol.clone()).or_default();
-
-            match book.apply_diff(&diff) {
-                Err(AppError::SnapshotRequired(_)) | Err(AppError::OrderBookGap { .. }) => {
-                    warn!(conn = %name, symbol = %symbol, "gap — reconnecting");
-                    {
-                        let mut state = monitor.lock().unwrap();
-                        if let Some(cs) = state.get_mut(&name)
-                            && let Some(ss) = cs.symbols.get_mut(&symbol) {
-                            ss.gaps_today += 1;
-                        }
-                    }
-                    break;
-                }
-                Err(e) => { warn!(error = %e, "book error"); continue; }
-                Ok(None) => continue,
-                Ok(Some(applied)) => {
-                    {
-                        let mut state = monitor.lock().unwrap();
-                        if let Some(cs) = state.get_mut(&name)
-                            && let Some(ss) = cs.symbols.get_mut(&symbol) {
-                            ss.last_event_at = Some(Instant::now());
-                        }
-                    }
-
-                    let _ = raw_tx.try_send(RawDiff {
-                        timestamp_us,
+                    let diff = DepthDiff {
                         exchange: adapter.name().to_string(),
                         symbol: symbol.clone(),
-                        seq_id: diff.seq_id,
-                        prev_seq_id: diff.prev_seq_id,
-                        bids,
-                        asks,
-                    });
+                        timestamp_us,
+                        seq_id: depth.final_update_id,
+                        prev_seq_id: depth.first_update_id,
+                        prev_final_update_id: depth.prev_final_update_id,
+                        bids: bids.clone(),
+                        asks: asks.clone(),
+                    };
 
-                    let now = Instant::now();
-                    let acc = accumulators.entry(symbol.clone()).or_insert_with(|| {
-                        WindowAccumulator::new(adapter.name(), &symbol, timestamp_us)
-                    });
-                    acc.on_diff(book, &applied);
+                    let book = books.entry(symbol.clone()).or_default();
 
-                    let last_flush = last_1s_flush.entry(symbol.clone()).or_insert(now);
-                    if now.duration_since(*last_flush) >= Duration::from_secs(1) {
-                        let snap = acc.flush(book, timestamp_us);
-                        let _ = snap_tx.try_send(snap);
-                        *last_flush = now;
+                    match book.apply_diff(&diff) {
+                        Err(AppError::SnapshotRequired(_)) | Err(AppError::OrderBookGap { .. }) => {
+                            warn!(conn = %name, symbol = %symbol, "gap — reconnecting");
+                            {
+                                let mut state = monitor.lock().unwrap();
+                                if let Some(cs) = state.get_mut(&name)
+                                    && let Some(ss) = cs.symbols.get_mut(&symbol) {
+                                    ss.gaps_today += 1;
+                                }
+                            }
+                            break 'inner;
+                        }
+                        Err(e) => { warn!(error = %e, "book error"); continue; }
+                        Ok(None) => continue,
+                        Ok(Some(applied)) => {
+                            {
+                                let mut state = monitor.lock().unwrap();
+                                if let Some(cs) = state.get_mut(&name)
+                                    && let Some(ss) = cs.symbols.get_mut(&symbol) {
+                                    ss.last_event_at = Some(Instant::now());
+                                }
+                            }
+
+                            if raw_tx.try_send(RawDiff {
+                                timestamp_us,
+                                exchange: adapter.name().to_string(),
+                                symbol: symbol.clone(),
+                                seq_id: diff.seq_id,
+                                prev_seq_id: diff.prev_seq_id,
+                                bids,
+                                asks,
+                            }).is_err() {
+                                warn!(conn = %name, symbol = %symbol, "raw channel full — diff dropped");
+                            }
+
+                            let acc = accumulators.entry(symbol.clone()).or_insert_with(|| {
+                                WindowAccumulator::new(adapter.name(), &symbol, timestamp_us)
+                            });
+                            acc.on_diff(book, &applied);
+                        }
+                    }
+                }
+
+                _ = snap_ticker.tick() => {
+                    // Flush every symbol that has an accumulator — uniform 1Hz sampling
+                    // regardless of WS event rate (quiet symbols still emit rows).
+                    let ts_us = Utc::now().timestamp_micros();
+                    for sym in &symbols {
+                        if let Some(acc) = accumulators.get_mut(sym)
+                            && let Some(book) = books.get(sym)
+                        {
+                            let snap = acc.flush(book, ts_us);
+                            if snap_tx.try_send(snap).is_err() {
+                                warn!(conn = %name, symbol = %sym, "snap channel full — 1s snap dropped");
+                            }
+                        }
                     }
                 }
             }
@@ -298,10 +319,26 @@ pub async fn connection_task(
             }
         }
 
+        // Flush any partially-accumulated 1s window before resetting state.
+        // Prevents data loss when WS disconnects mid-second (the partial window
+        // would otherwise be silently dropped by accumulators.clear() below).
+        {
+            let ts_us = Utc::now().timestamp_micros();
+            for sym in &symbols {
+                if let Some(acc) = accumulators.get_mut(sym)
+                    && let Some(book) = books.get(sym)
+                {
+                    let snap = acc.flush(book, ts_us);
+                    if snap_tx.try_send(snap).is_err() {
+                        warn!(conn = %name, symbol = %sym, "snap channel full — disconnect flush dropped");
+                    }
+                }
+            }
+        }
+
         for book in books.values_mut() { *book = OrderBook::new(); }
         // Clear per-symbol accumulators so stale OFI/open_px/intra_sigma from the
         // previous session don't bleed into the first 1s snapshot after reconnect.
-        // last_1s_flush is intentionally kept so the flush timer continues correctly.
         accumulators.clear();
         sleep_backoff(&mut backoff_ms).await;
     }
