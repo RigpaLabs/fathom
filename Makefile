@@ -1,4 +1,4 @@
-.PHONY: run run-json build release test smoke lint fmt fmt-check clean monitor check-data cov
+.PHONY: run run-json build release test smoke lint fmt fmt-check clean docker-smoke docker-blue-green monitor check-data cov
 
 build:
 	cargo build
@@ -29,6 +29,15 @@ fmt-check:
 
 clean:
 	cargo clean
+
+# ── Docker smoke test (real Binance) ──────────────────────────────────────
+
+SMOKE_SECS ?= 60
+docker-smoke:
+	./scripts/docker-smoke.sh $(SMOKE_SECS)
+
+docker-blue-green:
+	./scripts/docker-blue-green.sh
 
 # ── Monitoring ─────────────────────────────────────────────────────────────
 
