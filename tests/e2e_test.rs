@@ -377,6 +377,90 @@ async fn test_e2e_gap_triggers_reconnect() {
     );
 }
 
+// ── Test 6: partial snapshot failure — other symbols must not be affected ─────
+
+/// When one symbol's REST snapshot returns HTTP 500, the connection must NOT
+/// tear down the entire WS session for the other symbols.  BTCUSDT's snapshot
+/// succeeds; its messages must be processed and written before ETHUSDT's first
+/// event triggers a SnapshotRequired reconnect.
+///
+/// Bug A: the old code used `break` + `snapshots_ok = false` in the snapshot
+/// for-loop, which caused `continue` on the outer loop, disconnecting every
+/// symbol even if only one failed.
+#[tokio::test]
+async fn test_e2e_multi_symbol_partial_snapshot_failure() {
+    let server = MockBinanceServer::new().await;
+
+    // ETH: first request → 500, subsequent → ok (consumed one-by-one).
+    server.push_http_error("ETHUSDT", 500);
+    server.push_snapshot(
+        "ETHUSDT",
+        100,
+        vec![("3000.00", "5.00")],
+        vec![("3001.00", "4.00")],
+    );
+    // BTC: always ok.
+    server.push_snapshot(
+        "BTCUSDT",
+        200,
+        vec![("50000.00", "1.00")],
+        vec![("50001.00", "1.00")],
+    );
+
+    // Round 1: BTC sync + post-sync arrive BEFORE ETH message.
+    // ETH message triggers SnapshotRequired (book still unsynced) → reconnect.
+    server.push_ws_round(vec![
+        ws_msg("btcusdt", 1_700_000_001_000, 200, 201, vec![("50000.00", "1.00")], vec![]),
+        ws_msg("btcusdt", 1_700_000_002_000, 202, 202, vec![("50000.00", "1.20")], vec![]),
+        ws_msg("ethusdt", 1_700_000_003_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
+    ]);
+    // Round 2: both symbols synced after reconnect.
+    server.push_ws_round(vec![
+        ws_msg("ethusdt", 1_700_000_010_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
+        ws_msg("ethusdt", 1_700_000_011_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
+    ]);
+
+    let dir = TempDir::new().unwrap();
+    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
+    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+
+    let state = monitor::new_state();
+    // ETH listed first so its snapshot attempt fires first and returns 500.
+    let conn = make_conn("partial_snap_test", vec!["ETHUSDT", "BTCUSDT"], &server);
+    let task = tokio::spawn(connection_task(
+        conn,
+        Box::new(BinanceSpot),
+        dir.path().to_path_buf(),
+        state,
+        raw_tx,
+        snap_tx,
+    ));
+
+    // BTC round-1 msgs (~50 ms) + ETH triggers reconnect + backoff (~1 s) + round 2 + slack.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    task.abort();
+    let _ = task.await;
+    raw_w.await.unwrap();
+    snap_w.await.unwrap();
+
+    let raws = raw_parquets(dir.path());
+
+    // BTC must have written rows from round 1 (before ETH triggered reconnect).
+    let btc_rows: usize = raws
+        .iter()
+        .filter(|p| p.to_str().unwrap_or("").to_uppercase().contains("BTCUSDT"))
+        .map(|p| count_parquet_rows(p))
+        .sum();
+    assert!(
+        btc_rows >= 2,
+        "BTCUSDT should have >= 2 raw rows from round 1 (got {}); \
+         if 0, snapshot failure for ETHUSDT incorrectly killed the entire connection",
+        btc_rows
+    );
+}
+
 // ── Test 5: snap 1s parquet is created ───────────────────────────────────────
 
 /// Verifies that the 1s snapshot parquet file is written with the correct schema.

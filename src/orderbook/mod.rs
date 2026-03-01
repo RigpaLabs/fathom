@@ -143,10 +143,11 @@ impl OrderBook {
             let key = OrderedFloat(px);
             let prev = self.bid_last.get(&key).copied().unwrap_or(0.0);
             bid_abs_change += (qty - prev).abs();
-            self.bid_last.insert(key, qty);
             if qty == 0.0 {
+                self.bid_last.remove(&key);
                 self.bids.remove(&key);
             } else {
+                self.bid_last.insert(key, qty);
                 self.bids.insert(key, qty);
             }
         }
@@ -155,10 +156,11 @@ impl OrderBook {
             let key = OrderedFloat(px);
             let prev = self.ask_last.get(&key).copied().unwrap_or(0.0);
             ask_abs_change += (qty - prev).abs();
-            self.ask_last.insert(key, qty);
             if qty == 0.0 {
+                self.ask_last.remove(&key);
                 self.asks.remove(&key);
             } else {
+                self.ask_last.insert(key, qty);
                 self.asks.insert(key, qty);
             }
         }
@@ -285,5 +287,68 @@ impl OrderBook {
 impl Default for OrderBook {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl OrderBook {
+    fn bid_last_contains(&self, price: f64) -> bool {
+        self.bid_last.contains_key(&OrderedFloat(price))
+    }
+
+    fn ask_last_contains(&self, price: f64) -> bool {
+        self.ask_last.contains_key(&OrderedFloat(price))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) -> SnapshotMsg {
+        SnapshotMsg { symbol: "ETHUSDT".to_string(), last_update_id: 100, bids, asks }
+    }
+
+    fn diff(seq: i64, prev_seq: i64, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) -> DepthDiff {
+        DepthDiff {
+            exchange: "test".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            timestamp_us: seq * 1_000,
+            seq_id: seq,
+            prev_seq_id: prev_seq,
+            bids,
+            asks,
+        }
+    }
+
+    /// Bug C: when a price level is removed (qty=0), bid_last must NOT retain a
+    /// tombstone entry.  Before the fix, `bid_last.insert(key, 0.0)` was called
+    /// unconditionally, so every removed level accumulated forever.
+    #[test]
+    fn test_removed_bid_level_not_retained_in_bid_last() {
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+        assert!(book.bid_last_contains(3000.0), "snapshot should seed bid_last");
+
+        book.apply_diff(&diff(101, 100, vec![(3000.0, 0.0)], vec![])).unwrap();
+
+        assert!(
+            !book.bid_last_contains(3000.0),
+            "removed bid level must not leave a tombstone in bid_last"
+        );
+    }
+
+    #[test]
+    fn test_removed_ask_level_not_retained_in_ask_last() {
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+        assert!(book.ask_last_contains(3001.0), "snapshot should seed ask_last");
+
+        book.apply_diff(&diff(101, 100, vec![], vec![(3001.0, 0.0)])).unwrap();
+
+        assert!(
+            !book.ask_last_contains(3001.0),
+            "removed ask level must not leave a tombstone in ask_last"
+        );
     }
 }

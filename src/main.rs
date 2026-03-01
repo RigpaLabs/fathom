@@ -41,13 +41,13 @@ async fn main() -> anyhow::Result<()> {
     let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(CHANNEL_BUFFER);
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(CHANNEL_BUFFER);
 
-    tokio::spawn(fathom::writer::raw::run_raw_writer(
+    let raw_handle = tokio::spawn(fathom::writer::raw::run_raw_writer(
         cfg.data_dir.clone(),
         raw_rx,
         RAW_FLUSH_INTERVAL_S,
     ));
-    tokio::spawn(run_snap_writer(cfg.data_dir.clone(), snap_rx));
-    tokio::spawn(monitor::run_monitor(
+    let snap_handle = tokio::spawn(run_snap_writer(cfg.data_dir.clone(), snap_rx));
+    let mon_handle = tokio::spawn(monitor::run_monitor(
         cfg.data_dir.clone(),
         monitor_state.clone(),
         start,
@@ -67,9 +67,21 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::signal::ctrl_c().await?;
     info!("shutting down fathom...");
+
+    // Abort connection tasks (they loop forever and have no shutdown channel).
+    for handle in &handles {
+        handle.abort();
+    }
+
+    // Closing senders signals writers to drain their channels and finalize files.
     drop(raw_tx);
     drop(snap_tx);
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Await writers so all buffered data is flushed to disk before exit.
+    let _ = raw_handle.await;
+    let _ = snap_handle.await;
+    mon_handle.abort();
+
     info!("shutdown complete");
 
     Ok(())

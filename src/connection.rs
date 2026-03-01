@@ -120,8 +120,11 @@ pub async fn connection_task(
 
         let (mut ws_sink, mut ws_stream) = ws.split();
 
-        // Fetch REST snapshots per symbol
-        let mut snapshots_ok = true;
+        // Fetch REST snapshots per symbol.
+        // A failure for one symbol only skips that symbol — other symbols keep
+        // their WS stream.  The skipped symbol's book stays unsynced and will
+        // return SnapshotRequired on the first incoming diff, triggering a full
+        // reconnect (which re-fetches all snapshots).
         for sym in &symbols {
             // Build snapshot URL — use override template if provided
             let snap_url = conn
@@ -132,15 +135,13 @@ pub async fn connection_task(
 
             match http_client.get(&snap_url).send().await {
                 Err(e) => {
-                    warn!(conn = %name, symbol = %sym, error = %e, "snapshot fetch failed");
-                    snapshots_ok = false;
-                    break;
+                    warn!(conn = %name, symbol = %sym, error = %e, "snapshot fetch failed — skipping symbol");
+                    continue;
                 }
                 Ok(resp) => match resp.json::<SnapshotRest>().await {
                     Err(e) => {
-                        warn!(conn = %name, symbol = %sym, error = %e, "snapshot parse failed");
-                        snapshots_ok = false;
-                        break;
+                        warn!(conn = %name, symbol = %sym, error = %e, "snapshot parse failed — skipping symbol");
+                        continue;
                     }
                     Ok(snap) => {
                         info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");
@@ -155,11 +156,6 @@ pub async fn connection_task(
                     }
                 },
             }
-        }
-
-        if !snapshots_ok {
-            sleep_backoff(&mut backoff_ms).await;
-            continue;
         }
 
         {
@@ -280,6 +276,10 @@ pub async fn connection_task(
         }
 
         for book in books.values_mut() { *book = OrderBook::new(); }
+        // Clear per-symbol accumulators so stale OFI/open_px/intra_sigma from the
+        // previous session don't bleed into the first 1s snapshot after reconnect.
+        // last_1s_flush is intentionally kept so the flush timer continues correctly.
+        accumulators.clear();
         sleep_backoff(&mut backoff_ms).await;
     }
 }
