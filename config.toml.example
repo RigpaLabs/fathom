@@ -1,0 +1,13 @@
+data_dir = "data"
+
+[[connections]]
+name     = "binance_spot"
+exchange = "binance_spot"
+symbols  = ["ETHUSDT", "BTCUSDT", "BNBUSDT"]
+depth_ms = 100
+
+[[connections]]
+name     = "binance_perp"
+exchange = "binance_perp"
+symbols  = ["ETHUSDT", "BTCUSDT", "BNBUSDT"]
+depth_ms = 100
