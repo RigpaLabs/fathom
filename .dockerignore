@@ -1,0 +1,7 @@
+target/
+data/
+.git/
+.github/
+.claude/
+*.md
+config.toml

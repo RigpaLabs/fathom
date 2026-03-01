@@ -1,0 +1,135 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (leave blank for auto: vYYYYMMDD-sha)"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build & Push
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="v$(date +%Y%m%d)-${GITHUB_SHA::7}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VPS
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set env
+        run: |
+          echo "IMAGE_TAG=${{ needs.build.outputs.version }}" >> "$GITHUB_ENV"
+          echo "GITHUB_REPO=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Setup SSH
+        run: |
+          install -m 600 -D /dev/null ~/.ssh/id_rsa
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Sync compose file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "docker-compose.prod.yml"
+          target: ${{ secrets.VPS_DEPLOY_DIR }}
+
+      - name: Deploy
+        run: |
+          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} "
+            set -e
+            cd ${{ secrets.VPS_DEPLOY_DIR }}
+
+            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Tag current as rollback before pulling new
+            docker tag ghcr.io/${GITHUB_REPO}:latest ghcr.io/${GITHUB_REPO}:rollback 2>/dev/null || true
+
+            docker pull ghcr.io/${GITHUB_REPO}:${IMAGE_TAG}
+
+            # Graceful stop (30s for writers to flush) then start new
+            export GITHUB_REPO=${GITHUB_REPO}
+            export IMAGE_TAG=${IMAGE_TAG}
+            docker compose -f docker-compose.prod.yml down --timeout 30
+            docker compose -f docker-compose.prod.yml up -d
+
+            # Wait for status.json inside container (monitor writes every 30s)
+            echo 'Waiting for fathom to start...'
+            HEALTHY=false
+            for i in \$(seq 1 8); do
+              sleep 15
+              if docker exec fathom find /app/data/metadata/status.json -mmin -3 2>/dev/null | grep -q .; then
+                HEALTHY=true
+                echo \"  -> healthy after \$((i * 15))s\"
+                break
+              fi
+              echo \"  -> waiting... (\$((i * 15))s elapsed)\"
+            done
+
+            if [ \"\$HEALTHY\" = true ]; then
+              echo 'Deploy OK: ${IMAGE_TAG}'
+              docker ps --filter name=fathom --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+            else
+              echo 'Deploy FAILED — rolling back'
+              docker logs fathom --tail 30 2>&1 || true
+              export IMAGE_TAG=rollback
+              docker compose -f docker-compose.prod.yml up -d
+              exit 1
+            fi
+          "

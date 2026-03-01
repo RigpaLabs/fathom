@@ -1,0 +1,27 @@
+services:
+  fathom:
+    image: ghcr.io/${GITHUB_REPO}:${IMAGE_TAG:?IMAGE_TAG is required}
+    container_name: fathom
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - fathom-data:/app/data
+      - ./config.toml:/app/config.toml:ro
+    environment:
+      - RUST_LOG=fathom=info
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  fathom-data:
