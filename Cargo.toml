@@ -29,3 +29,4 @@ rand               = "0.8"
 tempfile           = "3"
 parquet            = { version = "54", features = ["snap", "arrow"] }
 arrow              = { version = "54" }
+axum               = { version = "0.8", features = ["ws"] }
