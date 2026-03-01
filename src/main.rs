@@ -24,13 +24,20 @@ fn make_adapter(exchange: &Exchange) -> Box<dyn ExchangeAdapter> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "fathom=info".into()),
-        )
-        .json()
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "fathom=info".into());
+
+    if std::env::var("FATHOM_JSON_LOG").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    }
 
     let cfg = Config::load("config.toml")?;
     std::fs::create_dir_all(&cfg.data_dir)?;

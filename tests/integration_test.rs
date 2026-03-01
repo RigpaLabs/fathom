@@ -25,7 +25,7 @@ use fathom::{
     connection::connection_task,
     exchange::BinanceSpot,
     monitor,
-    writer::raw::{run_raw_writer, RawDiff},
+    writer::raw::{RawDiff, run_raw_writer},
     writer::snap_1s::run_snap_writer,
 };
 
@@ -234,7 +234,12 @@ async fn test_integration_binance_spot_pipeline() {
     let state = monitor::new_state();
 
     let conn_task = tokio::spawn(connection_task(
-        conn, adapter, data_dir.clone(), state, raw_tx, snap_tx,
+        conn,
+        adapter,
+        data_dir.clone(),
+        state,
+        raw_tx,
+        snap_tx,
     ));
 
     // Allow enough time for: WS connect + snapshot fetch + all 6 messages + Close frame.
@@ -274,7 +279,9 @@ async fn test_integration_binance_spot_pipeline() {
     let schema = reader.schema().clone();
 
     // Schema sanity checks
-    schema.field_with_name("timestamp_us").expect("timestamp_us");
+    schema
+        .field_with_name("timestamp_us")
+        .expect("timestamp_us");
     schema.field_with_name("exchange").expect("exchange");
     schema.field_with_name("symbol").expect("symbol");
     schema.field_with_name("seq_id").expect("seq_id");
@@ -287,7 +294,10 @@ async fn test_integration_binance_spot_pipeline() {
     for batch in reader.build().unwrap() {
         rows += batch.unwrap().num_rows();
     }
-    assert_eq!(rows, 5, "expected 5 raw depth events (1 sync + 4 post-sync)");
+    assert_eq!(
+        rows, 5,
+        "expected 5 raw depth events (1 sync + 4 post-sync)"
+    );
 }
 
 #[tokio::test]
@@ -354,7 +364,9 @@ async fn test_integration_monitor_state_updated() {
     // After abort: connected should be false (set to false on WS close/reconnect)
     // and symbol "BTCUSDT" should exist in state
     let guard = state_check.lock().unwrap();
-    let conn_stats = guard.get("btc_conn").expect("btc_conn should be in monitor state");
+    let conn_stats = guard
+        .get("btc_conn")
+        .expect("btc_conn should be in monitor state");
     assert!(
         conn_stats.symbols.contains_key("BTCUSDT"),
         "BTCUSDT should be tracked"

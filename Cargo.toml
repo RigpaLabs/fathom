@@ -13,19 +13,17 @@ arrow-array        = "54"
 arrow-schema       = "54"
 parquet            = { version = "54", features = ["snap"] }
 ordered-float      = "4.3"
-smallvec           = { version = "1.13", features = ["union"] }
 config             = "0.14"
-notify             = "6"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror          = "2.0"
 anyhow             = "1.0"
 reqwest            = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 chrono             = { version = "0.4", features = ["serde"] }
-tokio-retry        = "0.3"
 rand               = "0.8"
 
 [dev-dependencies]
+tokio              = { version = "1.43", features = ["test-util"] }
 tempfile           = "3"
 parquet            = { version = "54", features = ["snap", "arrow"] }
 arrow              = { version = "54" }

@@ -20,6 +20,9 @@ impl ExchangeAdapter for BinancePerp {
     }
 
     fn snapshot_url(&self, symbol: &str) -> String {
-        format!("{REST_BASE}/depth?symbol={}&limit=1000", symbol.to_uppercase())
+        format!(
+            "{REST_BASE}/depth?symbol={}&limit=1000",
+            symbol.to_uppercase()
+        )
     }
 }

@@ -1,6 +1,12 @@
 use fathom::orderbook::{DepthDiff, OrderBook, SnapshotMsg};
 
-fn make_diff(symbol: &str, first_id: i64, final_id: i64, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) -> DepthDiff {
+fn make_diff(
+    symbol: &str,
+    first_id: i64,
+    final_id: i64,
+    bids: Vec<(f64, f64)>,
+    asks: Vec<(f64, f64)>,
+) -> DepthDiff {
     DepthDiff {
         exchange: "binance_spot".to_string(),
         symbol: symbol.to_string(),
@@ -47,11 +53,15 @@ fn test_apply_snapshot_and_diff() {
     assert!(!book.synced);
 
     // Pre-sync diff: should be dropped (u <= last_update_id)
-    let dropped = book.apply_diff(&make_diff("ETHUSDT", 90, 100, vec![], vec![])).unwrap();
+    let dropped = book
+        .apply_diff(&make_diff("ETHUSDT", 90, 100, vec![], vec![]))
+        .unwrap();
     assert!(dropped.is_none());
 
     // Sync event: U <= 101 <= u
-    let applied = book.apply_diff(&make_diff("ETHUSDT", 100, 102, vec![(3000.0, 1.5)], vec![])).unwrap();
+    let applied = book
+        .apply_diff(&make_diff("ETHUSDT", 100, 102, vec![(3000.0, 1.5)], vec![]))
+        .unwrap();
     assert!(applied.is_some());
     assert!(book.synced);
     assert_eq!(book.last_update_id, 102);
@@ -64,7 +74,9 @@ fn test_multiple_pre_sync_drops() {
 
     // All these are pre-snapshot — drop them
     for u in [50, 80, 99, 100] {
-        let r = book.apply_diff(&make_diff("ETHUSDT", u - 1, u, vec![], vec![])).unwrap();
+        let r = book
+            .apply_diff(&make_diff("ETHUSDT", u - 1, u, vec![], vec![]))
+            .unwrap();
         assert!(r.is_none(), "u={u} should be dropped");
     }
 }
@@ -84,7 +96,10 @@ fn test_remove_zero_qty_level() {
     let _ = book.apply_diff(&make_diff("ETHUSDT", 102, 103, vec![(3000.0, 0.0)], vec![]));
 
     let bids = book.bids_top_n(5);
-    assert!(!bids.iter().any(|(px, _)| *px == 3000.0), "zero-qty level should be removed");
+    assert!(
+        !bids.iter().any(|(px, _)| *px == 3000.0),
+        "zero-qty level should be removed"
+    );
     assert!(bids.iter().any(|(px, _)| *px == 2999.0));
 }
 
@@ -107,7 +122,13 @@ fn test_gap_detection() {
 
     // Gap: expected U=102, got U=103
     let result = book.apply_diff(&make_diff("ETHUSDT", 103, 104, vec![], vec![]));
-    assert!(matches!(result, Err(fathom::error::AppError::OrderBookGap { expected: 102, got: 103 })));
+    assert!(matches!(
+        result,
+        Err(fathom::error::AppError::OrderBookGap {
+            expected: 102,
+            got: 103
+        })
+    ));
 }
 
 #[test]
@@ -116,7 +137,10 @@ fn test_pre_snapshot_gap_requires_resnapshot() {
     book.apply_snapshot(snapshot(100, vec![(3000.0, 1.0)], vec![(3001.0, 1.0)]));
 
     let result = book.apply_diff(&make_diff("ETHUSDT", 103, 105, vec![], vec![]));
-    assert!(matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))));
+    assert!(matches!(
+        result,
+        Err(fathom::error::AppError::SnapshotRequired(_))
+    ));
 }
 
 // ── Empty book edge cases ─────────────────────────────────────────────────────
@@ -188,7 +212,10 @@ fn test_microprice_large_bid() {
     // Big bid → microprice closer to ask
     let book = synced_book(vec![(3000.0, 9.0)], vec![(3002.0, 1.0)]);
     let mp = book.microprice().unwrap();
-    assert!(mp > 3001.0, "large bid → microprice should be above mid, got {mp}");
+    assert!(
+        mp > 3001.0,
+        "large bid → microprice should be above mid, got {mp}"
+    );
     assert!(mp < 3002.0, "microprice should not exceed ask");
 }
 
@@ -197,7 +224,10 @@ fn test_microprice_large_ask() {
     // Big ask → microprice closer to bid
     let book = synced_book(vec![(3000.0, 1.0)], vec![(3002.0, 9.0)]);
     let mp = book.microprice().unwrap();
-    assert!(mp < 3001.0, "large ask → microprice should be below mid, got {mp}");
+    assert!(
+        mp < 3001.0,
+        "large ask → microprice should be below mid, got {mp}"
+    );
     assert!(mp > 3000.0);
 }
 
@@ -209,7 +239,10 @@ fn test_spread_bps() {
     let book = synced_book(vec![(3000.0, 1.0)], vec![(3001.0, 1.0)]);
     let spread = book.spread_bps().unwrap();
     let expected = (1.0 / 3000.5 * 10_000.0) as f32;
-    assert!((spread - expected).abs() < 0.01, "spread_bps={spread}, expected≈{expected}");
+    assert!(
+        (spread - expected).abs() < 0.01,
+        "spread_bps={spread}, expected≈{expected}"
+    );
 }
 
 #[test]
@@ -316,7 +349,10 @@ fn test_ofi_bid_pressure_increases_qty() {
         .apply_diff(&make_diff("ETHUSDT", 102, 103, vec![(3000.0, 8.0)], vec![]))
         .unwrap()
         .unwrap();
-    assert!(applied.ofi_l1_delta > 0.0, "bid qty increase → positive OFI delta");
+    assert!(
+        applied.ofi_l1_delta > 0.0,
+        "bid qty increase → positive OFI delta"
+    );
 }
 
 #[test]
@@ -352,4 +388,169 @@ fn test_re_snapshot_resets_sync() {
     book.apply_snapshot(snapshot(200, vec![(3001.0, 2.0)], vec![(3002.0, 1.0)]));
     assert!(!book.synced, "snapshot should reset synced flag");
     assert_eq!(book.last_update_id, 200);
+}
+
+// ── Perp gap detection ──────────────────────────────────────────────────────
+
+#[test]
+fn test_perp_pu_gap_detected() {
+    let mut book = synced_book(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]);
+    // book.last_update_id == 101 after synced_book
+    // Perp event where pu != last_update_id → gap
+    let perp_gap = DepthDiff {
+        exchange: "test".into(),
+        symbol: "ETHUSDT".into(),
+        timestamp_us: 2_000,
+        seq_id: 110,
+        prev_seq_id: 105,
+        prev_final_update_id: Some(99), // != 101
+        bids: vec![],
+        asks: vec![],
+    };
+    assert!(
+        book.apply_diff(&perp_gap).is_err(),
+        "perp event with pu != last_update_id must trigger gap"
+    );
+}
+
+// ── Imbalance multi-level ───────────────────────────────────────────────────
+
+#[test]
+fn test_imbalance_multi_level() {
+    let book = synced_book(
+        vec![
+            (3000.0, 2.0),
+            (2999.0, 3.0),
+            (2998.0, 1.0),
+            (2997.0, 1.0),
+            (2996.0, 1.0),
+        ],
+        vec![
+            (3001.0, 1.0),
+            (3002.0, 1.0),
+            (3003.0, 1.0),
+            (3004.0, 1.0),
+            (3005.0, 1.0),
+        ],
+    );
+    // bid_depth_l5 = 2+3+1+1+1 = 8, ask_depth_l5 = 5*1 = 5
+    let imb = book.imbalance(5).unwrap();
+    let expected = (8.0 - 5.0) / (8.0 + 5.0);
+    assert!(
+        (imb - expected as f32).abs() < 1e-6,
+        "imbalance={imb}, expected={expected}"
+    );
+}
+
+// ── OFI edge cases ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_ofi_bid_removed_negative() {
+    let mut book = synced_book(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]);
+    // Remove best bid entirely → negative OFI (bid pressure decreased)
+    let applied = book
+        .apply_diff(&make_diff("ETHUSDT", 102, 103, vec![(3000.0, 0.0)], vec![]))
+        .unwrap()
+        .unwrap();
+    assert!(
+        applied.ofi_l1_delta < 0.0,
+        "bid removed → negative OFI, got {}",
+        applied.ofi_l1_delta
+    );
+}
+
+#[test]
+fn test_ofi_ask_qty_increase() {
+    let mut book = synced_book(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]);
+    // Increase ask qty at best ask → negative OFI (ask pressure increased)
+    let applied = book
+        .apply_diff(&make_diff("ETHUSDT", 102, 103, vec![], vec![(3001.0, 8.0)]))
+        .unwrap()
+        .unwrap();
+    assert!(
+        applied.ofi_l1_delta < 0.0,
+        "ask qty increase → negative OFI, got {}",
+        applied.ofi_l1_delta
+    );
+}
+
+#[test]
+fn test_churn_both_sides_single_diff() {
+    let mut book = synced_book(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]);
+    let applied = book
+        .apply_diff(&make_diff(
+            "ETHUSDT",
+            102,
+            103,
+            vec![(3000.0, 8.0)],
+            vec![(3001.0, 1.0)],
+        ))
+        .unwrap()
+        .unwrap();
+    assert!((applied.bid_abs_change - 3.0).abs() < 1e-9, "|8-5|=3");
+    assert!((applied.ask_abs_change - 3.0).abs() < 1e-9, "|1-4|=3");
+}
+
+// ── Large book ──────────────────────────────────────────────────────────────
+
+#[test]
+fn test_large_book_top_n_correctness() {
+    // 50 bid levels, 50 ask levels
+    let bids: Vec<(f64, f64)> = (0..50)
+        .map(|i| (3000.0 - i as f64, 1.0 + i as f64))
+        .collect();
+    let asks: Vec<(f64, f64)> = (0..50)
+        .map(|i| (3001.0 + i as f64, 1.0 + i as f64))
+        .collect();
+    let book = synced_book(bids, asks);
+
+    let top10_bids = book.bids_top_n(10);
+    assert_eq!(top10_bids.len(), 10);
+    assert_eq!(top10_bids[0].0, 3000.0, "best bid");
+    assert_eq!(top10_bids[9].0, 2991.0, "10th bid");
+
+    let top10_asks = book.asks_top_n(10);
+    assert_eq!(top10_asks.len(), 10);
+    assert_eq!(top10_asks[0].0, 3001.0, "best ask");
+    assert_eq!(top10_asks[9].0, 3010.0, "10th ask");
+
+    // depth(10) should sum first 10 levels only
+    let (bid_d, ask_d) = book.depth(10);
+    let expected_bid: f64 = (0..10).map(|i| 1.0 + i as f64).sum();
+    assert!((bid_d - expected_bid).abs() < 1e-9);
+    let expected_ask: f64 = (0..10).map(|i| 1.0 + i as f64).sum();
+    assert!((ask_d - expected_ask).abs() < 1e-9);
+}
+
+// ── Snapshot zero-qty filtering ─────────────────────────────────────────────
+
+#[test]
+fn test_snapshot_filters_zero_qty_levels() {
+    let mut book = OrderBook::new();
+    book.apply_snapshot(snapshot(
+        100,
+        vec![(3000.0, 1.0), (2999.0, 0.0)], // zero-qty in snapshot
+        vec![(3001.0, 0.0), (3002.0, 2.0)], // zero-qty in snapshot
+    ));
+    assert_eq!(book.bids_top_n(10).len(), 1, "zero-qty bids filtered");
+    assert_eq!(book.asks_top_n(10).len(), 1, "zero-qty asks filtered");
+}
+
+// ── Consecutive diffs maintain state ────────────────────────────────────────
+
+#[test]
+fn test_consecutive_diffs_update_book() {
+    let mut book = synced_book(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]);
+    // Diff 1: add new bid level
+    let _ = book.apply_diff(&make_diff("ETHUSDT", 102, 103, vec![(2999.0, 3.0)], vec![]));
+    // Diff 2: update existing ask
+    let _ = book.apply_diff(&make_diff("ETHUSDT", 104, 105, vec![], vec![(3001.0, 7.0)]));
+
+    let bids = book.bids_top_n(10);
+    assert_eq!(bids.len(), 2);
+    assert_eq!(bids[0], (3000.0, 5.0));
+    assert_eq!(bids[1], (2999.0, 3.0));
+
+    let asks = book.asks_top_n(10);
+    assert_eq!(asks[0], (3001.0, 7.0));
 }

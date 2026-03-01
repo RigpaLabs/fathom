@@ -19,8 +19,17 @@ fn test_raw_schema_fields() {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
         names,
-        ["timestamp_us", "exchange", "symbol", "seq_id", "prev_seq_id",
-         "bid_prices", "bid_qtys", "ask_prices", "ask_qtys"]
+        [
+            "timestamp_us",
+            "exchange",
+            "symbol",
+            "seq_id",
+            "prev_seq_id",
+            "bid_prices",
+            "bid_qtys",
+            "ask_prices",
+            "ask_qtys"
+        ]
     );
     assert_eq!(schema.fields().len(), 9);
 }
@@ -38,16 +47,36 @@ fn test_snap_1s_schema_fields() {
 
     // Check price columns
     for i in 0..10 {
-        let _ = schema.field_with_name(&format!("bid_px_{i}")).expect("bid_px");
-        let _ = schema.field_with_name(&format!("ask_px_{i}")).expect("ask_px");
-        let _ = schema.field_with_name(&format!("bid_sz_{i}")).expect("bid_sz");
-        let _ = schema.field_with_name(&format!("ask_sz_{i}")).expect("ask_sz");
+        let _ = schema
+            .field_with_name(&format!("bid_px_{i}"))
+            .expect("bid_px");
+        let _ = schema
+            .field_with_name(&format!("ask_px_{i}"))
+            .expect("ask_px");
+        let _ = schema
+            .field_with_name(&format!("bid_sz_{i}"))
+            .expect("bid_sz");
+        let _ = schema
+            .field_with_name(&format!("ask_sz_{i}"))
+            .expect("ask_sz");
     }
 
     // Check derived fields present
-    for name in &["mid_px", "microprice", "spread_bps", "imbalance_l1",
-                  "imbalance_l5", "imbalance_l10", "ofi_l1", "churn_bid",
-                  "churn_ask", "intra_sigma", "open_px", "close_px", "n_events"] {
+    for name in &[
+        "mid_px",
+        "microprice",
+        "spread_bps",
+        "imbalance_l1",
+        "imbalance_l5",
+        "imbalance_l10",
+        "ofi_l1",
+        "churn_bid",
+        "churn_ask",
+        "intra_sigma",
+        "open_px",
+        "close_px",
+        "n_events",
+    ] {
         schema.field_with_name(name).expect(name);
     }
 }
@@ -87,7 +116,9 @@ fn test_raw_schema_parquet_roundtrip() {
         let mut builder = ListBuilder::new(Float64Builder::new());
         for row in rows {
             let vals = builder.values();
-            for &v in *row { vals.append_value(v); }
+            for &v in *row {
+                vals.append_value(v);
+            }
             builder.append(true);
         }
         builder.finish()
@@ -106,7 +137,8 @@ fn test_raw_schema_parquet_roundtrip() {
             Arc::new(list_f64(&[&[3001.0]])) as ArrayRef,
             Arc::new(list_f64(&[&[4.0]])) as ArrayRef,
         ],
-    ).unwrap();
+    )
+    .unwrap();
 
     writer.write(&batch).unwrap();
     writer.finish().unwrap();
@@ -119,18 +151,26 @@ fn test_raw_schema_parquet_roundtrip() {
 
     // Schema compatibility
     for field in schema.fields() {
-        read_schema.field_with_name(field.name()).expect("field should exist in read schema");
+        read_schema
+            .field_with_name(field.name())
+            .expect("field should exist in read schema");
     }
 
     let read_batch = reader.next().unwrap().unwrap();
     assert_eq!(read_batch.num_rows(), 1);
 
-    let ts_col = read_batch.column(0)
-        .as_any().downcast_ref::<Int64Array>().unwrap();
+    let ts_col = read_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(ts_col.value(0), 1_000_000);
 
-    let sym_col = read_batch.column(2)
-        .as_any().downcast_ref::<StringArray>().unwrap();
+    let sym_col = read_batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(sym_col.value(0), "ETHUSDT");
 }
 
@@ -177,8 +217,13 @@ fn test_snap_1s_schema_parquet_roundtrip() {
     columns.push(Arc::new(Float64Array::from(vec![Some(3001.0_f64)]))); // close_px
     columns.push(Arc::new(UInt32Array::from(vec![42_u32]))); // n_events
 
-    assert_eq!(columns.len(), schema.fields().len(),
-        "column count must match schema field count: {} vs {}", columns.len(), schema.fields().len());
+    assert_eq!(
+        columns.len(),
+        schema.fields().len(),
+        "column count must match schema field count: {} vs {}",
+        columns.len(),
+        schema.fields().len()
+    );
 
     let batch = arrow_array::RecordBatch::try_new(schema.clone(), columns).unwrap();
     writer.write(&batch).unwrap();
@@ -187,12 +232,17 @@ fn test_snap_1s_schema_parquet_roundtrip() {
     // Read back and verify
     let read_file = tmp.reopen().unwrap();
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(read_file)
-        .unwrap().build().unwrap();
+        .unwrap()
+        .build()
+        .unwrap();
     let batch = reader.next().unwrap().unwrap();
     assert_eq!(batch.num_rows(), 1);
 
     // Verify n_events column (last)
-    let n_events_col = batch.column(batch.num_columns() - 1)
-        .as_any().downcast_ref::<UInt32Array>().unwrap();
+    let n_events_col = batch
+        .column(batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
     assert_eq!(n_events_col.value(0), 42);
 }

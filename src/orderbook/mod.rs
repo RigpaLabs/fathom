@@ -1,5 +1,3 @@
-pub mod manager;
-
 use std::collections::{BTreeMap, HashMap};
 
 use ordered_float::OrderedFloat;
@@ -105,7 +103,7 @@ impl OrderBook {
     /// Apply a diff event. Returns `Err(SnapshotRequired)` on gap.
     /// Returns `Ok(None)` if the event is still pre-sync and was dropped.
     pub fn apply_diff(&mut self, diff: &DepthDiff) -> Result<Option<DiffApplied>> {
-        let u = diff.seq_id;      // final_update_id
+        let u = diff.seq_id; // final_update_id
         let big_u = diff.prev_seq_id; // first_update_id
 
         if !self.synced {
@@ -269,11 +267,7 @@ impl OrderBook {
 
     /// Returns (ask_px_i, ask_sz_i) for top N levels (asks ascending)
     pub fn asks_top_n(&self, n: usize) -> Vec<(f64, f64)> {
-        self.asks
-            .iter()
-            .take(n)
-            .map(|(k, v)| (k.0, *v))
-            .collect()
+        self.asks.iter().take(n).map(|(k, v)| (k.0, *v)).collect()
     }
 
     /// Imbalance at top N levels: (bid_depth - ask_depth) / (bid_depth + ask_depth)
@@ -316,7 +310,12 @@ mod tests {
     use super::*;
 
     fn snap(bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) -> SnapshotMsg {
-        SnapshotMsg { symbol: "ETHUSDT".to_string(), last_update_id: 100, bids, asks }
+        SnapshotMsg {
+            symbol: "ETHUSDT".to_string(),
+            last_update_id: 100,
+            bids,
+            asks,
+        }
     }
 
     fn diff(seq: i64, prev_seq: i64, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) -> DepthDiff {
@@ -379,9 +378,13 @@ mod tests {
     fn test_removed_bid_level_not_retained_in_bid_last() {
         let mut book = OrderBook::new();
         book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
-        assert!(book.bid_last_contains(3000.0), "snapshot should seed bid_last");
+        assert!(
+            book.bid_last_contains(3000.0),
+            "snapshot should seed bid_last"
+        );
 
-        book.apply_diff(&diff(101, 100, vec![(3000.0, 0.0)], vec![])).unwrap();
+        book.apply_diff(&diff(101, 100, vec![(3000.0, 0.0)], vec![]))
+            .unwrap();
 
         assert!(
             !book.bid_last_contains(3000.0),
@@ -393,9 +396,13 @@ mod tests {
     fn test_removed_ask_level_not_retained_in_ask_last() {
         let mut book = OrderBook::new();
         book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
-        assert!(book.ask_last_contains(3001.0), "snapshot should seed ask_last");
+        assert!(
+            book.ask_last_contains(3001.0),
+            "snapshot should seed ask_last"
+        );
 
-        book.apply_diff(&diff(101, 100, vec![], vec![(3001.0, 0.0)])).unwrap();
+        book.apply_diff(&diff(101, 100, vec![], vec![(3001.0, 0.0)]))
+            .unwrap();
 
         assert!(
             !book.ask_last_contains(3001.0),

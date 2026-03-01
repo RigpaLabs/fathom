@@ -6,15 +6,11 @@ use std::{
 
 use arrow_array::{
     ArrayRef, Int64Array, ListArray, StringArray,
-    builder::{ListBuilder, Float64Builder},
+    builder::{Float64Builder, ListBuilder},
 };
 use arrow_schema::SchemaRef;
 use chrono::Utc;
-use parquet::{
-    arrow::ArrowWriter,
-    file::properties::WriterProperties,
-    basic::Compression,
-};
+use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -64,7 +60,12 @@ struct SymbolWriter {
 }
 
 impl SymbolWriter {
-    fn open(dir: &Path, symbol: &str, exchange: &str, now_utc: chrono::DateTime<Utc>) -> Result<Self> {
+    fn open(
+        dir: &Path,
+        symbol: &str,
+        exchange: &str,
+        now_utc: chrono::DateTime<Utc>,
+    ) -> Result<Self> {
         let date_str = now_utc.format("%Y-%m-%d").to_string();
         let open_hour = now_utc.hour();
         let bucket = bucket_open(open_hour);
@@ -131,9 +132,9 @@ impl SymbolWriter {
         let prev_seq_ids: Vec<i64> = self.buffer.iter().map(|e| e.prev_seq_id).collect();
 
         let bid_prices = build_list_f64(self.buffer.iter().map(|e| e.bids.iter().map(|(p, _)| *p)));
-        let bid_qtys   = build_list_f64(self.buffer.iter().map(|e| e.bids.iter().map(|(_, q)| *q)));
+        let bid_qtys = build_list_f64(self.buffer.iter().map(|e| e.bids.iter().map(|(_, q)| *q)));
         let ask_prices = build_list_f64(self.buffer.iter().map(|e| e.asks.iter().map(|(p, _)| *p)));
-        let ask_qtys   = build_list_f64(self.buffer.iter().map(|e| e.asks.iter().map(|(_, q)| *q)));
+        let ask_qtys = build_list_f64(self.buffer.iter().map(|e| e.asks.iter().map(|(_, q)| *q)));
 
         let batch = arrow_array::RecordBatch::try_new(
             schema,
@@ -196,7 +197,9 @@ pub async fn run_raw_writer(
                 let symbol = event.symbol.clone();
 
                 // Check rotation
-                if let Some(sw) = writers.get_mut(&key) && sw.should_rotate(now_utc) {
+                if let Some(sw) = writers.get_mut(&key)
+                    && sw.should_rotate(now_utc)
+                {
                     if let Err(e) = sw.close_and_rename(now_utc) {
                         warn!(error = %e, "failed to rotate raw file");
                     }
@@ -206,8 +209,13 @@ pub async fn run_raw_writer(
                 // Open writer if needed
                 if !writers.contains_key(&key) {
                     match SymbolWriter::open(&data_dir.join("raw"), &symbol, &exchange, now_utc) {
-                        Ok(sw) => { writers.insert(key.clone(), sw); }
-                        Err(e) => { warn!(error = %e, "failed to open raw writer"); continue; }
+                        Ok(sw) => {
+                            writers.insert(key.clone(), sw);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to open raw writer");
+                            continue;
+                        }
                     }
                 }
 

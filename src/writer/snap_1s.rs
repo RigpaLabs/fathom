@@ -4,16 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{
-    ArrayRef, Float32Array, Float64Array, Int64Array, StringArray, UInt32Array,
-};
+use arrow_array::{ArrayRef, Float32Array, Float64Array, Int64Array, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
 use chrono::Utc;
-use parquet::{
-    arrow::ArrowWriter,
-    basic::Compression,
-    file::properties::WriterProperties,
-};
+use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -59,26 +53,50 @@ impl DayWriter {
         let symbols: Vec<&str> = self.buffer.iter().map(|s| s.symbol.as_str()).collect();
 
         // Helper: extract top-N price or size from bids/asks
-        let bid_px: Vec<[Option<f64>; 10]> = self.buffer.iter().map(|s| {
-            let mut arr = [None; 10];
-            for (i, (px, _)) in s.bids.iter().enumerate().take(10) { arr[i] = Some(*px); }
-            arr
-        }).collect();
-        let bid_sz: Vec<[Option<f64>; 10]> = self.buffer.iter().map(|s| {
-            let mut arr = [None; 10];
-            for (i, (_, sz)) in s.bids.iter().enumerate().take(10) { arr[i] = Some(*sz); }
-            arr
-        }).collect();
-        let ask_px: Vec<[Option<f64>; 10]> = self.buffer.iter().map(|s| {
-            let mut arr = [None; 10];
-            for (i, (px, _)) in s.asks.iter().enumerate().take(10) { arr[i] = Some(*px); }
-            arr
-        }).collect();
-        let ask_sz: Vec<[Option<f64>; 10]> = self.buffer.iter().map(|s| {
-            let mut arr = [None; 10];
-            for (i, (_, sz)) in s.asks.iter().enumerate().take(10) { arr[i] = Some(*sz); }
-            arr
-        }).collect();
+        let bid_px: Vec<[Option<f64>; 10]> = self
+            .buffer
+            .iter()
+            .map(|s| {
+                let mut arr = [None; 10];
+                for (i, (px, _)) in s.bids.iter().enumerate().take(10) {
+                    arr[i] = Some(*px);
+                }
+                arr
+            })
+            .collect();
+        let bid_sz: Vec<[Option<f64>; 10]> = self
+            .buffer
+            .iter()
+            .map(|s| {
+                let mut arr = [None; 10];
+                for (i, (_, sz)) in s.bids.iter().enumerate().take(10) {
+                    arr[i] = Some(*sz);
+                }
+                arr
+            })
+            .collect();
+        let ask_px: Vec<[Option<f64>; 10]> = self
+            .buffer
+            .iter()
+            .map(|s| {
+                let mut arr = [None; 10];
+                for (i, (px, _)) in s.asks.iter().enumerate().take(10) {
+                    arr[i] = Some(*px);
+                }
+                arr
+            })
+            .collect();
+        let ask_sz: Vec<[Option<f64>; 10]> = self
+            .buffer
+            .iter()
+            .map(|s| {
+                let mut arr = [None; 10];
+                for (i, (_, sz)) in s.asks.iter().enumerate().take(10) {
+                    arr[i] = Some(*sz);
+                }
+                arr
+            })
+            .collect();
 
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(ts_us)) as ArrayRef,
@@ -191,8 +209,13 @@ pub async fn run_snap_writer(data_dir: PathBuf, mut rx: mpsc::Receiver<Snapshot1
                 // Open writer if needed
                 if !writers.contains_key(&key) {
                     match DayWriter::open(&data_dir, &exchange, &symbol, &date_str) {
-                        Ok(dw) => { writers.insert(key.clone(), dw); }
-                        Err(e) => { warn!(error = %e, "failed to open snap writer"); continue; }
+                        Ok(dw) => {
+                            writers.insert(key.clone(), dw);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to open snap writer");
+                            continue;
+                        }
                     }
                 }
 

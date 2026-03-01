@@ -21,7 +21,7 @@ use fathom::{
     connection::connection_task,
     exchange::BinanceSpot,
     monitor,
-    writer::raw::{run_raw_writer, RawDiff},
+    writer::raw::{RawDiff, run_raw_writer},
     writer::snap_1s::run_snap_writer,
 };
 use helpers::MockBinanceServer;
@@ -132,15 +132,57 @@ async fn test_e2e_reconnect_after_ws_close() {
 
     // Round 1 messages (3 applied events)
     let round1 = vec![
-        ws_msg("ethusdt", 1_700_000_001_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_002_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_003_000, 103, 103, vec![], vec![("3001.00", "2.00")]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_002_000,
+            102,
+            102,
+            vec![("3000.00", "6.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_003_000,
+            103,
+            103,
+            vec![],
+            vec![("3001.00", "2.00")],
+        ),
     ];
     // Round 2: same sequence — after reset/re-sync, book starts fresh
     let round2 = vec![
-        ws_msg("ethusdt", 1_700_000_010_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_011_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_012_000, 103, 103, vec![], vec![("3001.00", "2.00")]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_010_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_011_000,
+            102,
+            102,
+            vec![("3000.00", "6.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_012_000,
+            103,
+            103,
+            vec![],
+            vec![("3001.00", "2.00")],
+        ),
     ];
     server.push_ws_round(round1);
     server.push_ws_round(round2);
@@ -206,10 +248,38 @@ async fn test_e2e_multi_symbol_single_connection() {
 
     // Interleaved: ETH sync, BTC sync, ETH post, BTC post → 2 rows each
     let round = vec![
-        ws_msg("ethusdt", 1_700_000_001_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("btcusdt", 1_700_000_001_001, 200, 201, vec![("50000.00", "1.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_002_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
-        ws_msg("btcusdt", 1_700_000_002_001, 202, 202, vec![("50000.00", "1.20")], vec![]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "btcusdt",
+            1_700_000_001_001,
+            200,
+            201,
+            vec![("50000.00", "1.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_002_000,
+            102,
+            102,
+            vec![("3000.00", "6.00")],
+            vec![],
+        ),
+        ws_msg(
+            "btcusdt",
+            1_700_000_002_001,
+            202,
+            202,
+            vec![("50000.00", "1.20")],
+            vec![],
+        ),
     ];
     server.push_ws_round(round);
 
@@ -273,8 +343,22 @@ async fn test_e2e_snapshot_http_error_then_retry() {
     server.push_ws_round(vec![]);
     // Round 2: sync + post-sync messages.
     server.push_ws_round(vec![
-        ws_msg("ethusdt", 1_700_000_001_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_002_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_002_000,
+            102,
+            102,
+            vec![("3000.00", "6.00")],
+            vec![],
+        ),
     ]);
 
     let dir = TempDir::new().unwrap();
@@ -302,9 +386,15 @@ async fn test_e2e_snapshot_http_error_then_retry() {
     snap_w.await.unwrap();
 
     let raws = raw_parquets(dir.path());
-    assert!(!raws.is_empty(), "raw parquet should exist after successful retry");
+    assert!(
+        !raws.is_empty(),
+        "raw parquet should exist after successful retry"
+    );
     let rows: usize = raws.iter().map(|p| count_parquet_rows(p)).sum();
-    assert!(rows > 0, "at least some raw events should have been written");
+    assert!(
+        rows > 0,
+        "at least some raw events should have been written"
+    );
 }
 
 // ── Test 4: OrderBook gap triggers reconnect ──────────────────────────────────
@@ -327,13 +417,41 @@ async fn test_e2e_gap_triggers_reconnect() {
 
     // Round 1: one sync event, then a gap (U=200 when 102 expected)
     server.push_ws_round(vec![
-        ws_msg("ethusdt", 1_700_000_001_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_002_000, 200, 200, vec![("3000.00", "9.00")], vec![]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_002_000,
+            200,
+            200,
+            vec![("3000.00", "9.00")],
+            vec![],
+        ),
     ]);
     // Round 2: fresh sync after reconnect
     server.push_ws_round(vec![
-        ws_msg("ethusdt", 1_700_000_010_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_011_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_010_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_011_000,
+            102,
+            102,
+            vec![("3000.00", "6.00")],
+            vec![],
+        ),
     ]);
 
     let dir = TempDir::new().unwrap();
@@ -362,14 +480,16 @@ async fn test_e2e_gap_triggers_reconnect() {
     snap_w.await.unwrap();
 
     let guard = state_check.lock().unwrap();
-    let cs = guard.get("gap_test").expect("gap_test connection in monitor");
+    let cs = guard
+        .get("gap_test")
+        .expect("gap_test connection in monitor");
 
-    let eth_gaps = cs
-        .symbols
-        .get("ETHUSDT")
-        .map(|s| s.gaps_today)
-        .unwrap_or(0);
-    assert!(eth_gaps >= 1, "ETHUSDT.gaps_today should be >= 1 (got {})", eth_gaps);
+    let eth_gaps = cs.symbols.get("ETHUSDT").map(|s| s.gaps_today).unwrap_or(0);
+    assert!(
+        eth_gaps >= 1,
+        "ETHUSDT.gaps_today should be >= 1 (got {})",
+        eth_gaps
+    );
     assert!(
         cs.reconnects_today >= 1,
         "reconnects_today should be >= 1 (got {})",
@@ -410,14 +530,49 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
     // Round 1: BTC sync + post-sync arrive BEFORE ETH message.
     // ETH message triggers SnapshotRequired (book still unsynced) → reconnect.
     server.push_ws_round(vec![
-        ws_msg("btcusdt", 1_700_000_001_000, 200, 201, vec![("50000.00", "1.00")], vec![]),
-        ws_msg("btcusdt", 1_700_000_002_000, 202, 202, vec![("50000.00", "1.20")], vec![]),
-        ws_msg("ethusdt", 1_700_000_003_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
+        ws_msg(
+            "btcusdt",
+            1_700_000_001_000,
+            200,
+            201,
+            vec![("50000.00", "1.00")],
+            vec![],
+        ),
+        ws_msg(
+            "btcusdt",
+            1_700_000_002_000,
+            202,
+            202,
+            vec![("50000.00", "1.20")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_003_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
     ]);
     // Round 2: both symbols synced after reconnect.
     server.push_ws_round(vec![
-        ws_msg("ethusdt", 1_700_000_010_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_011_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_010_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_011_000,
+            102,
+            102,
+            vec![("3000.00", "6.00")],
+            vec![],
+        ),
     ]);
 
     let dir = TempDir::new().unwrap();
@@ -484,9 +639,30 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
 
     // Three events queued immediately on WS connect (before snapshot returns).
     server.push_ws_round(vec![
-        ws_msg("ethusdt", 1_700_000_001_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_002_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_003_000, 103, 103, vec![], vec![("3001.00", "2.00")]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_002_000,
+            102,
+            102,
+            vec![("3000.00", "6.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_003_000,
+            103,
+            103,
+            vec![],
+            vec![("3001.00", "2.00")],
+        ),
     ]);
 
     let dir = TempDir::new().unwrap();
@@ -545,13 +721,41 @@ async fn test_e2e_snap_parquet_created() {
 
     // Round 1: sets last_1s_flush entry at t≈0.
     server.push_ws_round(vec![
-        ws_msg("ethusdt", 1_700_000_001_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_002_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_002_000,
+            102,
+            102,
+            vec![("3000.00", "6.00")],
+            vec![],
+        ),
     ]);
     // Round 2: arrives after ~1 s backoff → first event triggers flush.
     server.push_ws_round(vec![
-        ws_msg("ethusdt", 1_700_000_010_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
-        ws_msg("ethusdt", 1_700_000_011_000, 102, 102, vec![("3000.00", "6.50")], vec![]),
+        ws_msg(
+            "ethusdt",
+            1_700_000_010_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_msg(
+            "ethusdt",
+            1_700_000_011_000,
+            102,
+            102,
+            vec![("3000.00", "6.50")],
+            vec![],
+        ),
     ]);
 
     let dir = TempDir::new().unwrap();

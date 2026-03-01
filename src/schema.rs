@@ -14,22 +14,38 @@ pub fn raw_schema() -> &'static Schema {
             Field::new("prev_seq_id", DataType::Int64, false),
             Field::new(
                 "bid_prices",
-                DataType::List(std::sync::Arc::new(Field::new("item", DataType::Float64, true))),
+                DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::Float64,
+                    true,
+                ))),
                 false,
             ),
             Field::new(
                 "bid_qtys",
-                DataType::List(std::sync::Arc::new(Field::new("item", DataType::Float64, true))),
+                DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::Float64,
+                    true,
+                ))),
                 false,
             ),
             Field::new(
                 "ask_prices",
-                DataType::List(std::sync::Arc::new(Field::new("item", DataType::Float64, true))),
+                DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::Float64,
+                    true,
+                ))),
                 false,
             ),
             Field::new(
                 "ask_qtys",
-                DataType::List(std::sync::Arc::new(Field::new("item", DataType::Float64, true))),
+                DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::Float64,
+                    true,
+                ))),
                 false,
             ),
         ])

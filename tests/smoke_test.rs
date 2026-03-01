@@ -25,7 +25,7 @@ use fathom::{
     exchange::{BinancePerp, BinanceSpot},
     monitor,
     writer::{
-        raw::{run_raw_writer, RawDiff},
+        raw::{RawDiff, run_raw_writer},
         snap_1s::run_snap_writer,
     },
 };
@@ -128,8 +128,14 @@ async fn live_spot_ethusdt_pipeline() {
     snap_handle.await.unwrap();
 
     let all = collect_parquets(dir.path());
-    let raws: Vec<_> = all.iter().filter(|p| p.to_str().unwrap_or("").contains("raw")).collect();
-    let snaps: Vec<_> = all.iter().filter(|p| p.to_str().unwrap_or("").contains("1s")).collect();
+    let raws: Vec<_> = all
+        .iter()
+        .filter(|p| p.to_str().unwrap_or("").contains("raw"))
+        .collect();
+    let snaps: Vec<_> = all
+        .iter()
+        .filter(|p| p.to_str().unwrap_or("").contains("1s"))
+        .collect();
 
     // Raw data
     assert!(!raws.is_empty(), "no raw parquet written");
@@ -158,7 +164,10 @@ async fn live_spot_ethusdt_pipeline() {
     let cs = guard.get("smoke_eth").expect("smoke_eth in monitor");
     let eth_gaps = cs.symbols.get("ETHUSDT").map(|s| s.gaps_today).unwrap_or(0);
     println!("reconnects: {}, gaps: {eth_gaps}", cs.reconnects_today);
-    assert_eq!(cs.reconnects_today, 0, "unexpected reconnects during 8 s run");
+    assert_eq!(
+        cs.reconnects_today, 0,
+        "unexpected reconnects during 8 s run"
+    );
     assert_eq!(eth_gaps, 0, "unexpected sequence gaps during 8 s run");
 }
 
@@ -177,7 +186,11 @@ async fn live_spot_multi_symbol() {
 
     let state = monitor::new_state();
     let task = tokio::spawn(connection_task(
-        live_conn("smoke_multi", vec!["ETHUSDT", "BTCUSDT"], Exchange::BinanceSpot),
+        live_conn(
+            "smoke_multi",
+            vec!["ETHUSDT", "BTCUSDT"],
+            Exchange::BinanceSpot,
+        ),
         Box::new(BinanceSpot),
         dir.path().to_path_buf(),
         state.clone(),
@@ -214,7 +227,10 @@ async fn live_spot_multi_symbol() {
     // BTC mid price sanity
     let snaps = collect_parquets(dir.path())
         .into_iter()
-        .filter(|p| p.to_str().unwrap_or("").contains("1s") && p.to_str().unwrap_or("").to_uppercase().contains("BTCUSDT"))
+        .filter(|p| {
+            p.to_str().unwrap_or("").contains("1s")
+                && p.to_str().unwrap_or("").to_uppercase().contains("BTCUSDT")
+        })
         .collect::<Vec<_>>();
     if !snaps.is_empty() {
         let btc_mids = read_f64_col(&snaps[0], "mid_px");

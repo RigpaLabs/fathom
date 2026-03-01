@@ -35,7 +35,9 @@ async fn test_raw_writer_creates_file() {
             prev_seq_id: 100 + i as i64,
             bids: vec![(3000.0, 5.0), (2999.0, 3.0)],
             asks: vec![(3001.0, 4.0)],
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     // Drop sender → triggers graceful shutdown in writer
@@ -44,7 +46,10 @@ async fn test_raw_writer_creates_file() {
 
     // Find the parquet file
     let parquet_files = find_parquets(&data_dir);
-    assert!(!parquet_files.is_empty(), "raw writer should create at least one parquet file");
+    assert!(
+        !parquet_files.is_empty(),
+        "raw writer should create at least one parquet file"
+    );
 
     // Read back and verify
     let file = std::fs::File::open(&parquet_files[0]).unwrap();
@@ -52,7 +57,9 @@ async fn test_raw_writer_creates_file() {
     let schema = reader.schema().clone();
 
     // Schema has correct columns
-    schema.field_with_name("timestamp_us").expect("timestamp_us");
+    schema
+        .field_with_name("timestamp_us")
+        .expect("timestamp_us");
     schema.field_with_name("exchange").expect("exchange");
     schema.field_with_name("symbol").expect("symbol");
     schema.field_with_name("bid_prices").expect("bid_prices");
@@ -82,7 +89,9 @@ async fn test_raw_writer_multiple_symbols() {
                 prev_seq_id: 100 + i as i64,
                 bids: vec![(3000.0, 1.0)],
                 asks: vec![(3001.0, 1.0)],
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
     }
 
@@ -90,7 +99,10 @@ async fn test_raw_writer_multiple_symbols() {
     writer.await.unwrap();
 
     let files = find_parquets(&dir.path().to_path_buf());
-    assert!(files.len() >= 2, "should create separate files for each symbol");
+    assert!(
+        files.len() >= 2,
+        "should create separate files for each symbol"
+    );
 }
 
 #[tokio::test]
@@ -118,14 +130,23 @@ async fn test_snap_writer_creates_file() {
 
     let now_us = chrono::Utc::now().timestamp_micros();
     for i in 0..3u64 {
-        tx.send(make_snap("binance_spot", "ETHUSDT", now_us + i as i64 * 1_000_000)).await.unwrap();
+        tx.send(make_snap(
+            "binance_spot",
+            "ETHUSDT",
+            now_us + i as i64 * 1_000_000,
+        ))
+        .await
+        .unwrap();
     }
 
     drop(tx);
     writer.await.unwrap();
 
     let files = find_parquets(&dir.path().to_path_buf());
-    assert!(!files.is_empty(), "snap writer should create at least one parquet file");
+    assert!(
+        !files.is_empty(),
+        "snap writer should create at least one parquet file"
+    );
 
     let file = std::fs::File::open(&files[0]).unwrap();
     let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
@@ -174,7 +195,9 @@ async fn test_snap_writer_verifies_data_values() {
         open_px: Some(50000.0),
         close_px: Some(50001.0),
         n_events: 42,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     drop(tx);
     writer.await.unwrap();
@@ -182,18 +205,27 @@ async fn test_snap_writer_verifies_data_values() {
     let files = find_parquets(&dir.path().to_path_buf());
     let file = std::fs::File::open(&files[0]).unwrap();
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap().build().unwrap();
+        .unwrap()
+        .build()
+        .unwrap();
     let batch = reader.next().unwrap().unwrap();
 
     // n_events is last column
     use arrow_array::UInt32Array;
-    let n_events = batch.column(batch.num_columns() - 1)
-        .as_any().downcast_ref::<UInt32Array>().unwrap();
+    let n_events = batch
+        .column(batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
     assert_eq!(n_events.value(0), 42);
 
     // ts_us is first column
     use arrow_array::Int64Array;
-    let ts_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let ts_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(ts_col.value(0), ts);
 }
 
@@ -205,14 +237,20 @@ async fn test_snap_writer_multiple_symbols() {
 
     let now_us = chrono::Utc::now().timestamp_micros();
     for sym in &["ETHUSDT", "BTCUSDT", "BNBUSDT"] {
-        tx.send(make_snap("binance_spot", sym, now_us)).await.unwrap();
+        tx.send(make_snap("binance_spot", sym, now_us))
+            .await
+            .unwrap();
     }
 
     drop(tx);
     writer.await.unwrap();
 
     let files = find_parquets(&dir.path().to_path_buf());
-    assert!(files.len() >= 3, "separate file per symbol: got {} files", files.len());
+    assert!(
+        files.len() >= 3,
+        "separate file per symbol: got {} files",
+        files.len()
+    );
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

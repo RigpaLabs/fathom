@@ -10,19 +10,19 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
 use axum::{
+    Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
     routing::get,
-    Router,
 };
 
 // ── Internal state ─────────────────────────────────────────────────────────────
@@ -97,10 +97,7 @@ async fn depth_handler(
     }
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
@@ -189,7 +186,11 @@ impl MockBinanceServer {
         let mut snaps = self.state.snapshots.lock().unwrap();
         let entry = snaps
             .entry(symbol.to_uppercase())
-            .or_insert_with(|| SymbolSnap { errors: VecDeque::new(), json: None, delay_ms: 0 });
+            .or_insert_with(|| SymbolSnap {
+                errors: VecDeque::new(),
+                json: None,
+                delay_ms: 0,
+            });
         entry.json = Some(json);
     }
 
@@ -198,7 +199,11 @@ impl MockBinanceServer {
         let mut snaps = self.state.snapshots.lock().unwrap();
         let entry = snaps
             .entry(symbol.to_uppercase())
-            .or_insert_with(|| SymbolSnap { errors: VecDeque::new(), json: None, delay_ms: 0 });
+            .or_insert_with(|| SymbolSnap {
+                errors: VecDeque::new(),
+                json: None,
+                delay_ms: 0,
+            });
         entry.errors.push_back(status);
     }
 
@@ -208,7 +213,11 @@ impl MockBinanceServer {
         let mut snaps = self.state.snapshots.lock().unwrap();
         let entry = snaps
             .entry(symbol.to_uppercase())
-            .or_insert_with(|| SymbolSnap { errors: VecDeque::new(), json: None, delay_ms: 0 });
+            .or_insert_with(|| SymbolSnap {
+                errors: VecDeque::new(),
+                json: None,
+                delay_ms: 0,
+            });
         entry.delay_ms = delay_ms;
     }
 

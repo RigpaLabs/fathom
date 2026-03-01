@@ -137,21 +137,37 @@ pub async fn connection_task(
             let mut stream = ws_stream;
             loop {
                 match tokio::time::timeout(hb_dur, stream.next()).await {
-                    Err(_) => { warn!(conn = %fwd_name, "heartbeat timeout"); break; }
-                    Ok(None) => { info!(conn = %fwd_name, "WS stream closed"); break; }
-                    Ok(Some(Err(e))) => { warn!(conn = %fwd_name, error = %e, "WS error"); break; }
+                    Err(_) => {
+                        warn!(conn = %fwd_name, "heartbeat timeout");
+                        break;
+                    }
+                    Ok(None) => {
+                        info!(conn = %fwd_name, "WS stream closed");
+                        break;
+                    }
+                    Ok(Some(Err(e))) => {
+                        warn!(conn = %fwd_name, error = %e, "WS error");
+                        break;
+                    }
                     Ok(Some(Ok(msg))) => match msg {
                         Message::Text(t) => {
-                            if fwd_tx.send(t.to_string()).await.is_err() { break; }
+                            if fwd_tx.send(t.to_string()).await.is_err() {
+                                break;
+                            }
                         }
                         Message::Binary(b) => {
                             if let Ok(s) = String::from_utf8(b.into())
-                                && fwd_tx.send(s).await.is_err() { break; }
+                                && fwd_tx.send(s).await.is_err()
+                            {
+                                break;
+                            }
                         }
-                        Message::Ping(p) => { let _ = sink.send(Message::Pong(p)).await; }
+                        Message::Ping(p) => {
+                            let _ = sink.send(Message::Pong(p)).await;
+                        }
                         Message::Close(_) => break,
                         _ => {}
-                    }
+                    },
                 }
             }
             // Dropping fwd_tx signals the main loop that the stream is done.
@@ -182,14 +198,19 @@ pub async fn connection_task(
                     }
                     Ok(snap) => {
                         info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");
-                        let bids: Vec<(f64, f64)> = snap.bids.iter().filter_map(parse_level).collect();
-                        let asks: Vec<(f64, f64)> = snap.asks.iter().filter_map(parse_level).collect();
-                        books.entry(sym.clone()).or_default().apply_snapshot(SnapshotMsg {
-                            symbol: sym.clone(),
-                            last_update_id: snap.last_update_id,
-                            bids,
-                            asks,
-                        });
+                        let bids: Vec<(f64, f64)> =
+                            snap.bids.iter().filter_map(parse_level).collect();
+                        let asks: Vec<(f64, f64)> =
+                            snap.asks.iter().filter_map(parse_level).collect();
+                        books
+                            .entry(sym.clone())
+                            .or_default()
+                            .apply_snapshot(SnapshotMsg {
+                                symbol: sym.clone(),
+                                last_update_id: snap.last_update_id,
+                                bids,
+                                asks,
+                            });
                     }
                 },
             }
@@ -207,6 +228,12 @@ pub async fn connection_task(
         let mut snap_ticker = tokio::time::interval(Duration::from_secs(1));
         snap_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         snap_ticker.tick().await;
+
+        // Periodic stats: event counter + 60s summary
+        let mut stats_ticker = tokio::time::interval(Duration::from_secs(60));
+        stats_ticker.tick().await; // consume immediate first tick
+        let mut event_count: u64 = 0;
+        let stats_start = Instant::now();
 
         'inner: loop {
             tokio::select! {
@@ -286,6 +313,7 @@ pub async fn connection_task(
                                 WindowAccumulator::new(adapter.name(), &symbol, timestamp_us)
                             });
                             acc.on_diff(book, &applied);
+                            event_count += 1;
                         }
                     }
                 }
@@ -304,6 +332,19 @@ pub async fn connection_task(
                             }
                         }
                     }
+                }
+
+                _ = stats_ticker.tick() => {
+                    let elapsed = stats_start.elapsed().as_secs();
+                    let rate = if elapsed > 0 { event_count / elapsed } else { 0 };
+                    info!(
+                        conn = %name,
+                        events = event_count,
+                        uptime_s = elapsed,
+                        events_per_sec = rate,
+                        symbols = symbols.len(),
+                        "periodic stats"
+                    );
                 }
             }
         }
@@ -336,7 +377,9 @@ pub async fn connection_task(
             }
         }
 
-        for book in books.values_mut() { *book = OrderBook::new(); }
+        for book in books.values_mut() {
+            *book = OrderBook::new();
+        }
         // Clear per-symbol accumulators so stale OFI/open_px/intra_sigma from the
         // previous session don't bleed into the first 1s snapshot after reconnect.
         accumulators.clear();

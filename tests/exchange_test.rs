@@ -10,7 +10,10 @@ fn test_spot_name() {
 #[test]
 fn test_spot_ws_url_single_symbol() {
     let url = BinanceSpot.ws_url(&["ETHUSDT".to_string()], 100);
-    assert_eq!(url, "wss://stream.binance.com/stream?streams=ethusdt@depth@100ms");
+    assert_eq!(
+        url,
+        "wss://stream.binance.com/stream?streams=ethusdt@depth@100ms"
+    );
 }
 
 #[test]
@@ -32,20 +35,29 @@ fn test_spot_ws_url_250ms() {
 #[test]
 fn test_spot_ws_url_lowercases_symbols() {
     let url = BinanceSpot.ws_url(&["BNBUSDT".to_string()], 100);
-    assert!(url.contains("bnbusdt"), "symbol should be lowercase in WS URL");
+    assert!(
+        url.contains("bnbusdt"),
+        "symbol should be lowercase in WS URL"
+    );
     assert!(!url.contains("BNBUSDT"));
 }
 
 #[test]
 fn test_spot_snapshot_url() {
     let url = BinanceSpot.snapshot_url("ETHUSDT");
-    assert_eq!(url, "https://api.binance.com/api/v3/depth?symbol=ETHUSDT&limit=5000");
+    assert_eq!(
+        url,
+        "https://api.binance.com/api/v3/depth?symbol=ETHUSDT&limit=5000"
+    );
 }
 
 #[test]
 fn test_spot_snapshot_url_uppercases() {
     let url = BinanceSpot.snapshot_url("ethusdt");
-    assert!(url.contains("ETHUSDT"), "symbol should be uppercase in REST URL");
+    assert!(
+        url.contains("ETHUSDT"),
+        "symbol should be uppercase in REST URL"
+    );
 }
 
 // ── BinancePerp ──────────────────────────────────────────────────────────────
@@ -58,14 +70,20 @@ fn test_perp_name() {
 #[test]
 fn test_perp_ws_url() {
     let url = BinancePerp.ws_url(&["ETHUSDT".to_string()], 100);
-    assert!(url.starts_with("wss://fstream.binance.com"), "perp uses fstream subdomain");
+    assert!(
+        url.starts_with("wss://fstream.binance.com"),
+        "perp uses fstream subdomain"
+    );
     assert!(url.contains("ethusdt@depth@100ms"));
 }
 
 #[test]
 fn test_perp_snapshot_url() {
     let url = BinancePerp.snapshot_url("BTCUSDT");
-    assert!(url.starts_with("https://fapi.binance.com"), "perp uses fapi");
+    assert!(
+        url.starts_with("https://fapi.binance.com"),
+        "perp uses fapi"
+    );
     assert!(url.contains("BTCUSDT"));
     assert!(url.contains("limit=1000"));
 }
