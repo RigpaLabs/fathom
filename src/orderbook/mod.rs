@@ -14,6 +14,10 @@ pub struct DepthDiff {
     pub timestamp_us: i64,
     pub seq_id: i64,      // u (final update id)
     pub prev_seq_id: i64, // U (first update id) — used for sync check on first event
+    /// Binance USDM Futures only: `pu` field (prev final update id).
+    /// When present, the ongoing gap check uses `pu == last_update_id` instead of
+    /// the spot rule `U == last_update_id + 1`.
+    pub prev_final_update_id: Option<i64>,
     pub bids: Vec<(f64, f64)>,
     pub asks: Vec<(f64, f64)>,
 }
@@ -116,8 +120,14 @@ impl OrderBook {
             }
             self.synced = true;
         } else {
-            // Ongoing: detect gap
-            if big_u != self.last_update_id + 1 {
+            // Ongoing: detect gap.
+            // Perp (USDM Futures) events carry `pu` (prev_final_update_id); use it
+            // when available.  Spot falls back to `U == prev_u + 1`.
+            let has_gap = match diff.prev_final_update_id {
+                Some(pu) => pu != self.last_update_id,
+                None => big_u != self.last_update_id + 1,
+            };
+            if has_gap {
                 return Err(AppError::OrderBookGap {
                     expected: self.last_update_id + 1,
                     got: big_u,
@@ -316,6 +326,7 @@ mod tests {
             timestamp_us: seq * 1_000,
             seq_id: seq,
             prev_seq_id: prev_seq,
+            prev_final_update_id: None,
             bids,
             asks,
         }
@@ -324,6 +335,49 @@ mod tests {
     /// Bug C: when a price level is removed (qty=0), bid_last must NOT retain a
     /// tombstone entry.  Before the fix, `bid_last.insert(key, 0.0)` was called
     /// unconditionally, so every removed level accumulated forever.
+    /// Binance USDM Futures perp events carry `pu` (prev_final_update_id).
+    /// An event where U != prev_u + 1 but pu == prev_u must NOT trigger a gap.
+    /// This exercises the perp-specific gap check branch.
+    #[test]
+    fn test_perp_pu_no_false_gap() {
+        let mut book = OrderBook::new();
+        // Snapshot: lastUpdateId = 105
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+        // Override last_update_id (snap() hardcodes 100; set it to 105 via a sync diff)
+        // Sync event: U=100 <= 101 <= u=110  (spans multiple IDs — valid sync)
+        let sync = DepthDiff {
+            exchange: "test".into(),
+            symbol: "ETHUSDT".into(),
+            timestamp_us: 1_000,
+            seq_id: 110,
+            prev_seq_id: 100,
+            prev_final_update_id: None,
+            bids: vec![],
+            asks: vec![],
+        };
+        book.apply_diff(&sync).expect("sync event should apply");
+        assert_eq!(book.last_update_id, 110);
+
+        // Perp next event: U=106 (not 111!), u=115, pu=110
+        // Spot rule: U(106) != 110+1=111 → would be a false gap
+        // Perp rule: pu(110) == last_update_id(110) → no gap
+        let perp_event = DepthDiff {
+            exchange: "test".into(),
+            symbol: "ETHUSDT".into(),
+            timestamp_us: 2_000,
+            seq_id: 115,
+            prev_seq_id: 106,
+            prev_final_update_id: Some(110),
+            bids: vec![],
+            asks: vec![],
+        };
+        assert!(
+            book.apply_diff(&perp_event).is_ok(),
+            "perp event with pu matching last_update_id must not trigger a gap"
+        );
+        assert_eq!(book.last_update_id, 115);
+    }
+
     #[test]
     fn test_removed_bid_level_not_retained_in_bid_last() {
         let mut book = OrderBook::new();

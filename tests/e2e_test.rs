@@ -461,6 +461,67 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
     );
 }
 
+// ── Test 6: WS events buffered during slow snapshot fetch are not dropped ─────
+
+/// Variant A correctness: the forwarder task buffers WS messages while REST
+/// snapshot is being fetched.  A 300 ms snapshot delay simulates a slow network.
+/// All 3 events sent at WS connect time must still appear in the raw parquet.
+///
+/// This validates that connection_task does not silently discard events that
+/// arrive before the snapshot HTTP response returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_ws_buffered_during_slow_snapshot() {
+    let server = MockBinanceServer::new().await;
+
+    // Snapshot takes 300 ms to respond — WS events arrive before it returns.
+    server.set_snapshot_delay_ms("ETHUSDT", 300);
+    server.push_snapshot(
+        "ETHUSDT",
+        100,
+        vec![("3000.00", "5.00")],
+        vec![("3001.00", "4.00")],
+    );
+
+    // Three events queued immediately on WS connect (before snapshot returns).
+    server.push_ws_round(vec![
+        ws_msg("ethusdt", 1_700_000_001_000, 100, 101, vec![("3000.00", "5.00")], vec![]),
+        ws_msg("ethusdt", 1_700_000_002_000, 102, 102, vec![("3000.00", "6.00")], vec![]),
+        ws_msg("ethusdt", 1_700_000_003_000, 103, 103, vec![], vec![("3001.00", "2.00")]),
+    ]);
+
+    let dir = TempDir::new().unwrap();
+    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
+    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60));
+    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+
+    let state = monitor::new_state();
+    let conn = make_conn("slow_snap_test", vec!["ETHUSDT"], &server);
+    let task = tokio::spawn(connection_task(
+        conn,
+        Box::new(BinanceSpot),
+        dir.path().to_path_buf(),
+        state,
+        raw_tx,
+        snap_tx,
+    ));
+
+    // Snapshot delay (300 ms) + event processing + writer flush + slack.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    task.abort();
+    let _ = task.await;
+    raw_w.await.unwrap();
+    snap_w.await.unwrap();
+
+    let raws = raw_parquets(dir.path());
+    assert!(!raws.is_empty(), "raw parquet must exist");
+    let rows: usize = raws.iter().map(|p| count_parquet_rows(p)).sum();
+    assert_eq!(
+        rows, 3,
+        "all 3 events must be processed despite slow snapshot fetch (got {rows})"
+    );
+}
+
 // ── Test 5: snap 1s parquet is created ───────────────────────────────────────
 
 /// Verifies that the 1s snapshot parquet file is written with the correct schema.

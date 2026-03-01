@@ -41,6 +41,10 @@ pub struct DepthUpdate {
     pub first_update_id: i64,
     #[serde(rename = "u")]
     pub final_update_id: i64,
+    /// Binance USDM Futures only: previous final update ID.
+    /// Absent from spot events (defaults to None).
+    #[serde(rename = "pu", default)]
+    pub prev_final_update_id: Option<i64>,
     #[serde(rename = "b")]
     pub bids: Vec<[serde_json::Value; 2]>,
     #[serde(rename = "a")]
@@ -118,7 +122,39 @@ pub async fn connection_task(
             }
         };
 
-        let (mut ws_sink, mut ws_stream) = ws.split();
+        // ── Variant A: forwarder buffers WS events while REST snapshots are fetched ──
+        // Spawning the forwarder immediately means:
+        //  - Ping frames are answered even during the snapshot HTTP round-trips.
+        //  - Events queued in the OS TCP buffer before snapshot fetch completes
+        //    are forwarded to fwd_rx and processed in order.
+        let (ws_sink, ws_stream) = ws.split();
+        let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(4_096);
+        let fwd_name = name.clone();
+        let forwarder = tokio::spawn(async move {
+            let hb_dur = Duration::from_secs(HEARTBEAT_TIMEOUT_S);
+            let mut sink = ws_sink;
+            let mut stream = ws_stream;
+            loop {
+                match tokio::time::timeout(hb_dur, stream.next()).await {
+                    Err(_) => { warn!(conn = %fwd_name, "heartbeat timeout"); break; }
+                    Ok(None) => { info!(conn = %fwd_name, "WS stream closed"); break; }
+                    Ok(Some(Err(e))) => { warn!(conn = %fwd_name, error = %e, "WS error"); break; }
+                    Ok(Some(Ok(msg))) => match msg {
+                        Message::Text(t) => {
+                            if fwd_tx.send(t.to_string()).await.is_err() { break; }
+                        }
+                        Message::Binary(b) => {
+                            if let Ok(s) = String::from_utf8(b.into())
+                                && fwd_tx.send(s).await.is_err() { break; }
+                        }
+                        Message::Ping(p) => { let _ = sink.send(Message::Pong(p)).await; }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+            // Dropping fwd_tx signals the main loop that the stream is done.
+        });
 
         // Fetch REST snapshots per symbol.
         // A failure for one symbol only skips that symbol — other symbols keep
@@ -165,25 +201,10 @@ pub async fn connection_task(
             }
         }
 
-        let hb_dur = Duration::from_secs(HEARTBEAT_TIMEOUT_S);
-
         loop {
-            let msg = match tokio::time::timeout(hb_dur, ws_stream.next()).await {
-                Err(_) => { warn!(conn = %name, "heartbeat timeout"); break; }
-                Ok(None) => { info!(conn = %name, "WS stream closed"); break; }
-                Ok(Some(Err(e))) => { warn!(conn = %name, error = %e, "WS error"); break; }
-                Ok(Some(Ok(m))) => m,
-            };
-
-            let text: String = match msg {
-                Message::Text(t) => t.to_string(),
-                Message::Binary(b) => match String::from_utf8(b.into()) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                },
-                Message::Ping(p) => { let _ = ws_sink.send(Message::Pong(p)).await; continue; }
-                Message::Close(_) => break,
-                _ => continue,
+            let text = match fwd_rx.recv().await {
+                None => break, // forwarder closed (stream ended, timeout, or error)
+                Some(t) => t,
             };
 
             let combined: WsCombined = match serde_json::from_str(&text) {
@@ -210,6 +231,7 @@ pub async fn connection_task(
                 timestamp_us,
                 seq_id: depth.final_update_id,
                 prev_seq_id: depth.first_update_id,
+                prev_final_update_id: depth.prev_final_update_id,
                 bids: bids.clone(),
                 asks: asks.clone(),
             };
@@ -221,10 +243,9 @@ pub async fn connection_task(
                     warn!(conn = %name, symbol = %symbol, "gap — reconnecting");
                     {
                         let mut state = monitor.lock().unwrap();
-                        if let Some(cs) = state.get_mut(&name) {
-                            if let Some(ss) = cs.symbols.get_mut(&symbol) {
-                                ss.gaps_today += 1;
-                            }
+                        if let Some(cs) = state.get_mut(&name)
+                            && let Some(ss) = cs.symbols.get_mut(&symbol) {
+                            ss.gaps_today += 1;
                         }
                     }
                     break;
@@ -234,10 +255,9 @@ pub async fn connection_task(
                 Ok(Some(applied)) => {
                     {
                         let mut state = monitor.lock().unwrap();
-                        if let Some(cs) = state.get_mut(&name) {
-                            if let Some(ss) = cs.symbols.get_mut(&symbol) {
-                                ss.last_event_at = Some(Instant::now());
-                            }
+                        if let Some(cs) = state.get_mut(&name)
+                            && let Some(ss) = cs.symbols.get_mut(&symbol) {
+                            ss.last_event_at = Some(Instant::now());
                         }
                     }
 
@@ -266,6 +286,9 @@ pub async fn connection_task(
                 }
             }
         }
+
+        forwarder.abort();
+        let _ = forwarder.await;
 
         {
             let mut state = monitor.lock().unwrap();

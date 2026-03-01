@@ -33,6 +33,8 @@ struct SymbolSnap {
     /// Snapshot JSON to return after all errors are consumed.
     /// Kept persistently — not consumed — so reconnects re-use the same snapshot.
     json: Option<String>,
+    /// Extra delay (ms) to add before returning the snapshot response.
+    delay_ms: u64,
 }
 
 #[derive(Clone)]
@@ -55,20 +57,25 @@ async fn depth_handler(
         .unwrap_or_default();
 
     // Decide response while holding the lock, clone what we need, then drop lock.
-    let result: Option<Result<String, u16>> = {
+    let (result, delay_ms) = {
         let mut snaps = state.snapshots.lock().unwrap();
         if let Some(entry) = snaps.get_mut(&symbol) {
+            let delay = entry.delay_ms;
             if let Some(code) = entry.errors.pop_front() {
-                Some(Err(code))
+                (Some(Err(code)), delay)
             } else if let Some(json) = entry.json.clone() {
-                Some(Ok(json))
+                (Some(Ok(json)), delay)
             } else {
-                None
+                (None, delay)
             }
         } else {
-            None
+            (None, 0)
         }
     };
+    if delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+    let result = result;
 
     match result {
         None => (
@@ -182,7 +189,7 @@ impl MockBinanceServer {
         let mut snaps = self.state.snapshots.lock().unwrap();
         let entry = snaps
             .entry(symbol.to_uppercase())
-            .or_insert_with(|| SymbolSnap { errors: VecDeque::new(), json: None });
+            .or_insert_with(|| SymbolSnap { errors: VecDeque::new(), json: None, delay_ms: 0 });
         entry.json = Some(json);
     }
 
@@ -191,8 +198,18 @@ impl MockBinanceServer {
         let mut snaps = self.state.snapshots.lock().unwrap();
         let entry = snaps
             .entry(symbol.to_uppercase())
-            .or_insert_with(|| SymbolSnap { errors: VecDeque::new(), json: None });
+            .or_insert_with(|| SymbolSnap { errors: VecDeque::new(), json: None, delay_ms: 0 });
         entry.errors.push_back(status);
+    }
+
+    /// Add an artificial delay (milliseconds) before snapshot responses for `symbol`.
+    /// Useful for testing that WS events buffered during slow snapshot fetch are processed.
+    pub fn set_snapshot_delay_ms(&self, symbol: &str, delay_ms: u64) {
+        let mut snaps = self.state.snapshots.lock().unwrap();
+        let entry = snaps
+            .entry(symbol.to_uppercase())
+            .or_insert_with(|| SymbolSnap { errors: VecDeque::new(), json: None, delay_ms: 0 });
+        entry.delay_ms = delay_ms;
     }
 
     /// Queue a batch of WS messages to send on the next incoming WS connection.

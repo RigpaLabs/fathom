@@ -7,6 +7,7 @@ fn make_diff(symbol: &str, first_id: i64, final_id: i64, bids: Vec<(f64, f64)>, 
         timestamp_us: 1_000_000,
         seq_id: final_id,
         prev_seq_id: first_id,
+        prev_final_update_id: None,
         bids,
         asks,
     }

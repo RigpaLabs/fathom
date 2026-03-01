@@ -18,6 +18,7 @@ fn make_book_synced() -> OrderBook {
         timestamp_us: 1_000_000,
         seq_id: 101,
         prev_seq_id: 100,
+        prev_final_update_id: None,
         bids: vec![],
         asks: vec![],
     };
@@ -37,6 +38,7 @@ fn test_flush_n_events() {
         timestamp_us: 1_000_000,
         seq_id: 102,
         prev_seq_id: 102,
+        prev_final_update_id: None,
         bids: vec![(3000.0, 6.0)],
         asks: vec![],
     };
@@ -58,6 +60,7 @@ fn test_bid_last_carry_over() {
     let diff1 = DepthDiff {
         exchange: "test".into(), symbol: "ETHUSDT".into(),
         timestamp_us: 1_000_000, seq_id: 102, prev_seq_id: 102,
+        prev_final_update_id: None,
         bids: vec![(3000.0, 7.0)], asks: vec![],
     };
     let applied1 = book.apply_diff(&diff1).unwrap().unwrap();
@@ -69,6 +72,7 @@ fn test_bid_last_carry_over() {
     let diff2 = DepthDiff {
         exchange: "test".into(), symbol: "ETHUSDT".into(),
         timestamp_us: 2_000_000, seq_id: 103, prev_seq_id: 103,
+        prev_final_update_id: None,
         bids: vec![(3000.0, 9.0)], asks: vec![],
     };
     let applied2 = book.apply_diff(&diff2).unwrap().unwrap();
@@ -86,6 +90,7 @@ fn test_intra_sigma_zero_single_event() {
     let diff = DepthDiff {
         exchange: "test".into(), symbol: "ETHUSDT".into(),
         timestamp_us: 1_000_000, seq_id: 102, prev_seq_id: 102,
+        prev_final_update_id: None,
         bids: vec![], asks: vec![],
     };
     let applied = book.apply_diff(&diff).unwrap().unwrap();
@@ -103,6 +108,7 @@ fn test_flush_resets_counters() {
     let diff = DepthDiff {
         exchange: "test".into(), symbol: "ETHUSDT".into(),
         timestamp_us: 1_000_000, seq_id: 102, prev_seq_id: 102,
+        prev_final_update_id: None,
         bids: vec![(3000.0, 8.0)], asks: vec![],
     };
     let applied = book.apply_diff(&diff).unwrap().unwrap();

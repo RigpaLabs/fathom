@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -64,7 +64,7 @@ struct SymbolWriter {
 }
 
 impl SymbolWriter {
-    fn open(dir: &PathBuf, symbol: &str, exchange: &str, now_utc: chrono::DateTime<Utc>) -> Result<Self> {
+    fn open(dir: &Path, symbol: &str, exchange: &str, now_utc: chrono::DateTime<Utc>) -> Result<Self> {
         let date_str = now_utc.format("%Y-%m-%d").to_string();
         let open_hour = now_utc.hour();
         let bucket = bucket_open(open_hour);
@@ -196,13 +196,11 @@ pub async fn run_raw_writer(
                 let symbol = event.symbol.clone();
 
                 // Check rotation
-                if let Some(sw) = writers.get_mut(&key) {
-                    if sw.should_rotate(now_utc) {
-                        if let Err(e) = sw.close_and_rename(now_utc) {
-                            warn!(error = %e, "failed to rotate raw file");
-                        }
-                        writers.remove(&key);
+                if let Some(sw) = writers.get_mut(&key) && sw.should_rotate(now_utc) {
+                    if let Err(e) = sw.close_and_rename(now_utc) {
+                        warn!(error = %e, "failed to rotate raw file");
                     }
+                    writers.remove(&key);
                 }
 
                 // Open writer if needed

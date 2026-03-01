@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -27,7 +27,7 @@ struct DayWriter {
 }
 
 impl DayWriter {
-    fn open(dir: &PathBuf, exchange: &str, symbol: &str, date_str: &str) -> Result<Self> {
+    fn open(dir: &Path, exchange: &str, symbol: &str, date_str: &str) -> Result<Self> {
         let sym_dir = dir.join("1s").join(exchange).join(symbol);
         std::fs::create_dir_all(&sym_dir)?;
         let path = sym_dir.join(format!("{date_str}.parquet"));
@@ -173,7 +173,11 @@ pub async fn run_snap_writer(data_dir: PathBuf, mut rx: mpsc::Receiver<Snapshot1
                 let exchange = snap.exchange.clone();
                 let symbol = snap.symbol.clone();
 
-                // Day rollover check
+                // Day rollover check.
+                // The nested ifs cannot be collapsed into a let-chain: `writers.get(&key)`
+                // borrows immutably and the inner `writers.remove(&key)` needs a mutable
+                // borrow — the borrow checker would reject the flat form.
+                #[allow(clippy::collapsible_if)]
                 if let Some(dw) = writers.get(&key) {
                     if dw.date_str != date_str {
                         if let Some(old) = writers.remove(&key) {
