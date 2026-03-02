@@ -10,7 +10,7 @@ use fathom::{
     writer::{
         raw::RawDiff,
         raw::{bucket_open, run_raw_writer},
-        snap_1s::run_snap_writer,
+        snap_1s::{run_snap_writer, run_snap_writer_with_flush_interval},
     },
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -255,6 +255,60 @@ async fn test_snap_writer_multiple_symbols() {
         files.len() >= 3,
         "separate file per symbol: got {} files",
         files.len()
+    );
+}
+
+/// Verify periodic disk flush creates multiple row groups.
+///
+/// Each `ArrowWriter::flush()` closes the current row group and starts a new one.
+/// Without periodic flush, all rows end up in a single row group (closed at finish).
+/// With flush_interval=10 and 25 rows, we expect 3 row groups: [10, 10, 5].
+#[tokio::test]
+async fn test_snap_writer_periodic_disk_flush() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = mpsc::channel::<Snapshot1s>(64);
+    let flush_interval = 10;
+    let total_rows = 25;
+    let writer = tokio::spawn(run_snap_writer_with_flush_interval(
+        dir.path().to_path_buf(),
+        rx,
+        flush_interval,
+    ));
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    for i in 0..total_rows as u64 {
+        tx.send(make_snap(
+            "binance_spot",
+            "ETHUSDT",
+            now_us + i as i64 * 1_000_000,
+        ))
+        .await
+        .unwrap();
+    }
+
+    drop(tx);
+    writer.await.unwrap();
+
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(files.len(), 1);
+
+    let file = std::fs::File::open(&files[0]).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let metadata = reader.metadata();
+
+    assert_eq!(
+        count_parquet_rows(&files[0]),
+        total_rows,
+        "all rows written"
+    );
+
+    // With flush_interval=10 and 25 rows: flush at row 10, 20, then close flushes remaining 5
+    let num_row_groups = metadata.num_row_groups();
+    assert_eq!(
+        num_row_groups, 3,
+        "periodic flush should create 3 row groups (10+10+5), got {num_row_groups}"
     );
 }
 

@@ -13,15 +13,27 @@ use tracing::{info, warn};
 
 use crate::{accumulator::Snapshot1s, error::Result, schema::snap_1s_schema};
 
+/// Flush the Parquet row group to disk every this many rows.
+/// At 1 row/sec this equals 1 hour — matches raw writer rotation cadence.
+const DEFAULT_DISK_FLUSH_INTERVAL: usize = 3600;
+
 struct DayWriter {
     writer: ArrowWriter<std::fs::File>,
     date_str: String,
     path: PathBuf,
     buffer: Vec<Snapshot1s>,
+    rows_since_disk_flush: usize,
+    disk_flush_interval: usize,
 }
 
 impl DayWriter {
-    fn open(dir: &Path, exchange: &str, symbol: &str, date_str: &str) -> Result<Self> {
+    fn open(
+        dir: &Path,
+        exchange: &str,
+        symbol: &str,
+        date_str: &str,
+        disk_flush_interval: usize,
+    ) -> Result<Self> {
         let sym_dir = dir.join("1s").join(exchange).join(symbol);
         std::fs::create_dir_all(&sym_dir)?;
         let path = sym_dir.join(format!("{date_str}.parquet"));
@@ -38,6 +50,8 @@ impl DayWriter {
             date_str: date_str.to_string(),
             path,
             buffer: Vec::new(),
+            rows_since_disk_flush: 0,
+            disk_flush_interval,
         })
     }
 
@@ -164,8 +178,16 @@ impl DayWriter {
         ]);
 
         let batch = arrow_array::RecordBatch::try_new(schema, columns)?;
+        let n = batch.num_rows();
         self.writer.write(&batch)?;
         self.buffer.clear();
+
+        self.rows_since_disk_flush += n;
+        if self.rows_since_disk_flush >= self.disk_flush_interval {
+            self.writer.flush()?;
+            self.rows_since_disk_flush = 0;
+            info!(path = %self.path.display(), rows = self.disk_flush_interval, "flushed 1s row group");
+        }
         Ok(())
     }
 
@@ -178,7 +200,25 @@ impl DayWriter {
 }
 
 /// 1s snapshot writer — one daily file per (exchange, symbol), flush on each row.
-pub async fn run_snap_writer(data_dir: PathBuf, mut rx: mpsc::Receiver<Snapshot1s>) {
+pub async fn run_snap_writer(data_dir: PathBuf, rx: mpsc::Receiver<Snapshot1s>) {
+    run_snap_writer_inner(data_dir, rx, DEFAULT_DISK_FLUSH_INTERVAL).await;
+}
+
+/// Testable entry point with configurable disk flush interval.
+#[doc(hidden)]
+pub async fn run_snap_writer_with_flush_interval(
+    data_dir: PathBuf,
+    rx: mpsc::Receiver<Snapshot1s>,
+    disk_flush_interval: usize,
+) {
+    run_snap_writer_inner(data_dir, rx, disk_flush_interval).await;
+}
+
+async fn run_snap_writer_inner(
+    data_dir: PathBuf,
+    mut rx: mpsc::Receiver<Snapshot1s>,
+    disk_flush_interval: usize,
+) {
     let mut writers: HashMap<String, DayWriter> = HashMap::new();
 
     loop {
@@ -208,7 +248,13 @@ pub async fn run_snap_writer(data_dir: PathBuf, mut rx: mpsc::Receiver<Snapshot1
 
                 // Open writer if needed
                 if !writers.contains_key(&key) {
-                    match DayWriter::open(&data_dir, &exchange, &symbol, &date_str) {
+                    match DayWriter::open(
+                        &data_dir,
+                        &exchange,
+                        &symbol,
+                        &date_str,
+                        disk_flush_interval,
+                    ) {
                         Ok(dw) => {
                             writers.insert(key.clone(), dw);
                         }
