@@ -34,15 +34,19 @@ pub fn run(data_dir: &Path, retention: Duration) -> Result<()> {
             continue;
         }
 
-        let mtime = parquet
+        // Use marker mtime (upload time), not parquet mtime (write time).
+        // This prevents premature deletion after extended downtime: if
+        // fathom-sync was offline >retention and uploads a backlog, those
+        // files won't be immediately deleted because the marker is fresh.
+        let marker_mtime = marker
             .metadata()
             .and_then(|m| m.modified())
             .map_err(|e| Error::Io {
-                path: parquet.clone(),
+                path: marker.to_path_buf(),
                 source: e,
             })?;
 
-        let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+        let age = now.duration_since(marker_mtime).unwrap_or(Duration::ZERO);
         if age < retention {
             continue;
         }

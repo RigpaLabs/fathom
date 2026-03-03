@@ -1,13 +1,7 @@
-mod cleanup;
-mod config;
-mod error;
-mod scanner;
-mod state;
-mod uploader;
-
 use std::path::PathBuf;
 use std::time::Duration;
 
+use fathom_sync::{cleanup, config, scanner, uploader};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -78,10 +72,16 @@ async fn main() {
         }
 
         // Wait or shutdown
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             _ = tokio::signal::ctrl_c() => {
-                info!("received shutdown signal");
+                info!("received SIGINT, shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down");
                 break;
             }
         }

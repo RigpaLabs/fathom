@@ -11,9 +11,20 @@ pub struct SyncCandidate {
     pub rel_path: PathBuf,
 }
 
+/// Check if any component of the relative path equals `target`.
+/// Handles versioned DATA_DIR (e.g. `v20260301-abc/raw/...` still matches "raw").
+fn has_component(rel: &Path, target: &str) -> bool {
+    rel.components()
+        .any(|c| c.as_os_str().to_str().is_some_and(|s| s == target))
+}
+
 /// Walk `data_dir` and return completed, not-yet-synced Parquet files.
 pub fn scan(data_dir: &Path) -> Vec<SyncCandidate> {
-    let today = Utc::now().format("%Y-%m-%d").to_string();
+    scan_with_today(data_dir, &Utc::now().format("%Y-%m-%d").to_string())
+}
+
+/// Testable inner: same as `scan` but accepts `today` as parameter.
+pub fn scan_with_today(data_dir: &Path, today: &str) -> Vec<SyncCandidate> {
     let mut candidates = Vec::new();
 
     for entry in WalkDir::new(data_dir)
@@ -37,10 +48,9 @@ pub fn scan(data_dir: &Path) -> Vec<SyncCandidate> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let rel_str = rel.to_string_lossy();
 
-        // Raw files: skip if filename contains _open
-        if (rel_str.starts_with("raw/") || rel_str.starts_with("raw\\"))
+        // Raw files: skip if filename contains _open (in-progress write)
+        if has_component(rel, "raw")
             && path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -50,7 +60,7 @@ pub fn scan(data_dir: &Path) -> Vec<SyncCandidate> {
         }
 
         // 1s files: skip today's file (still being written)
-        if (rel_str.starts_with("1s/") || rel_str.starts_with("1s\\"))
+        if has_component(rel, "1s")
             && path
                 .file_stem()
                 .and_then(|n| n.to_str())
