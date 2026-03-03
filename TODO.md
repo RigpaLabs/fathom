@@ -8,7 +8,11 @@
 
 ## Storage
 
-- [ ] **S3 upload** — upload completed Parquet files (rotated raw + daily 1s) to S3/R2 for long-term storage. Could run as a sidecar or post-rotation hook. Consider: lifecycle policies, compression, partitioning by date/exchange/symbol.
+- [x] **S3 upload** — `fathom-sync` sidecar binary. Scans data_dir for completed Parquet files, uploads to S3-compatible storage via `object_store`, tracks state with `.synced` markers, cleans up after configurable retention.
+
+## Observability
+
+- [ ] **OpenTelemetry + SigNoz** — instrument fathom and fathom-sync with OTel traces/metrics. Deploy SigNoz for visualization. Consider: spans for WS connect/reconnect, upload duration, error rates, disk usage gauge.
 
 ## Monitoring
 

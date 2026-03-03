@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "fathom-sync"]
+
 [package]
 name = "fathom"
 version = "0.1.0"

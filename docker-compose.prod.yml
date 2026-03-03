@@ -23,5 +23,27 @@ services:
         max-size: "50m"
         max-file: "5"
 
+  fathom-sync:
+    image: ghcr.io/${GITHUB_REPO}-sync:${SYNC_TAG:-latest}
+    container_name: fathom-sync
+    restart: unless-stopped
+    volumes:
+      - fathom-data:/app/data
+      - ./fathom-sync-config.toml:/app/config.toml:ro
+    environment:
+      - RUST_LOG=fathom_sync=info
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   fathom-data:

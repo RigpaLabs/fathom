@@ -1,0 +1,13 @@
+data_dir = "/app/data"          # same as fathom's data_dir
+scan_interval_s = 300           # check every 5 minutes
+
+[s3]
+bucket = "fathom-data"
+prefix = ""                     # optional: "prod/vps1"
+region = "auto"                 # "auto" for R2
+endpoint = ""                   # R2/MinIO endpoint URL
+# Credentials from env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+
+[cleanup]
+enabled = true
+retention_hours = 72            # delete local files 72h after upload
