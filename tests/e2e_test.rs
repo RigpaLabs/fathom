@@ -795,11 +795,12 @@ async fn test_e2e_snap_parquet_created() {
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
     let schema = builder.schema().clone();
 
-    // Schema must have exactly 60 fields (see schema.rs → snap_1s_schema).
+    // Schema must have exactly 64 fields (see schema.rs → snap_1s_schema).
+    // 60 original + 4 trade columns (volume_delta, buy_vol, sell_vol, trade_count).
     assert_eq!(
         schema.fields().len(),
-        60,
-        "snap schema should have 60 columns (got {})",
+        64,
+        "snap schema should have 64 columns (got {})",
         schema.fields().len()
     );
 

@@ -200,6 +200,10 @@ async fn test_snap_writer_verifies_data_values() {
         open_px: Some(50000.0),
         close_px: Some(50001.0),
         n_events: 42,
+        volume_delta: 0.0,
+        buy_vol: 0.0,
+        sell_vol: 0.0,
+        trade_count: 0,
     })
     .await
     .unwrap();
@@ -215,10 +219,10 @@ async fn test_snap_writer_verifies_data_values() {
         .unwrap();
     let batch = reader.next().unwrap().unwrap();
 
-    // n_events is last column
+    // n_events is 5th from last (4 trade columns were appended after it)
     use arrow_array::UInt32Array;
     let n_events = batch
-        .column(batch.num_columns() - 1)
+        .column(batch.num_columns() - 5)
         .as_any()
         .downcast_ref::<UInt32Array>()
         .unwrap();
@@ -542,6 +546,10 @@ fn make_snap(exchange: &str, symbol: &str, ts_us: i64) -> Snapshot1s {
         open_px: Some(3000.0),
         close_px: Some(3001.0),
         n_events: 7,
+        volume_delta: 0.0,
+        buy_vol: 0.0,
+        sell_vol: 0.0,
+        trade_count: 0,
     }
 }
 

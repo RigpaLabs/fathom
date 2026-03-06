@@ -95,6 +95,10 @@ pub fn snap_1s_schema() -> &'static Schema {
             Field::new("open_px", DataType::Float64, true),
             Field::new("close_px", DataType::Float64, true),
             Field::new("n_events", DataType::UInt32, false),
+            Field::new("volume_delta", DataType::Float64, false),
+            Field::new("buy_vol", DataType::Float64, false),
+            Field::new("sell_vol", DataType::Float64, false),
+            Field::new("trade_count", DataType::UInt32, false),
         ]);
 
         Schema::new(fields)

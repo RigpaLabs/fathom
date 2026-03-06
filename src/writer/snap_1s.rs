@@ -156,6 +156,10 @@ impl DayWriter {
         let open_px: Vec<Option<f64>> = self.buffer.iter().map(|s| s.open_px).collect();
         let close_px: Vec<Option<f64>> = self.buffer.iter().map(|s| s.close_px).collect();
         let n_events: Vec<u32> = self.buffer.iter().map(|s| s.n_events).collect();
+        let volume_delta: Vec<f64> = self.buffer.iter().map(|s| s.volume_delta).collect();
+        let buy_vol: Vec<f64> = self.buffer.iter().map(|s| s.buy_vol).collect();
+        let sell_vol: Vec<f64> = self.buffer.iter().map(|s| s.sell_vol).collect();
+        let trade_count: Vec<u32> = self.buffer.iter().map(|s| s.trade_count).collect();
 
         columns.extend([
             Arc::new(Float64Array::from(mid_px)) as ArrayRef,
@@ -175,6 +179,10 @@ impl DayWriter {
             Arc::new(Float64Array::from(open_px)) as ArrayRef,
             Arc::new(Float64Array::from(close_px)) as ArrayRef,
             Arc::new(UInt32Array::from(n_events)) as ArrayRef,
+            Arc::new(Float64Array::from(volume_delta)) as ArrayRef,
+            Arc::new(Float64Array::from(buy_vol)) as ArrayRef,
+            Arc::new(Float64Array::from(sell_vol)) as ArrayRef,
+            Arc::new(UInt32Array::from(trade_count)) as ArrayRef,
         ]);
 
         let batch = arrow_array::RecordBatch::try_new(schema, columns)?;

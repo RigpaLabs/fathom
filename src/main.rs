@@ -3,7 +3,9 @@ use std::{path::PathBuf, time::Instant};
 use fathom::{
     config::{Config, Exchange},
     connection::connection_task,
-    exchange::{BinancePerp, BinanceSpot, ExchangeAdapter},
+    connection_dydx::connection_task_dydx,
+    connection_hl::connection_task_hl,
+    exchange::{BinancePerp, BinanceSpot, ExchangeAdapter, Hyperliquid},
     monitor,
     writer::{raw::RawDiff, snap_1s::run_snap_writer},
 };
@@ -15,10 +17,12 @@ use fathom::accumulator::Snapshot1s;
 const RAW_FLUSH_INTERVAL_S: u64 = 300;
 const CHANNEL_BUFFER: usize = 8_192;
 
-fn make_adapter(exchange: &Exchange) -> Box<dyn ExchangeAdapter> {
+fn make_adapter(exchange: &Exchange) -> Option<Box<dyn ExchangeAdapter>> {
     match exchange {
-        Exchange::BinanceSpot => Box::new(BinanceSpot),
-        Exchange::BinancePerp => Box::new(BinancePerp),
+        Exchange::BinanceSpot => Some(Box::new(BinanceSpot)),
+        Exchange::BinancePerp => Some(Box::new(BinancePerp)),
+        Exchange::Dydx => None, // dYdX uses its own connection task
+        Exchange::Hyperliquid => Some(Box::new(Hyperliquid)),
     }
 }
 
@@ -66,14 +70,29 @@ async fn main() -> anyhow::Result<()> {
 
     let mut handles = Vec::new();
     for conn in cfg.connections {
-        let adapter = make_adapter(&conn.exchange);
         let data_dir = data_dir.clone();
         let mon = monitor_state.clone();
         let rtx = raw_tx.clone();
         let stx = snap_tx.clone();
-        handles.push(tokio::spawn(connection_task(
-            conn, adapter, data_dir, mon, rtx, stx,
-        )));
+        match conn.exchange {
+            Exchange::Dydx => {
+                handles.push(tokio::spawn(connection_task_dydx(
+                    conn, data_dir, mon, rtx, stx,
+                )));
+            }
+            Exchange::Hyperliquid => {
+                let adapter = make_adapter(&conn.exchange).unwrap();
+                handles.push(tokio::spawn(connection_task_hl(
+                    conn, adapter, data_dir, mon, rtx, stx,
+                )));
+            }
+            _ => {
+                let adapter = make_adapter(&conn.exchange).unwrap();
+                handles.push(tokio::spawn(connection_task(
+                    conn, adapter, data_dir, mon, rtx, stx,
+                )));
+            }
+        }
     }
 
     // Handle both SIGINT (Ctrl-C) and SIGTERM (Docker stop).

@@ -37,8 +37,8 @@ fn test_raw_schema_fields() {
 #[test]
 fn test_snap_1s_schema_fields() {
     let schema = snap_1s_schema();
-    // 3 base + 10 bid_px + 10 ask_px + 10 bid_sz + 10 ask_sz + 17 derived = 60
-    assert_eq!(schema.fields().len(), 60);
+    // 3 base + 10 bid_px + 10 ask_px + 10 bid_sz + 10 ask_sz + 17 derived + 4 trade = 64
+    assert_eq!(schema.fields().len(), 64);
 
     // Check first three
     assert_eq!(schema.field(0).name(), "ts_us");
@@ -216,6 +216,10 @@ fn test_snap_1s_schema_parquet_roundtrip() {
     columns.push(Arc::new(Float64Array::from(vec![Some(3000.0_f64)]))); // open_px
     columns.push(Arc::new(Float64Array::from(vec![Some(3001.0_f64)]))); // close_px
     columns.push(Arc::new(UInt32Array::from(vec![42_u32]))); // n_events
+    columns.push(Arc::new(Float64Array::from(vec![0.0_f64]))); // volume_delta
+    columns.push(Arc::new(Float64Array::from(vec![0.0_f64]))); // buy_vol
+    columns.push(Arc::new(Float64Array::from(vec![0.0_f64]))); // sell_vol
+    columns.push(Arc::new(UInt32Array::from(vec![0_u32]))); // trade_count
 
     assert_eq!(
         columns.len(),
@@ -238,11 +242,20 @@ fn test_snap_1s_schema_parquet_roundtrip() {
     let batch = reader.next().unwrap().unwrap();
     assert_eq!(batch.num_rows(), 1);
 
-    // Verify n_events column (last)
+    // Verify n_events column (4 trade columns were appended after it)
+    let n_events_idx = batch.num_columns() - 5; // n_events is 5th from last
     let n_events_col = batch
-        .column(batch.num_columns() - 1)
+        .column(n_events_idx)
         .as_any()
         .downcast_ref::<UInt32Array>()
         .unwrap();
     assert_eq!(n_events_col.value(0), 42);
+
+    // Verify trade_count column (last)
+    let trade_count_col = batch
+        .column(batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert_eq!(trade_count_col.value(0), 0);
 }

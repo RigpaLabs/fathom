@@ -1,8 +1,11 @@
 mod binance_perp;
 mod binance_spot;
+pub mod dydx;
+pub mod hyperliquid;
 
 pub use binance_perp::BinancePerp;
 pub use binance_spot::BinanceSpot;
+pub use hyperliquid::Hyperliquid;
 
 /// Adapter for an exchange's WebSocket and REST API endpoints.
 pub trait ExchangeAdapter: Send + Sync {
