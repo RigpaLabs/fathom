@@ -235,25 +235,28 @@ pub async fn connection_task_hl(
                             if !symbols.contains(&symbol) { continue; }
                             if book.levels.len() < 2 { continue; }
 
-                            let bids: Vec<(f64, f64)> = book.levels[0]
+                            // Parse all levels for accurate churn/OFI
+                            let all_bids: Vec<(f64, f64)> = book.levels[0]
                                 .iter()
                                 .filter_map(|l| {
                                     let px = l.px.parse::<f64>().ok()?;
                                     let sz = l.sz.parse::<f64>().ok()?;
                                     Some((px, sz))
                                 })
-                                .take(10)
                                 .collect();
 
-                            let asks: Vec<(f64, f64)> = book.levels[1]
+                            let all_asks: Vec<(f64, f64)> = book.levels[1]
                                 .iter()
                                 .filter_map(|l| {
                                     let px = l.px.parse::<f64>().ok()?;
                                     let sz = l.sz.parse::<f64>().ok()?;
                                     Some((px, sz))
                                 })
-                                .take(10)
                                 .collect();
+
+                            // Top 10 for raw diff and snapshot output
+                            let bids: Vec<(f64, f64)> = all_bids.iter().take(10).copied().collect();
+                            let asks: Vec<(f64, f64)> = all_asks.iter().take(10).copied().collect();
 
                             let timestamp_us = book.time * 1_000;
 
@@ -274,10 +277,10 @@ pub async fn connection_task_hl(
                             }
 
                             // OFI: compare current best bid/ask with previous snapshot
-                            let curr_best_bid_px = bids.first().map(|(p, _)| *p).unwrap_or(f64::NEG_INFINITY);
-                            let curr_best_bid_qty = bids.first().map(|(_, q)| *q).unwrap_or(0.0);
-                            let curr_best_ask_px = asks.first().map(|(p, _)| *p).unwrap_or(f64::INFINITY);
-                            let curr_best_ask_qty = asks.first().map(|(_, q)| *q).unwrap_or(0.0);
+                            let curr_best_bid_px = all_bids.first().map(|(p, _)| *p).unwrap_or(f64::NEG_INFINITY);
+                            let curr_best_bid_qty = all_bids.first().map(|(_, q)| *q).unwrap_or(0.0);
+                            let curr_best_ask_px = all_asks.first().map(|(p, _)| *p).unwrap_or(f64::INFINITY);
+                            let curr_best_ask_qty = all_asks.first().map(|(_, q)| *q).unwrap_or(0.0);
 
                             let ofi_l1_delta = if let Some(prev) = prev_snapshots.get(&symbol) {
                                 let ofi_bid = if curr_best_bid_px >= prev.best_bid_px {
@@ -295,9 +298,9 @@ pub async fn connection_task_hl(
                                 0.0
                             };
 
-                            // Churn: sum of |qty change| at each price level vs previous snapshot
+                            // Churn: sum of |qty change| at each price level vs previous snapshot (full depth)
                             let (churn_bid, churn_ask) = if let Some((prev_bids, prev_asks)) = last_levels.get(&symbol) {
-                                (compute_churn(prev_bids, &bids), compute_churn(prev_asks, &asks))
+                                (compute_churn(prev_bids, &all_bids), compute_churn(prev_asks, &all_asks))
                             } else {
                                 (0.0, 0.0)
                             };
@@ -309,7 +312,8 @@ pub async fn connection_task_hl(
                                 best_ask_qty: curr_best_ask_qty,
                             });
 
-                            last_levels.insert(symbol.clone(), (bids.clone(), asks.clone()));
+                            // Store full levels for churn, top-10 for snapshot output
+                            last_levels.insert(symbol.clone(), (all_bids, all_asks));
 
                             let acc = accumulators.entry(symbol.clone()).or_insert_with(|| {
                                 WindowAccumulator::new(adapter.name(), &symbol, timestamp_us)
@@ -342,11 +346,15 @@ pub async fn connection_task_hl(
                             };
                             for trade in &trades {
                                 if !symbols.contains(&trade.coin) { continue; }
+                                let is_buy = match trade.side.as_str() {
+                                    "B" => true,
+                                    "A" => false,
+                                    _ => continue, // skip trades with unknown side
+                                };
                                 let size = match trade.sz.parse::<f64>() {
                                     Ok(s) => s,
                                     Err(_) => continue,
                                 };
-                                let is_buy = trade.side == "B";
                                 let ts_us = trade.time * 1_000;
                                 let acc = accumulators.entry(trade.coin.clone()).or_insert_with(|| {
                                     WindowAccumulator::new(adapter.name(), &trade.coin, ts_us)
@@ -362,8 +370,12 @@ pub async fn connection_task_hl(
                     let ts_us = Utc::now().timestamp_micros();
                     for sym in &symbols {
                         if let Some(acc) = accumulators.get_mut(sym) {
-                            let levels = last_levels.get(sym).map(|(b, a)| (b, a));
-                            let snap = acc.flush_with_levels(levels, ts_us);
+                            let levels = last_levels.get(sym).map(|(b, a)| {
+                                let b10: Levels = b.iter().take(10).copied().collect();
+                                let a10: Levels = a.iter().take(10).copied().collect();
+                                (b10, a10)
+                            });
+                            let snap = acc.flush_with_levels(levels.as_ref().map(|(b, a)| (b, a)), ts_us);
                             if snap_tx.try_send(snap).is_err() {
                                 warn!(conn = %name, symbol = %sym, "snap channel full — 1s snap dropped");
                             }
@@ -402,8 +414,12 @@ pub async fn connection_task_hl(
             let ts_us = Utc::now().timestamp_micros();
             for sym in &symbols {
                 if let Some(acc) = accumulators.get_mut(sym) {
-                    let levels = last_levels.get(sym).map(|(b, a)| (b, a));
-                    let snap = acc.flush_with_levels(levels, ts_us);
+                    let levels = last_levels.get(sym).map(|(b, a)| {
+                        let b10: Levels = b.iter().take(10).copied().collect();
+                        let a10: Levels = a.iter().take(10).copied().collect();
+                        (b10, a10)
+                    });
+                    let snap = acc.flush_with_levels(levels.as_ref().map(|(b, a)| (b, a)), ts_us);
                     if snap_tx.try_send(snap).is_err() {
                         warn!(conn = %name, symbol = %sym, "snap channel full — disconnect flush dropped");
                     }
@@ -436,4 +452,78 @@ fn compute_churn(prev: &[(f64, f64)], curr: &[(f64, f64)]) -> f64 {
     }
 
     churn
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_churn_identical() {
+        let levels = vec![(100.0, 5.0), (99.0, 3.0)];
+        assert!((compute_churn(&levels, &levels)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_churn_qty_change() {
+        let prev = vec![(100.0, 5.0), (99.0, 3.0)];
+        let curr = vec![(100.0, 7.0), (99.0, 1.0)];
+        // |7-5| + |1-3| = 2 + 2 = 4
+        assert!((compute_churn(&prev, &curr) - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_churn_new_level() {
+        let prev = vec![(100.0, 5.0)];
+        let curr = vec![(100.0, 5.0), (99.0, 3.0)];
+        // 99.0 is new: |3.0| = 3.0, 100.0 unchanged: 0
+        assert!((compute_churn(&prev, &curr) - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_churn_removed_level() {
+        let prev = vec![(100.0, 5.0), (99.0, 3.0)];
+        let curr = vec![(100.0, 5.0)];
+        // 99.0 removed: |0-3| = 3.0, 100.0 unchanged: 0
+        assert!((compute_churn(&prev, &curr) - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_churn_empty() {
+        assert!((compute_churn(&[], &[])).abs() < 1e-10);
+        assert!((compute_churn(&[], &[(100.0, 5.0)]) - 5.0).abs() < 1e-10);
+        assert!((compute_churn(&[(100.0, 5.0)], &[]) - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_hl_trade_deser() {
+        let json = serde_json::json!({
+            "coin": "ETH",
+            "side": "B",
+            "px": "2500.0",
+            "sz": "1.5",
+            "time": 1709654400000_i64
+        });
+        let trade: HlTrade = serde_json::from_value(json).unwrap();
+        assert_eq!(trade.coin, "ETH");
+        assert_eq!(trade.side, "B");
+        assert_eq!(trade.sz, "1.5");
+        assert_eq!(trade.time, 1709654400000);
+    }
+
+    #[test]
+    fn test_hl_l2book_deser() {
+        let json = serde_json::json!({
+            "coin": "ETH",
+            "time": 1709654400000_i64,
+            "levels": [
+                [{"px": "2500.0", "sz": "1.0", "n": 1}],
+                [{"px": "2501.0", "sz": "2.0", "n": 1}]
+            ]
+        });
+        let book: HlL2Book = serde_json::from_value(json).unwrap();
+        assert_eq!(book.coin, "ETH");
+        assert_eq!(book.levels.len(), 2);
+        assert_eq!(book.levels[0][0].px, "2500.0");
+    }
 }

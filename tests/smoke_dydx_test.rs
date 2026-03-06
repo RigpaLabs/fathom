@@ -8,12 +8,13 @@
 ///
 /// Run single:
 ///   cargo test --test smoke_dydx_test live_dydx_eth_pipeline -- --include-ignored --nocapture
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
-use arrow::array::{Array, Float64Array, UInt32Array};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
+
+mod helpers;
+use helpers::parquet::{collect_parquets, count_rows, read_f64_col, read_u32_col};
 
 use fathom::{
     accumulator::Snapshot1s,
@@ -27,75 +28,6 @@ use fathom::{
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn collect_parquets(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(collect_parquets(&path));
-            } else if path.extension().map_or(false, |e| e == "parquet") {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
-fn count_rows(path: &Path) -> usize {
-    let file = std::fs::File::open(path).expect("parquet file");
-    ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap()
-        .map(|b| b.unwrap().num_rows())
-        .sum()
-}
-
-fn read_f64_col(path: &Path, col: &str) -> Vec<f64> {
-    let file = std::fs::File::open(path).expect("parquet file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.unwrap();
-        if let Some(arr) = batch.column_by_name(col) {
-            if let Some(fa) = arr.as_any().downcast_ref::<Float64Array>() {
-                for i in 0..fa.len() {
-                    if !fa.is_null(i) {
-                        values.push(fa.value(i));
-                    }
-                }
-            }
-        }
-    }
-    values
-}
-
-fn read_u32_col(path: &Path, col: &str) -> Vec<u32> {
-    let file = std::fs::File::open(path).expect("parquet file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.unwrap();
-        if let Some(arr) = batch.column_by_name(col) {
-            if let Some(ua) = arr.as_any().downcast_ref::<UInt32Array>() {
-                for i in 0..ua.len() {
-                    if !ua.is_null(i) {
-                        values.push(ua.value(i));
-                    }
-                }
-            }
-        }
-    }
-    values
-}
 
 fn dydx_conn(name: &str, symbols: Vec<&str>) -> ConnectionConfig {
     ConnectionConfig {
@@ -148,7 +80,10 @@ async fn live_dydx_eth_pipeline() {
         .into_iter()
         .filter(|p| p.to_str().unwrap_or("").contains("1s"))
         .collect();
-    assert!(!snaps.is_empty(), "no 1s snap parquet written for dYdX ETH-USD");
+    assert!(
+        !snaps.is_empty(),
+        "no 1s snap parquet written for dYdX ETH-USD"
+    );
 
     let snap_rows: usize = snaps.iter().map(|p| count_rows(p)).sum();
     println!("dYdX ETH-USD snap rows: {snap_rows}");

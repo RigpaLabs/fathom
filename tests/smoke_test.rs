@@ -11,12 +11,13 @@
 ///
 /// Run a single test:
 ///   cargo test --test smoke_test live_spot_ethusdt -- --include-ignored --nocapture
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
-use arrow::array::{Array, Float64Array};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
+
+mod helpers;
+use helpers::parquet::{collect_parquets, count_rows, read_f64_col};
 
 use fathom::{
     accumulator::Snapshot1s,
@@ -31,54 +32,6 @@ use fathom::{
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
-
-fn collect_parquets(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(collect_parquets(&path));
-            } else if path.extension().map_or(false, |e| e == "parquet") {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
-fn count_rows(path: &Path) -> usize {
-    let file = std::fs::File::open(path).expect("parquet file");
-    ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap()
-        .map(|b| b.unwrap().num_rows())
-        .sum()
-}
-
-/// Read all non-null values from a Float64 column in a parquet file.
-fn read_f64_col(path: &Path, col: &str) -> Vec<f64> {
-    let file = std::fs::File::open(path).expect("parquet file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.unwrap();
-        if let Some(arr) = batch.column_by_name(col) {
-            if let Some(fa) = arr.as_any().downcast_ref::<Float64Array>() {
-                for i in 0..fa.len() {
-                    if !fa.is_null(i) {
-                        values.push(fa.value(i));
-                    }
-                }
-            }
-        }
-    }
-    values
-}
 
 fn live_conn(name: &str, symbols: Vec<&str>, exchange: Exchange) -> ConnectionConfig {
     ConnectionConfig {

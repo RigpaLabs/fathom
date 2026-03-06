@@ -344,6 +344,7 @@ pub async fn connection_task_dydx(
         info!(conn = %name, symbols = ?symbols, "subscribed to dYdX channels");
 
         let mut snapshotted: HashMap<String, bool> = HashMap::new();
+        let mut last_msg_id: HashMap<String, i64> = HashMap::new();
         for sym in &symbols {
             snapshotted.insert(sym.clone(), false);
         }
@@ -448,14 +449,17 @@ pub async fn connection_task_dydx(
                             }
 
                             let ts_us = Utc::now().timestamp_micros();
+                            let msg_id = v["message_id"].as_i64().unwrap_or(0);
+                            let prev_msg_id = last_msg_id.get(&symbol).copied().unwrap_or(0);
+                            last_msg_id.insert(symbol.clone(), msg_id);
 
                             if raw_tx
                                 .try_send(RawDiff {
                                     timestamp_us: ts_us,
                                     exchange: EXCHANGE_NAME.to_string(),
                                     symbol: symbol.clone(),
-                                    seq_id: v["message_id"].as_i64().unwrap_or(0),
-                                    prev_seq_id: 0,
+                                    seq_id: msg_id,
+                                    prev_seq_id: prev_msg_id,
                                     bids: all_bids.clone(),
                                     asks: all_asks.clone(),
                                 })
@@ -503,12 +507,18 @@ pub async fn connection_task_dydx(
                             for item in contents {
                                 if let Some(trades) = item["trades"].as_array() {
                                     for trade in trades {
-                                        let side = trade["side"].as_str().unwrap_or("");
-                                        let size: f64 = trade["size"]
+                                        let is_buy = match trade["side"].as_str() {
+                                            Some("BUY") => true,
+                                            Some("SELL") => false,
+                                            _ => continue, // skip trades with unknown side
+                                        };
+                                        let size: f64 = match trade["size"]
                                             .as_str()
                                             .and_then(|s| s.parse().ok())
-                                            .unwrap_or(0.0);
-                                        let is_buy = side == "BUY";
+                                        {
+                                            Some(s) => s,
+                                            None => continue,
+                                        };
                                         acc.accumulate_trade(size, is_buy);
                                     }
                                 }

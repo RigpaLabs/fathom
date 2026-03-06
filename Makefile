@@ -1,4 +1,4 @@
-.PHONY: run run-json build release test smoke lint fmt fmt-check clean docker-smoke docker-blue-green monitor check-data cov
+.PHONY: run run-json build release test smoke lint fmt fmt-check check clean docker-smoke docker-blue-green monitor check-data cov
 
 build:
 	cargo build
@@ -26,6 +26,8 @@ fmt:
 
 fmt-check:
 	cargo fmt --check
+
+check: fmt-check lint test
 
 clean:
 	cargo clean

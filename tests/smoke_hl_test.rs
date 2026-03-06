@@ -8,12 +8,13 @@
 ///
 /// Run single:
 ///   cargo test --test smoke_hl_test live_hl_eth_pipeline -- --include-ignored --nocapture
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
-use arrow::array::{Array, Float32Array, Float64Array, UInt32Array};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
+
+mod helpers;
+use helpers::parquet::{collect_parquets, count_rows, read_f32_col, read_f64_col, read_u32_col};
 
 use fathom::{
     accumulator::Snapshot1s,
@@ -28,97 +29,6 @@ use fathom::{
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn collect_parquets(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(collect_parquets(&path));
-            } else if path.extension().map_or(false, |e| e == "parquet") {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
-fn count_rows(path: &Path) -> usize {
-    let file = std::fs::File::open(path).expect("parquet file");
-    ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap()
-        .map(|b| b.unwrap().num_rows())
-        .sum()
-}
-
-fn read_f64_col(path: &Path, col: &str) -> Vec<f64> {
-    let file = std::fs::File::open(path).expect("parquet file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.unwrap();
-        if let Some(arr) = batch.column_by_name(col) {
-            if let Some(fa) = arr.as_any().downcast_ref::<Float64Array>() {
-                for i in 0..fa.len() {
-                    if !fa.is_null(i) {
-                        values.push(fa.value(i));
-                    }
-                }
-            }
-        }
-    }
-    values
-}
-
-fn read_f32_col(path: &Path, col: &str) -> Vec<f32> {
-    let file = std::fs::File::open(path).expect("parquet file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.unwrap();
-        if let Some(arr) = batch.column_by_name(col) {
-            if let Some(fa) = arr.as_any().downcast_ref::<Float32Array>() {
-                for i in 0..fa.len() {
-                    if !fa.is_null(i) {
-                        values.push(fa.value(i));
-                    }
-                }
-            }
-        }
-    }
-    values
-}
-
-fn read_u32_col(path: &Path, col: &str) -> Vec<u32> {
-    let file = std::fs::File::open(path).expect("parquet file");
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut values = Vec::new();
-    for batch in reader {
-        let batch = batch.unwrap();
-        if let Some(arr) = batch.column_by_name(col) {
-            if let Some(ua) = arr.as_any().downcast_ref::<UInt32Array>() {
-                for i in 0..ua.len() {
-                    if !ua.is_null(i) {
-                        values.push(ua.value(i));
-                    }
-                }
-            }
-        }
-    }
-    values
-}
 
 fn hl_conn(name: &str, symbols: Vec<&str>) -> ConnectionConfig {
     ConnectionConfig {
@@ -172,7 +82,10 @@ async fn live_hl_eth_pipeline() {
         .into_iter()
         .filter(|p| p.to_str().unwrap_or("").contains("1s"))
         .collect();
-    assert!(!snaps.is_empty(), "no 1s snap parquet written for Hyperliquid ETH");
+    assert!(
+        !snaps.is_empty(),
+        "no 1s snap parquet written for Hyperliquid ETH"
+    );
 
     let snap_rows: usize = snaps.iter().map(|p| count_rows(p)).sum();
     println!("HL ETH snap rows: {snap_rows}");
@@ -190,16 +103,28 @@ async fn live_hl_eth_pipeline() {
 
     // OFI should have non-zero values after warmup
     let ofis = read_f64_col(&snaps[0], "ofi_l1");
-    println!("HL ETH ofi_l1 values: {} total, first 5: {:?}", ofis.len(), &ofis[..ofis.len().min(5)]);
+    println!(
+        "HL ETH ofi_l1 values: {} total, first 5: {:?}",
+        ofis.len(),
+        &ofis[..ofis.len().min(5)]
+    );
     assert!(!ofis.is_empty(), "ofi_l1 column is empty");
 
     // Trade columns should exist (may be zero if no trades in window, but column must be present)
     let trade_counts = read_u32_col(&snaps[0], "trade_count");
-    println!("HL ETH trade_count values: {} total, first 5: {:?}", trade_counts.len(), &trade_counts[..trade_counts.len().min(5)]);
+    println!(
+        "HL ETH trade_count values: {} total, first 5: {:?}",
+        trade_counts.len(),
+        &trade_counts[..trade_counts.len().min(5)]
+    );
     assert_eq!(trade_counts.len(), snap_rows, "trade_count rows mismatch");
 
     let vol_deltas = read_f64_col(&snaps[0], "volume_delta");
-    println!("HL ETH volume_delta: {} total, first 5: {:?}", vol_deltas.len(), &vol_deltas[..vol_deltas.len().min(5)]);
+    println!(
+        "HL ETH volume_delta: {} total, first 5: {:?}",
+        vol_deltas.len(),
+        &vol_deltas[..vol_deltas.len().min(5)]
+    );
 
     // At least some trades should have happened in 12 seconds on ETH
     let total_trades: u32 = trade_counts.iter().sum();
@@ -208,7 +133,11 @@ async fn live_hl_eth_pipeline() {
     // Imbalance should be populated (stored as f32 in Parquet)
     let imbs = read_f32_col(&snaps[0], "imbalance_l1");
     assert!(!imbs.is_empty(), "imbalance_l1 column empty");
-    println!("HL ETH imbalance_l1: {} values, first 5: {:?}", imbs.len(), &imbs[..imbs.len().min(5)]);
+    println!(
+        "HL ETH imbalance_l1: {} values, first 5: {:?}",
+        imbs.len(),
+        &imbs[..imbs.len().min(5)]
+    );
     for &v in &imbs {
         assert!((-1.0..=1.0).contains(&v), "imbalance_l1 {v} out of [-1,1]");
     }
@@ -216,7 +145,10 @@ async fn live_hl_eth_pipeline() {
     // Monitor state
     let guard = state.lock().unwrap();
     if let Some(cs) = guard.get("smoke_hl_eth") {
-        println!("HL reconnects: {}, connected: {}", cs.reconnects_today, cs.connected);
+        println!(
+            "HL reconnects: {}, connected: {}",
+            cs.reconnects_today, cs.connected
+        );
     }
 }
 
@@ -252,8 +184,14 @@ async fn live_hl_multi_symbol() {
         .filter(|p| p.to_str().unwrap_or("").contains("1s"))
         .collect::<Vec<_>>();
 
-    let eth_snaps: Vec<_> = snaps.iter().filter(|p| p.to_str().unwrap_or("").contains("ETH")).collect();
-    let btc_snaps: Vec<_> = snaps.iter().filter(|p| p.to_str().unwrap_or("").contains("BTC")).collect();
+    let eth_snaps: Vec<_> = snaps
+        .iter()
+        .filter(|p| p.to_str().unwrap_or("").contains("ETH"))
+        .collect();
+    let btc_snaps: Vec<_> = snaps
+        .iter()
+        .filter(|p| p.to_str().unwrap_or("").contains("BTC"))
+        .collect();
 
     assert!(!eth_snaps.is_empty(), "no snap for ETH");
     assert!(!btc_snaps.is_empty(), "no snap for BTC");

@@ -5,7 +5,7 @@ use fathom::{
     connection::connection_task,
     connection_dydx::connection_task_dydx,
     connection_hl::connection_task_hl,
-    exchange::{BinancePerp, BinanceSpot, ExchangeAdapter, Hyperliquid},
+    exchange::{BinancePerp, BinanceSpot, Hyperliquid},
     monitor,
     writer::{raw::RawDiff, snap_1s::run_snap_writer},
 };
@@ -16,15 +16,6 @@ use fathom::accumulator::Snapshot1s;
 
 const RAW_FLUSH_INTERVAL_S: u64 = 300;
 const CHANNEL_BUFFER: usize = 8_192;
-
-fn make_adapter(exchange: &Exchange) -> Option<Box<dyn ExchangeAdapter>> {
-    match exchange {
-        Exchange::BinanceSpot => Some(Box::new(BinanceSpot)),
-        Exchange::BinancePerp => Some(Box::new(BinancePerp)),
-        Exchange::Dydx => None, // dYdX uses its own connection task
-        Exchange::Hyperliquid => Some(Box::new(Hyperliquid)),
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -75,21 +66,39 @@ async fn main() -> anyhow::Result<()> {
         let rtx = raw_tx.clone();
         let stx = snap_tx.clone();
         match conn.exchange {
-            Exchange::Dydx => {
-                handles.push(tokio::spawn(connection_task_dydx(
-                    conn, data_dir, mon, rtx, stx,
+            Exchange::BinanceSpot => {
+                handles.push(tokio::spawn(connection_task(
+                    conn,
+                    Box::new(BinanceSpot),
+                    data_dir,
+                    mon,
+                    rtx,
+                    stx,
+                )));
+            }
+            Exchange::BinancePerp => {
+                handles.push(tokio::spawn(connection_task(
+                    conn,
+                    Box::new(BinancePerp),
+                    data_dir,
+                    mon,
+                    rtx,
+                    stx,
                 )));
             }
             Exchange::Hyperliquid => {
-                let adapter = make_adapter(&conn.exchange).unwrap();
                 handles.push(tokio::spawn(connection_task_hl(
-                    conn, adapter, data_dir, mon, rtx, stx,
+                    conn,
+                    Box::new(Hyperliquid),
+                    data_dir,
+                    mon,
+                    rtx,
+                    stx,
                 )));
             }
-            _ => {
-                let adapter = make_adapter(&conn.exchange).unwrap();
-                handles.push(tokio::spawn(connection_task(
-                    conn, adapter, data_dir, mon, rtx, stx,
+            Exchange::Dydx => {
+                handles.push(tokio::spawn(connection_task_dydx(
+                    conn, data_dir, mon, rtx, stx,
                 )));
             }
         }
