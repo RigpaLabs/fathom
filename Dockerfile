@@ -1,14 +1,11 @@
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 findutils \
+    ca-certificates findutils \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home appuser
 WORKDIR /app
