@@ -3,10 +3,10 @@
 ## [0.2.1] — 2026-03-07
 
 ### Fixed
-- **Memory: ~500MB → ~60MB** — set `max_row_group_size` on Parquet ArrowWriters (was default 1M rows, now 8K raw / 4K snap)
+- **Memory: ~500MB → ~50MB** — raw flush interval 300s → 5s, parquet `max_row_group_size` 1M → 8K/4K, channel buffer 8192 → 2048
 
 ### Changed
-- Docker deploy: added `--memory 256m` limit
+- Docker deploy: added `--memory 128m` limit
 
 ## [0.2.0] — 2026-03-06
 

@@ -14,8 +14,8 @@ use tracing::info;
 
 use fathom::accumulator::Snapshot1s;
 
-const RAW_FLUSH_INTERVAL_S: u64 = 300;
-const CHANNEL_BUFFER: usize = 8_192;
+const RAW_FLUSH_INTERVAL_S: u64 = 5;
+const CHANNEL_BUFFER: usize = 2_048;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
