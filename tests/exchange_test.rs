@@ -1,4 +1,4 @@
-use fathom::exchange::{BinancePerp, BinanceSpot, ExchangeAdapter};
+use fathom::exchange::{BinancePerp, BinanceSpot, ExchangeAdapter, Hyperliquid};
 
 // ── BinanceSpot ──────────────────────────────────────────────────────────────
 
@@ -100,5 +100,32 @@ fn test_spot_perp_different_urls() {
         BinanceSpot.snapshot_url("ETHUSDT"),
         BinancePerp.snapshot_url("ETHUSDT"),
         "spot and perp snapshot URLs must differ"
+    );
+}
+
+// ── Hyperliquid ──────────────────────────────────────────────────────────────
+
+#[test]
+fn test_hl_name() {
+    assert_eq!(Hyperliquid.name(), "hyperliquid");
+}
+
+#[test]
+fn test_hl_ws_url_ignores_symbols() {
+    let url1 = Hyperliquid.ws_url(&["ETH".to_string()], 100);
+    let url2 = Hyperliquid.ws_url(&["BTC".to_string(), "SOL".to_string()], 250);
+    assert_eq!(
+        url1, url2,
+        "HL WS URL is constant regardless of symbols/depth_ms"
+    );
+    assert_eq!(url1, "wss://api.hyperliquid.xyz/ws");
+}
+
+#[test]
+fn test_hl_snapshot_url_empty() {
+    let url = Hyperliquid.snapshot_url("ETH");
+    assert!(
+        url.is_empty(),
+        "HL sends snapshots over WS — no REST endpoint"
     );
 }

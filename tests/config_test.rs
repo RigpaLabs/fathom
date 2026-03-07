@@ -183,3 +183,97 @@ depth_ms = 100
     let result = Config::load(f.path().to_str().unwrap());
     assert!(result.is_err());
 }
+
+#[test]
+fn test_load_hyperliquid_exchange() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+
+[[connections]]
+name     = "hl"
+exchange = "hyperliquid"
+symbols  = ["ETH", "BTC"]
+depth_ms = 0
+"#,
+    );
+    let cfg = Config::load(f.path().to_str().unwrap()).unwrap();
+    assert!(matches!(cfg.connections[0].exchange, Exchange::Hyperliquid));
+    assert_eq!(cfg.connections[0].symbols, ["ETH", "BTC"]);
+}
+
+#[test]
+fn test_load_dydx_exchange() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+
+[[connections]]
+name     = "dydx"
+exchange = "dydx"
+symbols  = ["ETH-USD"]
+depth_ms = 0
+"#,
+    );
+    let cfg = Config::load(f.path().to_str().unwrap()).unwrap();
+    assert!(matches!(cfg.connections[0].exchange, Exchange::Dydx));
+}
+
+#[test]
+fn test_load_invalid_exchange() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+
+[[connections]]
+name     = "bad"
+exchange = "kraken"
+symbols  = ["ETH"]
+depth_ms = 100
+"#,
+    );
+    let result = Config::load(f.path().to_str().unwrap());
+    assert!(
+        result.is_err(),
+        "unknown exchange variant should fail deserialization"
+    );
+}
+
+#[test]
+fn test_load_all_four_exchanges() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+
+[[connections]]
+name = "spot"
+exchange = "binance_spot"
+symbols = ["ETHUSDT"]
+depth_ms = 100
+
+[[connections]]
+name = "perp"
+exchange = "binance_perp"
+symbols = ["ETHUSDT"]
+depth_ms = 100
+
+[[connections]]
+name = "hl"
+exchange = "hyperliquid"
+symbols = ["ETH"]
+depth_ms = 0
+
+[[connections]]
+name = "dydx"
+exchange = "dydx"
+symbols = ["ETH-USD"]
+depth_ms = 0
+"#,
+    );
+    let cfg = Config::load(f.path().to_str().unwrap()).unwrap();
+    assert_eq!(cfg.connections.len(), 4);
+    assert!(matches!(cfg.connections[0].exchange, Exchange::BinanceSpot));
+    assert!(matches!(cfg.connections[1].exchange, Exchange::BinancePerp));
+    assert!(matches!(cfg.connections[2].exchange, Exchange::Hyperliquid));
+    assert!(matches!(cfg.connections[3].exchange, Exchange::Dydx));
+}

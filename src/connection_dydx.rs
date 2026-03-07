@@ -649,6 +649,81 @@ mod tests {
     }
 
     #[test]
+    fn test_dydx_book_remove_cleans_bid_last() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(vec![(100.0, 5.0), (99.0, 2.0)], vec![(101.0, 3.0)]);
+        assert!(book.bid_last.contains_key(&OrderedFloat(100.0)));
+
+        // Remove bid at 100.0 (qty=0)
+        book.apply_diffs(vec![(100.0, 0.0)], vec![]);
+        assert!(
+            !book.bid_last.contains_key(&OrderedFloat(100.0)),
+            "removed bid must not leave tombstone in bid_last"
+        );
+    }
+
+    #[test]
+    fn test_dydx_book_remove_cleans_ask_last() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(vec![(100.0, 5.0)], vec![(101.0, 3.0), (102.0, 2.0)]);
+        assert!(book.ask_last.contains_key(&OrderedFloat(101.0)));
+
+        book.apply_diffs(vec![], vec![(101.0, 0.0)]);
+        assert!(
+            !book.ask_last.contains_key(&OrderedFloat(101.0)),
+            "removed ask must not leave tombstone in ask_last"
+        );
+    }
+
+    #[test]
+    fn test_dydx_book_ofi_negative() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(vec![(100.0, 5.0)], vec![(101.0, 4.0)]);
+
+        // Increase ask qty: ask price unchanged (<=), ofi_ask = new_qty = 8
+        // Bid unchanged: ofi_bid = 5, OFI = 5 - 8 = -3 (ask pressure)
+        let applied = book.apply_diffs(vec![], vec![(101.0, 8.0)]);
+        assert!(
+            (applied.ofi_l1_delta - (-3.0)).abs() < 1e-10,
+            "OFI should be negative"
+        );
+    }
+
+    #[test]
+    fn test_dydx_book_ofi_both_sides() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(vec![(100.0, 5.0)], vec![(101.0, 4.0)]);
+
+        // Both sides change: bid 5→10 (same price), ask 4→2 (same price)
+        // ofi_bid = 10 (price held), ofi_ask = 2 (price held), OFI = 10 - 2 = 8
+        let applied = book.apply_diffs(vec![(100.0, 10.0)], vec![(101.0, 2.0)]);
+        assert!((applied.ofi_l1_delta - 8.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_dydx_book_churn() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(vec![(100.0, 5.0)], vec![(101.0, 4.0)]);
+
+        // bid: |8 - 5| = 3, ask: |6 - 4| = 2
+        let applied = book.apply_diffs(vec![(100.0, 8.0)], vec![(101.0, 6.0)]);
+        assert!((applied.bid_abs_change - 3.0).abs() < 1e-10);
+        assert!((applied.ask_abs_change - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_dydx_book_empty_diff() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(vec![(100.0, 5.0)], vec![(101.0, 4.0)]);
+
+        let applied = book.apply_diffs(vec![], vec![]);
+        // No changes, but OFI still computed (price held): ofi_bid = 5, ofi_ask = 4
+        assert!((applied.ofi_l1_delta - 1.0).abs() < 1e-10);
+        assert_eq!(applied.bid_abs_change, 0.0);
+        assert_eq!(applied.ask_abs_change, 0.0);
+    }
+
+    #[test]
     fn test_dydx_book_ofi() {
         let mut book = DydxBook::new();
         book.apply_snapshot(vec![(100.0, 5.0)], vec![(101.0, 4.0)]);

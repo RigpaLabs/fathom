@@ -1,6 +1,6 @@
 use fathom::{
     accumulator::WindowAccumulator,
-    orderbook::{DepthDiff, OrderBook, SnapshotMsg},
+    orderbook::{DepthDiff, DiffApplied, OrderBook, SnapshotMsg},
 };
 
 fn make_book_synced() -> OrderBook {
@@ -373,4 +373,225 @@ fn test_snapshot_fields_populated() {
     assert!(snap.microprice.is_some());
     assert!(snap.spread_bps.is_some());
     assert!(snap.imbalance_l1.is_some());
+}
+
+// ── accumulate_trade tests (HL/dYdX path) ────────────────────────────────────
+
+#[test]
+fn test_accumulate_trade_buy() {
+    let mut acc = WindowAccumulator::new("test", "ETHUSDT", 1_000_000);
+    acc.accumulate_trade(1.5, true);
+    let snap = acc.flush_with_levels(None, 2_000_000);
+    assert_eq!(snap.trade_count, 1);
+    assert!((snap.buy_vol - 1.5).abs() < 1e-10);
+    assert_eq!(snap.sell_vol, 0.0);
+    assert!((snap.volume_delta - 1.5).abs() < 1e-10);
+}
+
+#[test]
+fn test_accumulate_trade_sell() {
+    let mut acc = WindowAccumulator::new("test", "ETHUSDT", 1_000_000);
+    acc.accumulate_trade(2.0, false);
+    let snap = acc.flush_with_levels(None, 2_000_000);
+    assert_eq!(snap.trade_count, 1);
+    assert_eq!(snap.buy_vol, 0.0);
+    assert!((snap.sell_vol - 2.0).abs() < 1e-10);
+    assert!((snap.volume_delta - (-2.0)).abs() < 1e-10);
+}
+
+#[test]
+fn test_accumulate_trade_mixed_buy_sell() {
+    let mut acc = WindowAccumulator::new("test", "ETHUSDT", 1_000_000);
+    acc.accumulate_trade(3.0, true);
+    acc.accumulate_trade(1.0, false);
+    acc.accumulate_trade(2.0, true);
+    let snap = acc.flush_with_levels(None, 2_000_000);
+    assert_eq!(snap.trade_count, 3);
+    assert!((snap.buy_vol - 5.0).abs() < 1e-10);
+    assert!((snap.sell_vol - 1.0).abs() < 1e-10);
+    // volume_delta = +3 - 1 + 2 = 4
+    assert!((snap.volume_delta - 4.0).abs() < 1e-10);
+}
+
+#[test]
+fn test_accumulate_trade_resets_after_flush() {
+    let mut acc = WindowAccumulator::new("test", "ETHUSDT", 1_000_000);
+    acc.accumulate_trade(5.0, true);
+    let _ = acc.flush_with_levels(None, 2_000_000);
+
+    let snap2 = acc.flush_with_levels(None, 3_000_000);
+    assert_eq!(snap2.trade_count, 0);
+    assert_eq!(snap2.buy_vol, 0.0);
+    assert_eq!(snap2.sell_vol, 0.0);
+    assert_eq!(snap2.volume_delta, 0.0);
+}
+
+// ── on_diff_from_levels tests (HL/dYdX path) ─────────────────────────────────
+
+#[test]
+fn test_on_diff_from_levels_basic() {
+    let mut acc = WindowAccumulator::new("test", "ETHUSDT", 1_000_000);
+    let applied = DiffApplied {
+        ofi_l1_delta: 3.0,
+        bid_abs_change: 1.0,
+        ask_abs_change: 0.5,
+    };
+    acc.on_diff_from_levels(Some(3000.0), Some(3001.0), &applied);
+
+    let snap = acc.flush_with_levels(None, 2_000_000);
+    assert_eq!(snap.n_events, 1);
+    assert!((snap.ofi_l1 - 3.0).abs() < 1e-10);
+    assert!((snap.churn_bid - 1.0).abs() < 1e-10);
+    assert!((snap.churn_ask - 0.5).abs() < 1e-10);
+    // open_px should be mid = (3000 + 3001) / 2 = 3000.5
+    assert_eq!(snap.open_px, Some(3000.5));
+}
+
+#[test]
+fn test_on_diff_from_levels_none_prices() {
+    let mut acc = WindowAccumulator::new("test", "ETHUSDT", 1_000_000);
+    let applied = DiffApplied {
+        ofi_l1_delta: 1.0,
+        bid_abs_change: 0.0,
+        ask_abs_change: 0.0,
+    };
+    // One side missing — mid should NOT be recorded
+    acc.on_diff_from_levels(Some(3000.0), None, &applied);
+
+    let snap = acc.flush_with_levels(None, 2_000_000);
+    assert_eq!(snap.n_events, 1);
+    assert!(
+        snap.open_px.is_none(),
+        "mid not computable with one side None"
+    );
+    assert_eq!(snap.intra_sigma, 0.0);
+}
+
+#[test]
+fn test_on_diff_from_levels_accumulates_ofi() {
+    let mut acc = WindowAccumulator::new("test", "ETHUSDT", 1_000_000);
+    let a1 = DiffApplied {
+        ofi_l1_delta: 2.0,
+        bid_abs_change: 0.0,
+        ask_abs_change: 0.0,
+    };
+    let a2 = DiffApplied {
+        ofi_l1_delta: -1.0,
+        bid_abs_change: 0.0,
+        ask_abs_change: 0.0,
+    };
+    acc.on_diff_from_levels(Some(100.0), Some(101.0), &a1);
+    acc.on_diff_from_levels(Some(100.0), Some(101.0), &a2);
+
+    let snap = acc.flush_with_levels(None, 2_000_000);
+    assert_eq!(snap.n_events, 2);
+    assert!(
+        (snap.ofi_l1 - 1.0).abs() < 1e-10,
+        "OFI should accumulate: 2 + (-1) = 1"
+    );
+}
+
+// ── flush_with_levels tests (HL/dYdX path) ───────────────────────────────────
+
+#[test]
+fn test_flush_with_levels_computes_metrics() {
+    let mut acc = WindowAccumulator::new("hl", "ETH", 1_000_000);
+    // Feed two events with different mids for sigma > 0
+    let a1 = DiffApplied {
+        ofi_l1_delta: 1.0,
+        bid_abs_change: 0.5,
+        ask_abs_change: 0.3,
+    };
+    let a2 = DiffApplied {
+        ofi_l1_delta: -0.5,
+        bid_abs_change: 0.2,
+        ask_abs_change: 0.1,
+    };
+    acc.on_diff_from_levels(Some(3000.0), Some(3002.0), &a1); // mid = 3001
+    acc.on_diff_from_levels(Some(3004.0), Some(3006.0), &a2); // mid = 3005
+
+    let bids = vec![(3004.0, 5.0), (3003.0, 3.0), (3002.0, 2.0)];
+    let asks = vec![(3006.0, 4.0), (3007.0, 2.0)];
+    let snap = acc.flush_with_levels(Some((&bids, &asks)), 2_000_000);
+
+    assert_eq!(snap.exchange, "hl");
+    assert_eq!(snap.symbol, "ETH");
+    assert_eq!(snap.n_events, 2);
+    // mid from levels: (3004 + 3006) / 2 = 3005
+    assert!((snap.mid_px.unwrap() - 3005.0).abs() < 1e-10);
+    // microprice: (3004 * 4 + 3006 * 5) / (5 + 4) = (12016 + 15030) / 9 = 3005.111...
+    let expected_micro = (3004.0 * 4.0 + 3006.0 * 5.0) / 9.0;
+    assert!((snap.microprice.unwrap() - expected_micro).abs() < 1e-6);
+    // spread_bps: (3006 - 3004) / 3005 * 10000 = 6.655...
+    let expected_spread = (3006.0 - 3004.0) / 3005.0 * 10_000.0;
+    assert!((snap.spread_bps.unwrap() - expected_spread as f32).abs() < 0.01);
+    // imbalance_l1: (5 - 4) / (5 + 4) = 0.111...
+    assert!((snap.imbalance_l1.unwrap() - 1.0 / 9.0).abs() < 1e-6);
+    // depths
+    assert!((snap.bid_depth_l5 - 10.0).abs() < 1e-10); // 5 + 3 + 2
+    assert!((snap.ask_depth_l5 - 6.0).abs() < 1e-10); // 4 + 2
+    // sigma > 0 (two different mids: 3001 and 3005)
+    assert!(snap.intra_sigma > 0.0);
+    // OFI: 1.0 + (-0.5) = 0.5
+    assert!((snap.ofi_l1 - 0.5).abs() < 1e-10);
+    // churn: bid = 0.5 + 0.2 = 0.7, ask = 0.3 + 0.1 = 0.4
+    assert!((snap.churn_bid - 0.7).abs() < 1e-10);
+    assert!((snap.churn_ask - 0.4).abs() < 1e-10);
+    // open_px = first mid = 3001
+    assert_eq!(snap.open_px, Some(3001.0));
+    // close_px = current mid from levels = 3005
+    assert!((snap.close_px.unwrap() - 3005.0).abs() < 1e-10);
+}
+
+#[test]
+fn test_flush_with_levels_none_returns_empty() {
+    let mut acc = WindowAccumulator::new("hl", "ETH", 1_000_000);
+    let snap = acc.flush_with_levels(None, 2_000_000);
+    assert!(snap.mid_px.is_none());
+    assert!(snap.microprice.is_none());
+    assert!(snap.spread_bps.is_none());
+    assert!(snap.imbalance_l1.is_none());
+    assert!(snap.bids.is_empty());
+    assert!(snap.asks.is_empty());
+    assert_eq!(snap.bid_depth_l5, 0.0);
+    assert_eq!(snap.ask_depth_l5, 0.0);
+}
+
+#[test]
+fn test_flush_with_levels_resets_counters() {
+    let mut acc = WindowAccumulator::new("hl", "ETH", 1_000_000);
+    let applied = DiffApplied {
+        ofi_l1_delta: 5.0,
+        bid_abs_change: 2.0,
+        ask_abs_change: 1.0,
+    };
+    acc.on_diff_from_levels(Some(100.0), Some(101.0), &applied);
+    acc.accumulate_trade(3.0, true);
+    let _ = acc.flush_with_levels(None, 2_000_000);
+
+    let snap2 = acc.flush_with_levels(None, 3_000_000);
+    assert_eq!(snap2.n_events, 0);
+    assert_eq!(snap2.ofi_l1, 0.0);
+    assert_eq!(snap2.churn_bid, 0.0);
+    assert_eq!(snap2.churn_ask, 0.0);
+    assert!(snap2.open_px.is_none());
+    assert_eq!(snap2.trade_count, 0);
+    assert_eq!(snap2.volume_delta, 0.0);
+}
+
+#[test]
+fn test_flush_with_levels_sigma_exact_value() {
+    let mut acc = WindowAccumulator::new("test", "ETH", 1_000_000);
+    // Two events: mid = 100, mid = 200. Mean = 150, var = E[x²]-E[x]² = 25000 - 22500 = 2500
+    let a = DiffApplied::default();
+    acc.on_diff_from_levels(Some(90.0), Some(110.0), &a); // mid = 100
+    acc.on_diff_from_levels(Some(190.0), Some(210.0), &a); // mid = 200
+
+    let snap = acc.flush_with_levels(None, 2_000_000);
+    // sigma = sqrt(2500) = 50
+    assert!(
+        (snap.intra_sigma - 50.0).abs() < 0.01,
+        "sigma should be 50, got {}",
+        snap.intra_sigma
+    );
 }
