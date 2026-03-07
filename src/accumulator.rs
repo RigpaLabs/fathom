@@ -48,9 +48,10 @@ pub struct WindowAccumulator {
     churn_ask: f64,
     /// First mid price seen this window
     open_px: Option<f64>,
-    /// Running sum of mid prices (for mean)
+    /// Running sum of mid prices (for mean). Event-weighted, not time-weighted:
+    /// each diff event contributes one sample regardless of inter-event timing.
     mid_sum: f64,
-    /// Running sum of mid² (for variance)
+    /// Running sum of mid² (for population variance via E[x²] - E[x]²)
     mid_sq_sum: f64,
     window_start_us: i64,
     // ── Trade accumulators ───────────────────────────────────────────────
@@ -141,6 +142,8 @@ impl WindowAccumulator {
         let n = self.n_events;
         let n_f64 = n as f64;
 
+        // intra_sigma: absolute mid-price dispersion (USD), NOT returns-based volatility.
+        // See flush() for full doc comment.
         let intra_sigma = if n > 1 {
             let mean = self.mid_sum / n_f64;
             let variance = (self.mid_sq_sum / n_f64 - mean * mean).max(0.0);
@@ -289,7 +292,9 @@ impl WindowAccumulator {
         let n = self.n_events;
         let n_f64 = n as f64;
 
-        // intra_sigma = sqrt(E[mid²] - E[mid]²)
+        // intra_sigma: absolute mid-price dispersion (USD), NOT returns-based volatility.
+        // Formula: sqrt(E[mid²] - E[mid]²) — population stddev of mid prices within the window.
+        // Event-weighted: each diff event = one sample. At 1s granularity this is adequate.
         let intra_sigma = if n > 1 {
             let mean = self.mid_sum / n_f64;
             let variance = (self.mid_sq_sum / n_f64 - mean * mean).max(0.0);

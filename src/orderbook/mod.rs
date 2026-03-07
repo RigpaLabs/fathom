@@ -173,7 +173,10 @@ impl OrderBook {
             }
         }
 
-        // OFI at L1: change in best bid - change in best ask
+        // OFI at L1 — "level OFI" variant (Cont, Kukanov, Stoikov 2014):
+        // When best price improves or holds: ofi_side = new_qty (full qty, not delta).
+        // When best price worsens: ofi_side = -prev_qty.
+        // This is consistent across Binance, HL, and dYdX paths.
         let new_best_bid = self.best_bid_px();
         let new_best_bid_qty = self.best_bid_qty();
         let new_best_ask = self.best_ask_px();

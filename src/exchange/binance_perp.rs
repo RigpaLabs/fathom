@@ -19,6 +19,7 @@ impl ExchangeAdapter for BinancePerp {
         format!("{WS_BASE}?streams={streams}")
     }
 
+    /// Binance USDM Futures max depth is 1000 (vs 5000 for spot).
     fn snapshot_url(&self, symbol: &str) -> String {
         format!(
             "{REST_BASE}/depth?symbol={}&limit=1000",
