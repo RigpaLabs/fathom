@@ -3,6 +3,7 @@ services:
     image: ghcr.io/${GITHUB_REPO}:${IMAGE_TAG:?IMAGE_TAG is required}
     container_name: fathom
     restart: unless-stopped
+    network_mode: host
     stop_grace_period: 30s
     volumes:
       - fathom-data:/app/data
