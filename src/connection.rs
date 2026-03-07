@@ -18,7 +18,7 @@ use crate::{
     config::ConnectionConfig,
     error::AppError,
     exchange::ExchangeAdapter,
-    monitor::MonitorState,
+    monitor::{MonitorState, lock_state},
     orderbook::{DepthDiff, OrderBook, SnapshotMsg},
     writer::raw::RawDiff,
 };
@@ -88,7 +88,7 @@ pub async fn connection_task(
     let mut accumulators: HashMap<String, WindowAccumulator> = HashMap::new();
 
     {
-        let mut state = monitor.lock().unwrap();
+        let mut state = lock_state(&monitor);
         let cs = state.entry(name.clone()).or_default();
         cs.connected = false;
         for sym in &symbols {
@@ -97,6 +97,7 @@ pub async fn connection_task(
     }
 
     let mut backoff_ms = BACKOFF_START_MS;
+    #[allow(clippy::expect_used)] // infallible: no custom TLS config
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -218,7 +219,7 @@ pub async fn connection_task(
         }
 
         {
-            let mut state = monitor.lock().unwrap();
+            let mut state = lock_state(&monitor);
             if let Some(cs) = state.get_mut(&name) {
                 cs.connected = true;
             }
@@ -279,7 +280,7 @@ pub async fn connection_task(
                         Err(AppError::SnapshotRequired(_)) | Err(AppError::OrderBookGap { .. }) => {
                             warn!(conn = %name, symbol = %symbol, "gap — reconnecting");
                             {
-                                let mut state = monitor.lock().unwrap();
+                                let mut state = lock_state(&monitor);
                                 if let Some(cs) = state.get_mut(&name)
                                     && let Some(ss) = cs.symbols.get_mut(&symbol) {
                                     ss.gaps_today += 1;
@@ -291,7 +292,7 @@ pub async fn connection_task(
                         Ok(None) => continue,
                         Ok(Some(applied)) => {
                             {
-                                let mut state = monitor.lock().unwrap();
+                                let mut state = lock_state(&monitor);
                                 if let Some(cs) = state.get_mut(&name)
                                     && let Some(ss) = cs.symbols.get_mut(&symbol) {
                                     ss.last_event_at = Some(Instant::now());
@@ -354,7 +355,7 @@ pub async fn connection_task(
         let _ = forwarder.await;
 
         {
-            let mut state = monitor.lock().unwrap();
+            let mut state = lock_state(&monitor);
             if let Some(cs) = state.get_mut(&name) {
                 cs.connected = false;
                 cs.reconnects_today += 1;

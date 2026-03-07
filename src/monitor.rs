@@ -29,6 +29,15 @@ pub fn new_state() -> MonitorState {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Lock MonitorState, recovering from poison (another task panicked).
+/// This is always safe: the HashMap is append-only metadata — a poisoned
+/// lock just means one snapshot of ConnStats may be stale.
+pub fn lock_state(state: &MonitorState) -> std::sync::MutexGuard<'_, HashMap<String, ConnStats>> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Serialize)]
 struct StatusJson {
     updated_at: String,
@@ -64,7 +73,7 @@ pub async fn run_monitor(data_dir: PathBuf, state: MonitorState, start: Instant)
         let updated_at = chrono::Utc::now().to_rfc3339();
 
         let conns_snap = {
-            let guard = state.lock().unwrap();
+            let guard = lock_state(&state);
             guard.clone()
         };
 

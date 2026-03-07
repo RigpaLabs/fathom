@@ -16,7 +16,7 @@ use crate::{
     config::ConnectionConfig,
     connection::sleep_backoff,
     exchange::dydx::{EXCHANGE_NAME, WS_URL},
-    monitor::MonitorState,
+    monitor::{MonitorState, lock_state},
     orderbook::DiffApplied,
     writer::raw::RawDiff,
 };
@@ -196,7 +196,7 @@ pub async fn connection_task_dydx(
     let mut accumulators: HashMap<String, WindowAccumulator> = HashMap::new();
 
     {
-        let mut state = monitor.lock().unwrap();
+        let mut state = lock_state(&monitor);
         let cs = state.entry(name.clone()).or_default();
         cs.connected = false;
         for sym in &symbols {
@@ -351,7 +351,7 @@ pub async fn connection_task_dydx(
         }
 
         {
-            let mut state = monitor.lock().unwrap();
+            let mut state = lock_state(&monitor);
             if let Some(cs) = state.get_mut(&name) {
                 cs.connected = true;
             }
@@ -476,7 +476,7 @@ pub async fn connection_task_dydx(
                             let best_ask = book.best_ask();
 
                             {
-                                let mut state = monitor.lock().unwrap();
+                                let mut state = lock_state(&monitor);
                                 if let Some(cs) = state.get_mut(&name)
                                     && let Some(ss) = cs.symbols.get_mut(&symbol)
                                 {
@@ -564,7 +564,7 @@ pub async fn connection_task_dydx(
         let _ = forwarder.await;
 
         {
-            let mut state = monitor.lock().unwrap();
+            let mut state = lock_state(&monitor);
             if let Some(cs) = state.get_mut(&name) {
                 cs.connected = false;
                 cs.reconnects_today += 1;
@@ -594,6 +594,7 @@ pub async fn connection_task_dydx(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -92,6 +92,7 @@ impl SymbolWriter {
         self.writer.finish()?;
 
         let end_hhmm = format!("{:02}{:02}", end_utc.hour(), end_utc.minute());
+        #[allow(clippy::unwrap_used)] // temp_path is always dir/.../file.parquet
         let new_path = self
             .temp_path
             .parent()
