@@ -24,6 +24,13 @@ use crate::{
 const BACKOFF_START_MS: u64 = 1_000;
 pub const HEARTBEAT_TIMEOUT_S: u64 = 30;
 
+/// Extract top-10 bid/ask levels from full-depth storage.
+fn top10(full: &(Levels, Levels)) -> (Levels, Levels) {
+    let b10: Levels = full.0.iter().take(10).copied().collect();
+    let a10: Levels = full.1.iter().take(10).copied().collect();
+    (b10, a10)
+}
+
 // ── Hyperliquid WS message types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -370,11 +377,7 @@ pub async fn connection_task_hl(
                     let ts_us = Utc::now().timestamp_micros();
                     for sym in &symbols {
                         if let Some(acc) = accumulators.get_mut(sym) {
-                            let levels = last_levels.get(sym).map(|(b, a)| {
-                                let b10: Levels = b.iter().take(10).copied().collect();
-                                let a10: Levels = a.iter().take(10).copied().collect();
-                                (b10, a10)
-                            });
+                            let levels = last_levels.get(sym).map(top10);
                             let snap = acc.flush_with_levels(levels.as_ref().map(|(b, a)| (b, a)), ts_us);
                             if snap_tx.try_send(snap).is_err() {
                                 warn!(conn = %name, symbol = %sym, "snap channel full — 1s snap dropped");

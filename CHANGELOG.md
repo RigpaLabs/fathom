@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2] — 2026-03-07
+
+### Changed
+- Channel buffer 2048 → 4096 (4x headroom for 22 symbols)
+- Extracted `top10()` helper in HL connection (dedup flush_with_levels)
+- Added `scripts/` to `.gitignore`
+
 ## [0.2.1] — 2026-03-07
 
 ### Fixed
