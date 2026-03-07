@@ -102,6 +102,7 @@ jobs:
               -e DATA_DIR=/app/data/${IMAGE_TAG} \
               -v fathom-data:/app/data \
               -v ${{ secrets.VPS_DEPLOY_DIR }}/config.toml:/app/config.toml:ro \
+              --memory 256m \
               --log-driver json-file \
               --log-opt max-size=50m \
               --log-opt max-file=5 \

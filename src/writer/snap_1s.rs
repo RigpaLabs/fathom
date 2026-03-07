@@ -42,6 +42,7 @@ impl DayWriter {
         let schema = SchemaRef::new(snap_1s_schema().clone());
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
+            .set_max_row_group_size(4096)
             .build();
         let writer = ArrowWriter::try_new(file, schema, Some(props))?;
 
