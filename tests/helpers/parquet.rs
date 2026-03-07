@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::path::Path;
 
 use arrow::array::{Array, Float32Array, Float64Array, UInt32Array};
