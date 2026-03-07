@@ -1,6 +1,6 @@
 [package]
 name = "fathom"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 
 [dependencies]
@@ -32,6 +32,16 @@ needless_pass_by_value = "warn"
 redundant_closure_for_method_calls = "warn"
 implicit_clone = "warn"
 semicolon_if_nothing_returned = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"
+panic = "abort"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 tokio              = { version = "1.43", features = ["test-util"] }

@@ -189,6 +189,7 @@ pub async fn connection_task_dydx(
     snap_tx: mpsc::Sender<Snapshot1s>,
 ) {
     let name = conn.name.clone();
+    let exchange_name = EXCHANGE_NAME.to_string();
     let symbols: Vec<String> = conn.symbols.clone();
 
     let mut books: HashMap<String, DydxBook> = HashMap::new();
@@ -456,7 +457,7 @@ pub async fn connection_task_dydx(
                             if raw_tx
                                 .try_send(RawDiff {
                                     timestamp_us: ts_us,
-                                    exchange: EXCHANGE_NAME.to_string(),
+                                    exchange: exchange_name.clone(),
                                     symbol: symbol.clone(),
                                     seq_id: msg_id,
                                     prev_seq_id: prev_msg_id,

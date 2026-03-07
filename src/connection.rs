@@ -78,6 +78,7 @@ pub async fn connection_task(
     snap_tx: mpsc::Sender<Snapshot1s>,
 ) {
     let name = conn.name.clone();
+    let exchange_name = adapter.name().to_string();
     let symbols: Vec<String> = conn.symbols.iter().map(|s| s.to_uppercase()).collect();
 
     let mut books: HashMap<String, OrderBook> = symbols
@@ -262,7 +263,7 @@ pub async fn connection_task(
                     let timestamp_us = depth.event_time_ms * 1_000;
 
                     let diff = DepthDiff {
-                        exchange: adapter.name().to_string(),
+                        exchange: exchange_name.clone(),
                         symbol: symbol.clone(),
                         timestamp_us,
                         seq_id: depth.final_update_id,
@@ -299,7 +300,7 @@ pub async fn connection_task(
 
                             if raw_tx.try_send(RawDiff {
                                 timestamp_us,
-                                exchange: adapter.name().to_string(),
+                                exchange: exchange_name.clone(),
                                 symbol: symbol.clone(),
                                 seq_id: diff.seq_id,
                                 prev_seq_id: diff.prev_seq_id,
