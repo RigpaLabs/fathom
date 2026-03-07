@@ -5,6 +5,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::{path::PathBuf, time::Instant};
 
 use fathom::{
+    CHANNEL_BUFFER,
     config::{Config, Exchange},
     connection::connection_task,
     connection_dydx::connection_task_dydx,
@@ -19,7 +20,6 @@ use tracing::info;
 use fathom::accumulator::Snapshot1s;
 
 const RAW_FLUSH_INTERVAL_S: u64 = 5;
-const CHANNEL_BUFFER: usize = 4_096;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

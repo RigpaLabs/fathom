@@ -48,6 +48,30 @@ impl Config {
         let cfg = ConfigBuilder::builder()
             .add_source(File::with_name(path))
             .build()?;
-        Ok(cfg.try_deserialize()?)
+        let config: Self = cfg.try_deserialize()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let h = self.raw_rotate_hours;
+        if h == 0 || 24 % h != 0 {
+            return Err(crate::error::AppError::Config(
+                config::ConfigError::Message(format!(
+                    "raw_rotate_hours must divide 24 evenly (1,2,3,4,6,8,12,24), got {h}"
+                )),
+            ));
+        }
+        for conn in &self.connections {
+            if conn.symbols.is_empty() {
+                return Err(crate::error::AppError::Config(
+                    config::ConfigError::Message(format!(
+                        "connection '{}' has empty symbols list",
+                        conn.name
+                    )),
+                ));
+            }
+        }
+        Ok(())
     }
 }

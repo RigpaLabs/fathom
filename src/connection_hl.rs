@@ -157,7 +157,7 @@ pub async fn connection_task_hl(
         info!(conn = %name, symbols = ?symbols, "subscriptions sent");
 
         // Forwarder task: reads WS frames, answers pings, forwards text to channel
-        let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(4_096);
+        let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(crate::CHANNEL_BUFFER);
         let fwd_name = name.clone();
         let forwarder = tokio::spawn(async move {
             let hb_dur = Duration::from_secs(HEARTBEAT_TIMEOUT_S);

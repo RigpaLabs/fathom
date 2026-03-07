@@ -80,6 +80,28 @@ pu == last_update_id   ← CORRECT for perp
 **Hyperliquid** sends full snapshots (no diffs) — no gap detection needed.
 **dYdX v4** uses batched diffs after initial snapshot; the WS guarantees ordering.
 
+## Data locations
+
+**Production (Vultr Tokyo):** SSH `fathom-root`, data inside Docker volume mounted at `/app/data/`.
+Each deploy creates a versioned dir: `/app/data/v{YYYYMMDD}-{sha7}/`.
+
+**Local backup (iCloud):** `~/Library/Mobile Documents/com~apple~CloudDocs/fathom-data/`
+- Contains all historical versions from v20260301 onward
+- Auto-synced daily at 10:00 WITA via launchd (`com.fathom.sync-data`)
+- Sync script: `scripts/sync-data.sh` (two-step: VPS → staging → iCloud)
+
+**Local staging:** `~/.local/fathom-staging/` — intermediate rsync target (avoids iCloud path spaces)
+
+**Data structure inside each version dir:**
+```
+v{tag}/
+├── 1s/{exchange}/{symbol}/{date}.parquet    # 1-second snapshots (1 row/sec)
+├── raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet  # raw diffs
+└── metadata/status.json
+```
+
+**Exchanges:** `binance_spot`, `binance_perp`, `hyperliquid`, `dydx` (22 symbols total)
+
 ## Testing conventions
 
 - Unit tests: `mod tests` inside `src/` files

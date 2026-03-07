@@ -277,3 +277,82 @@ depth_ms = 0
     assert!(matches!(cfg.connections[2].exchange, Exchange::Hyperliquid));
     assert!(matches!(cfg.connections[3].exchange, Exchange::Dydx));
 }
+
+// ── Validation tests ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_raw_rotate_hours_zero_rejected() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+raw_rotate_hours = 0
+
+[[connections]]
+name     = "spot"
+exchange = "binance_spot"
+symbols  = ["ETHUSDT"]
+depth_ms = 100
+"#,
+    );
+    let result = Config::load(f.path().to_str().unwrap());
+    assert!(result.is_err(), "raw_rotate_hours = 0 must be rejected");
+}
+
+#[test]
+fn test_raw_rotate_hours_not_dividing_24_rejected() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+raw_rotate_hours = 5
+
+[[connections]]
+name     = "spot"
+exchange = "binance_spot"
+symbols  = ["ETHUSDT"]
+depth_ms = 100
+"#,
+    );
+    let result = Config::load(f.path().to_str().unwrap());
+    assert!(
+        result.is_err(),
+        "raw_rotate_hours = 5 must be rejected (doesn't divide 24)"
+    );
+}
+
+#[test]
+fn test_raw_rotate_hours_valid_values() {
+    for hours in [1, 2, 3, 4, 6, 8, 12, 24] {
+        let content = format!(
+            r#"
+data_dir = "data"
+raw_rotate_hours = {hours}
+
+[[connections]]
+name     = "spot"
+exchange = "binance_spot"
+symbols  = ["ETHUSDT"]
+depth_ms = 100
+"#,
+        );
+        let f = toml_file(&content);
+        let result = Config::load(f.path().to_str().unwrap());
+        assert!(result.is_ok(), "raw_rotate_hours = {hours} should be valid");
+    }
+}
+
+#[test]
+fn test_empty_symbols_rejected() {
+    let f = toml_file(
+        r#"
+data_dir = "data"
+
+[[connections]]
+name     = "spot"
+exchange = "binance_spot"
+symbols  = []
+depth_ms = 100
+"#,
+    );
+    let result = Config::load(f.path().to_str().unwrap());
+    assert!(result.is_err(), "empty symbols list must be rejected");
+}

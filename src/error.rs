@@ -26,17 +26,8 @@ pub enum AppError {
     #[error("order book gap detected: expected {expected}, got {got}")]
     OrderBookGap { expected: i64, got: i64 },
 
-    #[error("order book not synced for symbol {0}")]
-    NotSynced(String),
-
     #[error("snapshot required for symbol {0}")]
     SnapshotRequired(String),
-
-    #[error("channel closed")]
-    ChannelClosed,
-
-    #[error("{0}")]
-    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

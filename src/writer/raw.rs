@@ -14,7 +14,7 @@ use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterPr
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::{error::Result, orderbook::DepthDiff, schema::raw_schema};
+use crate::{error::Result, schema::raw_schema};
 
 /// A raw diff event ready to be written to Parquet.
 #[derive(Debug, Clone)]
@@ -26,20 +26,6 @@ pub struct RawDiff {
     pub prev_seq_id: i64,
     pub bids: Vec<(f64, f64)>,
     pub asks: Vec<(f64, f64)>,
-}
-
-impl From<DepthDiff> for RawDiff {
-    fn from(d: DepthDiff) -> Self {
-        Self {
-            timestamp_us: d.timestamp_us,
-            exchange: d.exchange,
-            symbol: d.symbol,
-            seq_id: d.seq_id,
-            prev_seq_id: d.prev_seq_id,
-            bids: d.bids,
-            asks: d.asks,
-        }
-    }
 }
 
 /// Which hourly bucket does a UTC hour belong to?

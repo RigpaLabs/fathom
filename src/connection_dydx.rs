@@ -231,7 +231,7 @@ pub async fn connection_task_dydx(
 
         // Bidirectional forwarder: send_tx for outgoing, fwd_tx for incoming
         let (send_tx, mut send_rx) = mpsc::channel::<String>(64);
-        let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(4_096);
+        let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(crate::CHANNEL_BUFFER);
 
         let fwd_name = name.clone();
         let forwarder = tokio::spawn(async move {

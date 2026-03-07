@@ -130,7 +130,7 @@ pub async fn connection_task(
         //  - Events queued in the OS TCP buffer before snapshot fetch completes
         //    are forwarded to fwd_rx and processed in order.
         let (ws_sink, ws_stream) = ws.split();
-        let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(4_096);
+        let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(crate::CHANNEL_BUFFER);
         let fwd_name = name.clone();
         let forwarder = tokio::spawn(async move {
             let hb_dur = Duration::from_secs(HEARTBEAT_TIMEOUT_S);
