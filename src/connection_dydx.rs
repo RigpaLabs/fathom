@@ -106,6 +106,11 @@ impl DydxBook {
             }
         }
 
+        // dYdX v4 diff stream does not always send explicit qty=0 for consumed
+        // levels (matched orders). Stale levels accumulate and cross the book.
+        // Uncross by removing bids >= best_ask and asks <= best_bid.
+        self.uncross();
+
         let (new_best_bid_px, new_best_bid_qty) = self.best_bid();
         let (new_best_ask_px, new_best_ask_qty) = self.best_ask();
 
@@ -127,6 +132,31 @@ impl DydxBook {
             ofi_l1_delta: ofi_bid - ofi_ask,
             bid_abs_change,
             ask_abs_change,
+        }
+    }
+
+    /// Remove crossed levels: bids at or above best ask, asks at or below best bid.
+    /// dYdX's on-chain CLOB doesn't always send explicit removals for matched orders,
+    /// so stale levels accumulate on both sides. This sanitizes the book after each diff.
+    fn uncross(&mut self) {
+        loop {
+            let best_bid = self.bids.keys().next_back().copied();
+            let best_ask = self.asks.keys().next().copied();
+            match (best_bid, best_ask) {
+                (Some(bid), Some(ask)) if bid >= ask => {
+                    // Remove the side with less liquidity at the crossing level
+                    let bid_qty = self.bids.get(&bid).copied().unwrap_or(0.0);
+                    let ask_qty = self.asks.get(&ask).copied().unwrap_or(0.0);
+                    if bid_qty <= ask_qty {
+                        self.bids.remove(&bid);
+                        self.bid_last.remove(&bid);
+                    } else {
+                        self.asks.remove(&ask);
+                        self.ask_last.remove(&ask);
+                    }
+                }
+                _ => break,
+            }
         }
     }
 
@@ -723,6 +753,79 @@ mod tests {
         assert!((applied.ofi_l1_delta - 1.0).abs() < 1e-10);
         assert_eq!(applied.bid_abs_change, 0.0);
         assert_eq!(applied.ask_abs_change, 0.0);
+    }
+
+    #[test]
+    fn test_dydx_book_uncross_stale_ask() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(
+            vec![(100.0, 1.0), (99.0, 2.0)],
+            vec![(101.0, 1.5), (102.0, 2.5)],
+        );
+
+        // Simulate stale ask: bid moves up past ask without ask being removed
+        book.bids.insert(OrderedFloat(101.5), 3.0);
+        book.bid_last.insert(OrderedFloat(101.5), 3.0);
+
+        // Manually uncross
+        book.uncross();
+
+        let (best_bid_px, _) = book.best_bid();
+        let (best_ask_px, _) = book.best_ask();
+        assert!(
+            best_bid_px < best_ask_px,
+            "book should not be crossed after uncross: bid={best_bid_px} ask={best_ask_px}"
+        );
+    }
+
+    #[test]
+    fn test_dydx_book_uncross_multiple_levels() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(
+            vec![(100.0, 1.0)],
+            vec![(101.0, 0.5), (102.0, 2.0), (103.0, 3.0)],
+        );
+
+        // Add bids that cross multiple ask levels
+        book.bids.insert(OrderedFloat(102.5), 10.0);
+        book.bid_last.insert(OrderedFloat(102.5), 10.0);
+
+        book.uncross();
+
+        let (best_bid_px, _) = book.best_bid();
+        let (best_ask_px, _) = book.best_ask();
+        assert!(
+            best_bid_px < best_ask_px,
+            "book should not be crossed: bid={best_bid_px} ask={best_ask_px}"
+        );
+    }
+
+    #[test]
+    fn test_dydx_book_uncross_via_apply_diffs() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(vec![(100.0, 1.0)], vec![(101.0, 1.5)]);
+
+        // Apply diff that creates a crossing bid (simulating stale ask at 101.0)
+        let _applied = book.apply_diffs(vec![(101.5, 3.0)], vec![]);
+
+        let (best_bid_px, _) = book.best_bid();
+        let (best_ask_px, _) = book.best_ask();
+        assert!(
+            best_bid_px < best_ask_px,
+            "apply_diffs should auto-uncross: bid={best_bid_px} ask={best_ask_px}"
+        );
+    }
+
+    #[test]
+    fn test_dydx_book_uncross_no_op_when_not_crossed() {
+        let mut book = DydxBook::new();
+        book.apply_snapshot(vec![(100.0, 1.0), (99.0, 2.0)], vec![(101.0, 1.5)]);
+
+        let bid_count_before = book.bids.len();
+        let ask_count_before = book.asks.len();
+        book.uncross();
+        assert_eq!(book.bids.len(), bid_count_before);
+        assert_eq!(book.asks.len(), ask_count_before);
     }
 
     #[test]

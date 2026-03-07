@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0] — 2026-03-08
+
+### Fixed
+- **dYdX crossed book (94% → 0%)** — dYdX v4 diff stream doesn't always send explicit qty=0 for consumed levels; stale levels accumulated in BTreeMap causing $50-100 crossing. Added `uncross()` method that removes crossed levels after each diff application.
+
+### Added
+- 4 unit tests for `DydxBook::uncross()` (stale ask, multiple levels, auto-uncross via apply_diffs, no-op)
+- Smoke test assertion: `spread_bps >= 0` regression guard for dYdX
+
 ## [0.2.2] — 2026-03-07
 
 ### Changed

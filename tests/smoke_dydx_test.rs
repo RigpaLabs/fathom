@@ -99,6 +99,22 @@ async fn live_dydx_eth_pipeline() {
         "ETH-USD mid_px {mid:.2} outside $100–$100k"
     );
 
+    // Spread must be non-negative (no crossed book)
+    let spreads = helpers::parquet::read_f32_col(&snaps[0], "spread_bps");
+    assert!(!spreads.is_empty(), "spread_bps column is empty");
+    let crossed_count = spreads.iter().filter(|s| **s < 0.0).count();
+    println!(
+        "dYdX ETH-USD spread_bps: {} values, crossed: {crossed_count}/{}, min: {:.4}, mean: {:.4}",
+        spreads.len(),
+        spreads.len(),
+        spreads.iter().cloned().reduce(f32::min).unwrap_or(0.0),
+        spreads.iter().sum::<f32>() / spreads.len() as f32,
+    );
+    assert_eq!(
+        crossed_count, 0,
+        "dYdX book should never be crossed after uncross fix"
+    );
+
     // OFI values
     let ofis = read_f64_col(&snaps[0], "ofi_l1");
     println!(
