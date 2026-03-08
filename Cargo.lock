@@ -668,6 +668,7 @@ dependencies = [
  "axum",
  "chrono",
  "config",
+ "fathom-types",
  "futures-util",
  "ordered-float 4.6.0",
  "parquet",
@@ -682,6 +683,14 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fathom-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

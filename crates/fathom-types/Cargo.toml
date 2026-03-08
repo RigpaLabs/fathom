@@ -1,0 +1,12 @@
+[package]
+name = "fathom-types"
+version = "0.1.0"
+edition = "2024"
+description = "Shared types for Fathom L2 order book data"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

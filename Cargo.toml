@@ -1,9 +1,14 @@
+[workspace]
+resolver = "3"
+members = [".", "crates/fathom-types"]
+
 [package]
 name = "fathom"
 version = "0.3.0"
 edition = "2024"
 
 [dependencies]
+fathom-types = { path = "crates/fathom-types" }
 tokio              = { version = "1.43", features = ["full"] }
 tokio-tungstenite  = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util       = "0.3"
