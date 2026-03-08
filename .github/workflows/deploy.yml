@@ -78,14 +78,14 @@ jobs:
       - name: Setup SSH
         run: |
           install -m 600 -D /dev/null ~/.ssh/id_rsa
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+          echo "${{ secrets.VULTR_TOKYO_SSH_KEY }}" > ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.VULTR_TOKYO_HOST }} >> ~/.ssh/known_hosts
 
       - name: Deploy (blue-green)
         run: |
-          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} "
+          ssh ${{ secrets.VULTR_TOKYO_USER }}@${{ secrets.VULTR_TOKYO_HOST }} "
             set -e
-            cd ${{ secrets.VPS_DEPLOY_DIR }}
+            cd ${{ secrets.DEPLOY_DIR }}
 
             echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
@@ -101,7 +101,7 @@ jobs:
               -e RUST_LOG=fathom=info \
               -e DATA_DIR=/app/data/${IMAGE_TAG} \
               -v fathom-data:/app/data \
-              -v ${{ secrets.VPS_DEPLOY_DIR }}/config.toml:/app/config.toml:ro \
+              -v ${{ secrets.DEPLOY_DIR }}/config.toml:/app/config.toml:ro \
               --memory 192m \
               --log-driver json-file \
               --log-opt max-size=50m \
