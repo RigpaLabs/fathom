@@ -396,20 +396,46 @@ fn test_re_snapshot_resets_sync() {
 fn test_perp_pu_gap_detected() {
     let mut book = synced_book(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]);
     // book.last_update_id == 101 after synced_book
-    // Perp event where pu != last_update_id → gap
+    // Perp event where pu > last_update_id → genuine gap (missed events)
     let perp_gap = DepthDiff {
         exchange: "test".into(),
         symbol: "ETHUSDT".into(),
         timestamp_us: 2_000,
         seq_id: 110,
         prev_seq_id: 105,
-        prev_final_update_id: Some(99), // != 101
+        prev_final_update_id: Some(105), // > 101 → gap
         bids: vec![],
         asks: vec![],
     };
     assert!(
         book.apply_diff(&perp_gap).is_err(),
-        "perp event with pu != last_update_id must trigger gap"
+        "perp event with pu > last_update_id must trigger gap"
+    );
+}
+
+#[test]
+fn test_perp_pu_stale_event_dropped() {
+    let mut book = synced_book(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]);
+    // book.last_update_id == 101 after synced_book
+    // Perp event where pu < last_update_id → stale, silently dropped
+    let perp_stale = DepthDiff {
+        exchange: "test".into(),
+        symbol: "ETHUSDT".into(),
+        timestamp_us: 2_000,
+        seq_id: 110,
+        prev_seq_id: 105,
+        prev_final_update_id: Some(99), // < 101 → stale
+        bids: vec![],
+        asks: vec![],
+    };
+    let result = book.apply_diff(&perp_stale);
+    assert!(
+        result.is_ok(),
+        "stale perp event must not trigger gap error"
+    );
+    assert!(
+        result.unwrap().is_none(),
+        "stale perp event must return None (dropped)"
     );
 }
 

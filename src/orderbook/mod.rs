@@ -101,7 +101,7 @@ impl OrderBook {
     }
 
     /// Apply a diff event. Returns `Err(SnapshotRequired)` on gap.
-    /// Returns `Ok(None)` if the event is still pre-sync and was dropped.
+    /// Returns `Ok(None)` if the event is pre-sync or stale (perp out-of-order).
     pub fn apply_diff(&mut self, diff: &DepthDiff) -> Result<Option<DiffApplied>> {
         let u = diff.seq_id; // final_update_id
         let big_u = diff.prev_seq_id; // first_update_id
@@ -121,15 +121,29 @@ impl OrderBook {
             // Ongoing: detect gap.
             // Perp (USDM Futures) events carry `pu` (prev_final_update_id); use it
             // when available.  Spot falls back to `U == prev_u + 1`.
-            let has_gap = match diff.prev_final_update_id {
-                Some(pu) => pu != self.last_update_id,
-                None => big_u != self.last_update_id + 1,
-            };
-            if has_gap {
-                return Err(AppError::OrderBookGap {
-                    expected: self.last_update_id + 1,
-                    got: big_u,
-                });
+            match diff.prev_final_update_id {
+                Some(pu) => {
+                    if pu > self.last_update_id {
+                        // Genuine gap: we missed events
+                        return Err(AppError::OrderBookGap {
+                            expected: self.last_update_id,
+                            got: pu,
+                        });
+                    }
+                    if pu < self.last_update_id {
+                        // Stale/out-of-order event — already applied a later one
+                        return Ok(None);
+                    }
+                    // pu == last_update_id: normal sequence, fall through
+                }
+                None => {
+                    if big_u != self.last_update_id + 1 {
+                        return Err(AppError::OrderBookGap {
+                            expected: self.last_update_id + 1,
+                            got: big_u,
+                        });
+                    }
+                }
             }
         }
 
@@ -412,5 +426,93 @@ mod tests {
             !book.ask_last_contains(3001.0),
             "removed ask level must not leave a tombstone in ask_last"
         );
+    }
+
+    #[test]
+    fn test_perp_stale_event_dropped_not_gap() {
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+        // Sync event: U=100 <= 101 <= u=110
+        let sync = DepthDiff {
+            exchange: "test".into(),
+            symbol: "ETHUSDT".into(),
+            timestamp_us: 1_000,
+            seq_id: 110,
+            prev_seq_id: 100,
+            prev_final_update_id: None,
+            bids: vec![],
+            asks: vec![],
+        };
+        book.apply_diff(&sync).unwrap();
+        assert_eq!(book.last_update_id, 110);
+
+        // Normal perp event: pu=110 matches last_update_id
+        let event1 = DepthDiff {
+            exchange: "test".into(),
+            symbol: "ETHUSDT".into(),
+            timestamp_us: 2_000,
+            seq_id: 115,
+            prev_seq_id: 111,
+            prev_final_update_id: Some(110),
+            bids: vec![],
+            asks: vec![],
+        };
+        book.apply_diff(&event1).unwrap();
+        assert_eq!(book.last_update_id, 115);
+
+        // Stale event: pu=110 < last_update_id=115 → should be dropped, NOT gap
+        let stale = DepthDiff {
+            exchange: "test".into(),
+            symbol: "ETHUSDT".into(),
+            timestamp_us: 3_000,
+            seq_id: 113,
+            prev_seq_id: 111,
+            prev_final_update_id: Some(110),
+            bids: vec![(3000.0, 6.0)],
+            asks: vec![],
+        };
+        let result = book.apply_diff(&stale);
+        assert!(
+            result.is_ok(),
+            "stale perp event must not trigger gap error"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "stale perp event must return None (dropped)"
+        );
+        assert_eq!(book.last_update_id, 115, "last_update_id must not regress");
+    }
+
+    #[test]
+    fn test_perp_genuine_gap_still_detected() {
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+        let sync = DepthDiff {
+            exchange: "test".into(),
+            symbol: "ETHUSDT".into(),
+            timestamp_us: 1_000,
+            seq_id: 110,
+            prev_seq_id: 100,
+            prev_final_update_id: None,
+            bids: vec![],
+            asks: vec![],
+        };
+        book.apply_diff(&sync).unwrap();
+
+        // Genuine gap: pu=120 > last_update_id=110 → missed events
+        let gap_event = DepthDiff {
+            exchange: "test".into(),
+            symbol: "ETHUSDT".into(),
+            timestamp_us: 2_000,
+            seq_id: 125,
+            prev_seq_id: 121,
+            prev_final_update_id: Some(120),
+            bids: vec![],
+            asks: vec![],
+        };
+        let result = book.apply_diff(&gap_event);
+        assert!(result.is_err(), "genuine perp gap must still trigger error");
     }
 }
