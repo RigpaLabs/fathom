@@ -25,6 +25,7 @@ use crate::{
 
 const BACKOFF_START_MS: u64 = 1_000;
 const BACKOFF_MAX_MS: u64 = 60_000;
+const RATE_LIMIT_BACKOFF_S: u64 = 300;
 pub const HEARTBEAT_TIMEOUT_S: u64 = 30;
 
 // ── Binance WS message types ────────────────────────────────────────────────
@@ -59,6 +60,12 @@ pub struct SnapshotRest {
     pub last_update_id: i64,
     pub bids: Vec<[serde_json::Value; 2]>,
     pub asks: Vec<[serde_json::Value; 2]>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceError {
+    code: i64,
+    msg: String,
 }
 
 pub fn parse_level(v: &[serde_json::Value; 2]) -> Option<(f64, f64)> {
@@ -180,6 +187,7 @@ pub async fn connection_task(
         // their WS stream.  The skipped symbol's book stays unsynced and will
         // return SnapshotRequired on the first incoming diff, triggering a full
         // reconnect (which re-fetches all snapshots).
+        let mut rate_limited = false;
         for sym in &symbols {
             // Build snapshot URL — use override template if provided
             let snap_url = conn
@@ -193,29 +201,79 @@ pub async fn connection_task(
                     warn!(conn = %name, symbol = %sym, error = %e, "snapshot fetch failed — skipping symbol");
                     continue;
                 }
-                Ok(resp) => match resp.json::<SnapshotRest>().await {
-                    Err(e) => {
-                        warn!(conn = %name, symbol = %sym, error = %e, "snapshot parse failed — skipping symbol");
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = match resp.text().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(conn = %name, symbol = %sym, error = %e, "snapshot read failed — skipping symbol");
+                            continue;
+                        }
+                    };
+                    if !status.is_success() {
+                        if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
+                            && (err.code == -1003 || err.code == -1015)
+                        {
+                            warn!(conn = %name, code = err.code, msg = %err.msg, "Binance rate limit — backing off");
+                            rate_limited = true;
+                            break;
+                        }
+                        warn!(conn = %name, symbol = %sym, status = %status, "snapshot HTTP error — skipping symbol");
                         continue;
                     }
-                    Ok(snap) => {
-                        info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");
-                        let bids: Vec<(f64, f64)> =
-                            snap.bids.iter().filter_map(parse_level).collect();
-                        let asks: Vec<(f64, f64)> =
-                            snap.asks.iter().filter_map(parse_level).collect();
-                        books
-                            .entry(sym.clone())
-                            .or_default()
-                            .apply_snapshot(SnapshotMsg {
-                                symbol: sym.clone(),
-                                last_update_id: snap.last_update_id,
-                                bids,
-                                asks,
-                            });
+                    match serde_json::from_str::<SnapshotRest>(&body) {
+                        Err(_) => {
+                            // HTTP 200 but unexpected body — check for rate limit error
+                            if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
+                                && (err.code == -1003 || err.code == -1015)
+                            {
+                                warn!(conn = %name, code = err.code, msg = %err.msg, "Binance rate limit — backing off");
+                                rate_limited = true;
+                                break;
+                            }
+                            warn!(conn = %name, symbol = %sym, "snapshot parse failed — skipping symbol");
+                            continue;
+                        }
+                        Ok(snap) => {
+                            info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");
+                            let bids: Vec<(f64, f64)> =
+                                snap.bids.iter().filter_map(parse_level).collect();
+                            let asks: Vec<(f64, f64)> =
+                                snap.asks.iter().filter_map(parse_level).collect();
+                            books
+                                .entry(sym.clone())
+                                .or_default()
+                                .apply_snapshot(SnapshotMsg {
+                                    symbol: sym.clone(),
+                                    last_update_id: snap.last_update_id,
+                                    bids,
+                                    asks,
+                                });
+                        }
                     }
-                },
+                }
             }
+        }
+
+        // Binance IP ban detected — skip the event loop entirely and apply
+        // extended backoff to avoid a reconnect storm that extends the ban.
+        if rate_limited {
+            warn!(conn = %name, backoff_s = RATE_LIMIT_BACKOFF_S, "rate limited — extended backoff");
+            forwarder.abort();
+            let _ = forwarder.await;
+            {
+                let mut state = lock_state(&monitor);
+                if let Some(cs) = state.get_mut(&name) {
+                    cs.connected = false;
+                    cs.reconnects_today += 1;
+                }
+            }
+            for book in books.values_mut() {
+                *book = OrderBook::new();
+            }
+            accumulators.clear();
+            tokio::time::sleep(Duration::from_secs(RATE_LIMIT_BACKOFF_S)).await;
+            continue;
         }
 
         {
