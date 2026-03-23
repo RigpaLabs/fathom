@@ -300,7 +300,7 @@ pub async fn connection_task(
 
         // ── Sync phase: drain buffered WS events → replay → re-snapshot unsynced ──
         let mut sync_gap_detected = false;
-        'sync: for attempt in 0..3u32 {
+        'sync: for attempt in 0..5u32 {
             // Drain buffered events
             let mut buf: Vec<String> = Vec::new();
             while let Ok(msg) = fwd_rx.try_recv() {
@@ -410,7 +410,7 @@ pub async fn connection_task(
                 break 'sync;
             }
 
-            if attempt < 2 {
+            if attempt < 4 {
                 info!(conn = %name, attempt, unsynced = ?unsynced, "re-snapshot for unsynced symbols");
                 // Re-fetch snapshots only for unsynced symbols (parallel)
                 let re_snap_futures: Vec<_> = unsynced
@@ -487,7 +487,7 @@ pub async fn connection_task(
                 }
 
                 // Small delay to let more events buffer
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
 
