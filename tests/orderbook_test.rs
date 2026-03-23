@@ -132,32 +132,30 @@ fn test_gap_detection() {
 }
 
 #[test]
-fn test_pre_snapshot_gap_drops_instead_of_resnapshot() {
+fn test_pre_snapshot_gap_requires_resnapshot() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 1.0)], vec![(3001.0, 1.0)]));
 
-    // Spot: U=103 > last_update_id+1=101 → drop (wait for bridging event)
+    // Spot: U=103 > last_update_id+1=101 → SnapshotRequired (need re-snapshot)
     let result = book.apply_diff(&make_diff("ETHUSDT", 103, 105, vec![], vec![]));
-    assert!(result.is_ok(), "should not error: {result:?}");
     assert!(
-        result.unwrap().is_none(),
-        "ahead event should be dropped during initial sync"
+        matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))),
+        "ahead event during initial sync must return SnapshotRequired, got: {result:?}"
     );
     assert!(!book.synced, "book must remain unsynced");
 }
 
 #[test]
-fn test_spot_initial_sync_drops_ahead_events() {
+fn test_spot_initial_sync_ahead_events_require_resnapshot() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(1000, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
 
-    // Event far ahead: U=1200, u=1210 (no pu → spot) — should be dropped
+    // Event far ahead: U=1200, u=1210 (no pu → spot) — should return SnapshotRequired
     let ahead = make_diff("ETHUSDT", 1200, 1210, vec![(3000.0, 6.0)], vec![]);
     let result = book.apply_diff(&ahead);
-    assert!(result.is_ok(), "ahead event must not error: {result:?}");
     assert!(
-        result.unwrap().is_none(),
-        "ahead event must be dropped (Ok(None))"
+        matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))),
+        "ahead event must return SnapshotRequired, got: {result:?}"
     );
     assert!(!book.synced, "book must remain unsynced after ahead event");
     assert_eq!(book.last_update_id, 1000, "last_update_id must not change");
@@ -528,14 +526,14 @@ fn test_perp_initial_sync_with_batched_u() {
     assert_eq!(book.last_update_id, 125);
 }
 
-/// Perp initial sync with pu > snapshot: snapshot aged, drop and wait for bridging event.
+/// Perp initial sync with pu != snapshot: snapshot aged, require re-snapshot.
 /// The has_snapshot guard handles the "no snapshot at all" case separately.
 #[test]
 fn test_perp_initial_sync_genuine_gap() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
 
-    // Perp diff: pu=150 != 100 → not bridged yet, drop and keep waiting
+    // Perp diff: pu=150 != 100 → not bridged, require re-snapshot
     let diff = DepthDiff {
         exchange: "binance_perp".into(),
         symbol: "ETHUSDT".into(),
@@ -548,14 +546,10 @@ fn test_perp_initial_sync_genuine_gap() {
     };
     let result = book.apply_diff(&diff);
     assert!(
-        result.is_ok(),
-        "perp initial sync with pu > last_update_id must not error: {result:?}"
+        matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))),
+        "perp initial sync with pu != last_update_id must return SnapshotRequired, got: {result:?}"
     );
-    assert!(
-        result.unwrap().is_none(),
-        "perp initial sync with pu > last_update_id must be dropped (Ok(None))"
-    );
-    assert!(!book.synced, "book must not be synced after dropped event");
+    assert!(!book.synced, "book must not be synced after gap event");
 }
 
 /// Stale perp event during initial sync: u <= last_update_id → dropped by generic stale guard.
@@ -589,13 +583,13 @@ fn test_perp_initial_sync_stale_u() {
 }
 
 /// Stale pu during initial sync: u > last_update_id (passes stale guard) but pu < last_update_id.
-/// This exercises the pu-specific stale-drop logic in the initial sync path.
+/// This exercises the pu-specific check in the initial sync path — requires re-snapshot.
 #[test]
 fn test_perp_initial_sync_stale_pu() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
 
-    // u=105 > 100 (passes generic stale guard), but pu=90 < 100 (stale pu → drop)
+    // u=105 > 100 (passes generic stale guard), but pu=90 != 100 → SnapshotRequired
     let diff = DepthDiff {
         exchange: "binance_perp".into(),
         symbol: "ETHUSDT".into(),
@@ -608,12 +602,8 @@ fn test_perp_initial_sync_stale_pu() {
     };
     let result = book.apply_diff(&diff);
     assert!(
-        result.is_ok(),
-        "stale-pu perp event must not error: {result:?}"
-    );
-    assert!(
-        result.unwrap().is_none(),
-        "stale-pu perp event must be dropped (Ok(None))"
+        matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))),
+        "stale-pu perp event must return SnapshotRequired, got: {result:?}"
     );
     assert!(
         !book.synced,

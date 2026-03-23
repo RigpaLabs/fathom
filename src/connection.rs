@@ -298,6 +298,223 @@ pub async fn connection_task(
             }
         }
 
+        // ── Sync phase: drain buffered WS events → replay → re-snapshot unsynced ──
+        let mut sync_gap_detected = false;
+        'sync: for attempt in 0..3u32 {
+            // Drain buffered events
+            let mut buf: Vec<String> = Vec::new();
+            while let Ok(msg) = fwd_rx.try_recv() {
+                buf.push(msg);
+            }
+            if buf.is_empty() && attempt > 0 {
+                break 'sync;
+            }
+
+            // Replay buffer
+            for text in &buf {
+                let combined: WsCombined = match serde_json::from_str(text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let sym_lower = combined.stream.split('@').next().unwrap_or("").to_string();
+                let symbol = sym_lower.to_uppercase();
+                if !symbols.contains(&symbol) {
+                    continue;
+                }
+
+                let depth: DepthUpdate = match serde_json::from_value(combined.data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let bids: Vec<(f64, f64)> = depth.bids.iter().filter_map(parse_level).collect();
+                let asks: Vec<(f64, f64)> = depth.asks.iter().filter_map(parse_level).collect();
+                let timestamp_us = depth.event_time_ms * 1_000;
+
+                let diff = DepthDiff {
+                    exchange: exchange_name.clone(),
+                    symbol: symbol.clone(),
+                    timestamp_us,
+                    seq_id: depth.final_update_id,
+                    prev_seq_id: depth.first_update_id,
+                    prev_final_update_id: depth.prev_final_update_id,
+                    bids: bids.clone(),
+                    asks: asks.clone(),
+                };
+
+                let book = books.entry(symbol.clone()).or_default();
+
+                match book.apply_diff(&diff) {
+                    Err(AppError::SnapshotRequired(_)) => {
+                        // During sync phase, silently skip — will re-snapshot below
+                        continue;
+                    }
+                    Err(AppError::OrderBookGap { .. }) => {
+                        // Genuine gap on already-synced book — need full reconnect
+                        warn!(conn = %name, symbol = %symbol, "gap detected during sync replay — will reconnect");
+                        {
+                            let mut state = lock_state(&monitor);
+                            if let Some(cs) = state.get_mut(&name)
+                                && let Some(ss) = cs.symbols.get_mut(&symbol)
+                            {
+                                ss.gaps_today += 1;
+                            }
+                        }
+                        sync_gap_detected = true;
+                        break 'sync;
+                    }
+                    Err(_) => continue,
+                    Ok(None) => continue,
+                    Ok(Some(applied)) => {
+                        {
+                            let mut state = lock_state(&monitor);
+                            if let Some(cs) = state.get_mut(&name)
+                                && let Some(ss) = cs.symbols.get_mut(&symbol)
+                            {
+                                ss.last_event_at = Some(Instant::now());
+                            }
+                        }
+
+                        if raw_tx
+                            .try_send(RawDiff {
+                                timestamp_us,
+                                exchange: exchange_name.clone(),
+                                symbol: symbol.clone(),
+                                seq_id: diff.seq_id,
+                                prev_seq_id: diff.prev_seq_id,
+                                bids,
+                                asks,
+                            })
+                            .is_err()
+                        {
+                            warn!(conn = %name, symbol = %symbol, "raw channel full — diff dropped (sync phase)");
+                        }
+
+                        let acc = accumulators.entry(symbol.clone()).or_insert_with(|| {
+                            WindowAccumulator::new(adapter.name(), &symbol, timestamp_us)
+                        });
+                        acc.on_diff(book, &applied);
+                    }
+                }
+            }
+
+            // Check unsynced
+            let unsynced: Vec<String> = books
+                .iter()
+                .filter(|(_, b)| !b.synced)
+                .map(|(s, _)| s.clone())
+                .collect();
+            if unsynced.is_empty() {
+                info!(conn = %name, attempt, "all symbols synced via buffer replay");
+                break 'sync;
+            }
+
+            if attempt < 2 {
+                info!(conn = %name, attempt, unsynced = ?unsynced, "re-snapshot for unsynced symbols");
+                // Re-fetch snapshots only for unsynced symbols (parallel)
+                let re_snap_futures: Vec<_> = unsynced
+                    .iter()
+                    .map(|sym| {
+                        let snap_url = conn
+                            .snapshot_url_override
+                            .as_ref()
+                            .map(|t| t.replace("{symbol}", sym))
+                            .unwrap_or_else(|| adapter.snapshot_url(sym));
+                        let client = &http_client;
+                        let sym = sym.clone();
+                        async move {
+                            match client.get(&snap_url).send().await {
+                                Ok(resp) => {
+                                    let status = resp.status();
+                                    match resp.text().await {
+                                        Ok(body) => (sym, Ok((status, body))),
+                                        Err(e) => (sym, Err(e)),
+                                    }
+                                }
+                                Err(e) => (sym, Err(e)),
+                            }
+                        }
+                    })
+                    .collect();
+
+                let re_snap_results = futures_util::future::join_all(re_snap_futures).await;
+
+                for (sym, result) in re_snap_results {
+                    match result {
+                        Err(e) => {
+                            warn!(conn = %name, symbol = %sym, error = %e, "re-snapshot fetch failed");
+                        }
+                        Ok((status, body)) => {
+                            if !status.is_success() {
+                                if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
+                                    && (err.code == -1003 || err.code == -1015)
+                                {
+                                    warn!(conn = %name, code = err.code, msg = %err.msg, "rate limit during re-snapshot — aborting sync phase");
+                                    break 'sync;
+                                }
+                                warn!(conn = %name, symbol = %sym, status = %status, "re-snapshot HTTP error");
+                                continue;
+                            }
+                            match serde_json::from_str::<SnapshotRest>(&body) {
+                                Err(_) => {
+                                    if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
+                                        && (err.code == -1003 || err.code == -1015)
+                                    {
+                                        warn!(conn = %name, code = err.code, msg = %err.msg, "rate limit during re-snapshot — aborting sync phase");
+                                        break 'sync;
+                                    }
+                                    warn!(conn = %name, symbol = %sym, "re-snapshot parse failed");
+                                }
+                                Ok(snap) => {
+                                    info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "re-snapshot ok");
+                                    let bids: Vec<(f64, f64)> =
+                                        snap.bids.iter().filter_map(parse_level).collect();
+                                    let asks: Vec<(f64, f64)> =
+                                        snap.asks.iter().filter_map(parse_level).collect();
+                                    books.entry(sym.clone()).or_default().apply_snapshot(
+                                        SnapshotMsg {
+                                            symbol: sym.clone(),
+                                            last_update_id: snap.last_update_id,
+                                            bids,
+                                            asks,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Small delay to let more events buffer
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        {
+            let synced_count = books.values().filter(|b| b.synced).count();
+            info!(conn = %name, synced = synced_count, total = symbols.len(), "sync phase complete");
+        }
+
+        // Gap detected during sync replay — skip to reconnect
+        if sync_gap_detected {
+            forwarder.abort();
+            let _ = forwarder.await;
+            {
+                let mut state = lock_state(&monitor);
+                if let Some(cs) = state.get_mut(&name) {
+                    cs.connected = false;
+                    cs.reconnects_today += 1;
+                }
+            }
+            for book in books.values_mut() {
+                *book = OrderBook::new();
+            }
+            accumulators.clear();
+            sleep_backoff(&mut backoff_ms).await;
+            continue;
+        }
+
         // 1s ticker for uniform snapshot sampling, independent of WS event rate.
         // Consume the immediate first tick so the first flush fires ~1s after connect.
         let mut snap_ticker = tokio::time::interval(Duration::from_secs(1));
