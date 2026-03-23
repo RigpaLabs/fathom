@@ -439,6 +439,116 @@ fn test_perp_pu_stale_event_dropped() {
     );
 }
 
+// ── Perp initial sync ────────────────────────────────────────────────────────
+
+/// Perp events batch updates so U (first_update_id) can jump by 5-10.
+/// Initial sync must use pu == last_update_id (not the spot rule U <= last+1).
+#[test]
+fn test_perp_initial_sync_with_batched_u() {
+    let mut book = OrderBook::new();
+    book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+    // Perp diff: U=106 (big jump!), u=115, pu=100 → pu matches snapshot last_update_id
+    let diff1 = DepthDiff {
+        exchange: "binance_perp".into(),
+        symbol: "ETHUSDT".into(),
+        timestamp_us: 1_000,
+        seq_id: 115,
+        prev_seq_id: 106,
+        prev_final_update_id: Some(100),
+        bids: vec![(3000.0, 6.0)],
+        asks: vec![],
+    };
+    let result = book.apply_diff(&diff1);
+    assert!(
+        result.is_ok(),
+        "perp initial sync with batched U must succeed: {result:?}"
+    );
+    assert!(
+        result.unwrap().is_some(),
+        "first perp sync event must apply (not be dropped)"
+    );
+    assert!(
+        book.synced,
+        "book must be synced after first valid perp event"
+    );
+    assert_eq!(book.last_update_id, 115);
+
+    // Second perp diff: pu=115 matches last_update_id → normal ongoing
+    let diff2 = DepthDiff {
+        exchange: "binance_perp".into(),
+        symbol: "ETHUSDT".into(),
+        timestamp_us: 2_000,
+        seq_id: 125,
+        prev_seq_id: 116,
+        prev_final_update_id: Some(115),
+        bids: vec![(3000.0, 7.0)],
+        asks: vec![],
+    };
+    let result2 = book.apply_diff(&diff2);
+    assert!(
+        result2.is_ok(),
+        "second perp event must succeed: {result2:?}"
+    );
+    assert!(result2.unwrap().is_some());
+    assert_eq!(book.last_update_id, 125);
+}
+
+/// Perp initial sync with a genuine gap: pu != snapshot last_update_id.
+#[test]
+fn test_perp_initial_sync_genuine_gap() {
+    let mut book = OrderBook::new();
+    book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+    // Perp diff: pu=150 != 100 → genuine gap, need re-snapshot
+    let diff = DepthDiff {
+        exchange: "binance_perp".into(),
+        symbol: "ETHUSDT".into(),
+        timestamp_us: 1_000,
+        seq_id: 210,
+        prev_seq_id: 200,
+        prev_final_update_id: Some(150),
+        bids: vec![],
+        asks: vec![],
+    };
+    let result = book.apply_diff(&diff);
+    assert!(
+        matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))),
+        "perp initial sync with pu != last_update_id must require re-snapshot: {result:?}"
+    );
+    assert!(!book.synced, "book must not be synced after gap");
+}
+
+/// Stale perp event during initial sync: u <= last_update_id → dropped before pu check.
+#[test]
+fn test_perp_initial_sync_stale_pu() {
+    let mut book = OrderBook::new();
+    book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+    // Stale perp event: u=90 <= 100, pu=70 — should be dropped (u <= last_update_id)
+    let diff = DepthDiff {
+        exchange: "binance_perp".into(),
+        symbol: "ETHUSDT".into(),
+        timestamp_us: 1_000,
+        seq_id: 90,
+        prev_seq_id: 80,
+        prev_final_update_id: Some(70),
+        bids: vec![(3000.0, 6.0)],
+        asks: vec![],
+    };
+    let result = book.apply_diff(&diff);
+    assert!(
+        result.is_ok(),
+        "stale perp event must not error: {result:?}"
+    );
+    assert!(
+        result.unwrap().is_none(),
+        "stale perp event must be dropped (Ok(None))"
+    );
+    assert!(!book.synced, "book must not be synced from a stale event");
+    assert_eq!(book.last_update_id, 100, "last_update_id must not change");
+}
+
 // ── Imbalance multi-level ───────────────────────────────────────────────────
 
 #[test]

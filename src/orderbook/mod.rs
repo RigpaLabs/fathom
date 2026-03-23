@@ -111,10 +111,16 @@ impl OrderBook {
             if u <= self.last_update_id {
                 return Ok(None);
             }
-            // Sync: first event where U <= lastUpdateId + 1 <= u
-            if big_u > self.last_update_id + 1 {
-                // Gap between snapshot and stream — need re-snapshot
-                return Err(AppError::SnapshotRequired(diff.symbol.clone()));
+            // Perp: use pu for initial sync (pu must == last_update_id)
+            if let Some(pu) = diff.prev_final_update_id {
+                if pu != self.last_update_id {
+                    return Err(AppError::SnapshotRequired(diff.symbol.clone()));
+                }
+            } else {
+                // Spot: U <= lastUpdateId + 1 <= u
+                if big_u > self.last_update_id + 1 {
+                    return Err(AppError::SnapshotRequired(diff.symbol.clone()));
+                }
             }
             self.synced = true;
         } else {
