@@ -68,10 +68,16 @@ All paths → two parallel writers:
 ## Important gotcha: perp vs spot gap check
 
 **Binance USDM Futures** diff events carry a `pu` field (prev_final_update_id).
-The ongoing sequence check for perps is:
+The `pu` field is used for **both initial sync and ongoing gap detection**:
 
 ```
-pu == last_update_id   ← CORRECT for perp
+Initial sync:  pu > last_update_id  → SnapshotRequired (gap)
+               pu < last_update_id  → Ok(None) (stale, drop)
+               pu == last_update_id → valid sync event
+
+Ongoing:       pu > last_update_id  → OrderBookGap (missed events)
+               pu < last_update_id  → Ok(None) (stale, drop)
+               pu == last_update_id → normal sequence
 ```
 
 **Not** `U == last_update_id + 1`, which is the spot rule. Both are handled in

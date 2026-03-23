@@ -519,13 +519,13 @@ fn test_perp_initial_sync_genuine_gap() {
     assert!(!book.synced, "book must not be synced after gap");
 }
 
-/// Stale perp event during initial sync: u <= last_update_id → dropped before pu check.
+/// Stale perp event during initial sync: u <= last_update_id → dropped by generic stale guard.
 #[test]
-fn test_perp_initial_sync_stale_pu() {
+fn test_perp_initial_sync_stale_u() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
 
-    // Stale perp event: u=90 <= 100, pu=70 — should be dropped (u <= last_update_id)
+    // Stale perp event: u=90 <= 100 — dropped by generic `u <= last_update_id` guard
     let diff = DepthDiff {
         exchange: "binance_perp".into(),
         symbol: "ETHUSDT".into(),
@@ -546,6 +546,40 @@ fn test_perp_initial_sync_stale_pu() {
         "stale perp event must be dropped (Ok(None))"
     );
     assert!(!book.synced, "book must not be synced from a stale event");
+    assert_eq!(book.last_update_id, 100, "last_update_id must not change");
+}
+
+/// Stale pu during initial sync: u > last_update_id (passes stale guard) but pu < last_update_id.
+/// This exercises the pu-specific stale-drop logic in the initial sync path.
+#[test]
+fn test_perp_initial_sync_stale_pu() {
+    let mut book = OrderBook::new();
+    book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+    // u=105 > 100 (passes generic stale guard), but pu=90 < 100 (stale pu → drop)
+    let diff = DepthDiff {
+        exchange: "binance_perp".into(),
+        symbol: "ETHUSDT".into(),
+        timestamp_us: 1_000,
+        seq_id: 105,
+        prev_seq_id: 95,
+        prev_final_update_id: Some(90),
+        bids: vec![(3000.0, 6.0)],
+        asks: vec![],
+    };
+    let result = book.apply_diff(&diff);
+    assert!(
+        result.is_ok(),
+        "stale-pu perp event must not error: {result:?}"
+    );
+    assert!(
+        result.unwrap().is_none(),
+        "stale-pu perp event must be dropped (Ok(None))"
+    );
+    assert!(
+        !book.synced,
+        "book must not be synced from a stale-pu event"
+    );
     assert_eq!(book.last_update_id, 100, "last_update_id must not change");
 }
 

@@ -111,11 +111,15 @@ impl OrderBook {
             if u <= self.last_update_id {
                 return Ok(None);
             }
-            // Perp: use pu for initial sync (pu must == last_update_id)
+            // Perp: use pu for initial sync — mirror the ongoing stale-drop logic
             if let Some(pu) = diff.prev_final_update_id {
-                if pu != self.last_update_id {
+                if pu > self.last_update_id {
                     return Err(AppError::SnapshotRequired(diff.symbol.clone()));
                 }
+                if pu < self.last_update_id {
+                    return Ok(None); // stale, drop
+                }
+                // pu == last_update_id: valid sync
             } else {
                 // Spot: U <= lastUpdateId + 1 <= u
                 if big_u > self.last_update_id + 1 {
