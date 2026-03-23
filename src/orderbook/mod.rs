@@ -123,7 +123,16 @@ impl OrderBook {
             } else {
                 // Spot: U <= lastUpdateId + 1 <= u
                 if big_u > self.last_update_id + 1 {
-                    return Err(AppError::SnapshotRequired(diff.symbol.clone()));
+                    if self.last_update_id == 0 {
+                        // Snapshot was never fetched (fetch failed or skipped) —
+                        // need a real reconnect to get a snapshot.
+                        return Err(AppError::SnapshotRequired(diff.symbol.clone()));
+                    }
+                    // Snapshot fetched but WS events moved ahead during fetch.
+                    // With parallel snapshot fetch the gap is typically ~3 IDs.
+                    // Drop and wait — the bridging event is likely still in the
+                    // forwarder buffer from before the snapshot was taken.
+                    return Ok(None);
                 }
             }
             self.synced = true;
@@ -524,5 +533,52 @@ mod tests {
         };
         let result = book.apply_diff(&gap_event);
         assert!(result.is_err(), "genuine perp gap must still trigger error");
+    }
+
+    /// Spot initial sync: when snapshot was fetched (last_update_id > 0) but
+    /// WS events raced ahead, drop the event instead of reconnecting.
+    #[test]
+    fn test_spot_initial_sync_drops_ahead_events() {
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+        assert_eq!(book.last_update_id, 100);
+
+        // Event with U=105 > lastUpdateId+1=101 — ahead of snapshot
+        let ahead = diff(110, 105, vec![], vec![]);
+        let result = book.apply_diff(&ahead);
+        assert!(
+            result.is_ok(),
+            "ahead event must not trigger SnapshotRequired"
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "ahead event must return None (dropped)"
+        );
+        assert!(!book.synced, "book must remain unsynced after dropping");
+
+        // Bridge event arrives: U=100 <= 101 <= u=103
+        let bridge = diff(103, 100, vec![(3000.0, 6.0)], vec![]);
+        let result = book.apply_diff(&bridge);
+        assert!(
+            result.unwrap().is_some(),
+            "bridge event must sync and apply"
+        );
+        assert!(book.synced, "book must be synced after bridge event");
+    }
+
+    /// Spot initial sync: when snapshot was NEVER fetched (last_update_id=0),
+    /// SnapshotRequired must still fire to trigger a reconnect.
+    #[test]
+    fn test_spot_initial_sync_snapshot_required_when_never_fetched() {
+        let mut book = OrderBook::new();
+        assert_eq!(book.last_update_id, 0);
+
+        // Any event with U > 1 should trigger SnapshotRequired
+        let event = diff(110, 105, vec![], vec![]);
+        let result = book.apply_diff(&event);
+        assert!(
+            result.is_err(),
+            "must return SnapshotRequired when snapshot was never fetched"
+        );
     }
 }

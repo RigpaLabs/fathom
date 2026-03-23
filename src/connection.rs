@@ -182,75 +182,96 @@ pub async fn connection_task(
             // Dropping fwd_tx signals the main loop that the stream is done.
         });
 
-        // Fetch REST snapshots per symbol.
-        // A failure for one symbol only skips that symbol — other symbols keep
-        // their WS stream.  The skipped symbol's book stays unsynced and will
-        // return SnapshotRequired on the first incoming diff, triggering a full
-        // reconnect (which re-fetches all snapshots).
-        let mut rate_limited = false;
-        for sym in &symbols {
-            // Build snapshot URL — use override template if provided
-            let snap_url = conn
-                .snapshot_url_override
-                .as_ref()
-                .map(|t| t.replace("{symbol}", sym))
-                .unwrap_or_else(|| adapter.snapshot_url(sym));
-
-            match http_client.get(&snap_url).send().await {
-                Err(e) => {
-                    warn!(conn = %name, symbol = %sym, error = %e, "snapshot fetch failed — skipping symbol");
-                    continue;
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = match resp.text().await {
-                        Ok(t) => t,
+        // Fetch REST snapshots in parallel to minimize the race window between
+        // snapshot timestamps and WS event IDs.  Sequential fetch (6 × ~50ms =
+        // ~300ms) lets early symbols go 200+ IDs stale; parallel fetch keeps the
+        // window to a single HTTP round-trip (~50ms, gap ≈ 3 IDs).
+        //
+        // Both the HTTP send AND body read are inside the future so we get true
+        // end-to-end parallelism, not just parallel sends with sequential reads.
+        //
+        // Rate-limit tradeoff: all requests fire before any response is checked,
+        // so a 429 on the first won't prevent the others.  This costs up to 6×
+        // weight instead of failing fast after 1.  Accepted because 6 snapshot
+        // requests = 300 weight, well within Binance's 1200 weight/min limit.
+        let snapshot_futs: Vec<_> = symbols
+            .iter()
+            .map(|sym| {
+                let snap_url = conn
+                    .snapshot_url_override
+                    .as_ref()
+                    .map(|t| t.replace("{symbol}", sym))
+                    .unwrap_or_else(|| adapter.snapshot_url(sym));
+                let client = &http_client;
+                let conn_name = &name;
+                let sym = sym.clone();
+                async move {
+                    let resp = match client.get(&snap_url).send().await {
+                        Ok(r) => r,
                         Err(e) => {
-                            warn!(conn = %name, symbol = %sym, error = %e, "snapshot read failed — skipping symbol");
-                            continue;
+                            warn!(conn = %conn_name, symbol = %sym, error = %e, "snapshot fetch failed — skipping symbol");
+                            return (sym, None);
                         }
                     };
-                    if !status.is_success() {
-                        if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
-                            && (err.code == -1003 || err.code == -1015)
-                        {
-                            warn!(conn = %name, code = err.code, msg = %err.msg, "Binance rate limit — backing off");
-                            rate_limited = true;
-                            break;
-                        }
-                        warn!(conn = %name, symbol = %sym, status = %status, "snapshot HTTP error — skipping symbol");
-                        continue;
-                    }
-                    match serde_json::from_str::<SnapshotRest>(&body) {
-                        Err(_) => {
-                            // HTTP 200 but unexpected body — check for rate limit error
-                            if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
-                                && (err.code == -1003 || err.code == -1015)
-                            {
-                                warn!(conn = %name, code = err.code, msg = %err.msg, "Binance rate limit — backing off");
-                                rate_limited = true;
-                                break;
-                            }
-                            warn!(conn = %name, symbol = %sym, "snapshot parse failed — skipping symbol");
-                            continue;
-                        }
-                        Ok(snap) => {
-                            info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");
-                            let bids: Vec<(f64, f64)> =
-                                snap.bids.iter().filter_map(parse_level).collect();
-                            let asks: Vec<(f64, f64)> =
-                                snap.asks.iter().filter_map(parse_level).collect();
-                            books
-                                .entry(sym.clone())
-                                .or_default()
-                                .apply_snapshot(SnapshotMsg {
-                                    symbol: sym.clone(),
-                                    last_update_id: snap.last_update_id,
-                                    bids,
-                                    asks,
-                                });
+                    let status = resp.status();
+                    match resp.text().await {
+                        Ok(body) => (sym, Some((status, body))),
+                        Err(e) => {
+                            warn!(conn = %conn_name, symbol = %sym, error = %e, "snapshot body read failed — skipping symbol");
+                            (sym, None)
                         }
                     }
+                }
+            })
+            .collect();
+
+        let results = futures_util::future::join_all(snapshot_futs).await;
+
+        // Process snapshot results.  A failure for one symbol skips that symbol —
+        // its book stays at last_update_id=0 (unsynced) and apply_diff will
+        // return SnapshotRequired, triggering a reconnect that re-fetches all.
+        let mut rate_limited = false;
+        for (sym, result) in results {
+            let (status, body) = match result {
+                None => continue, // fetch or body-read failed, already logged
+                Some(pair) => pair,
+            };
+            if !status.is_success() {
+                if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
+                    && (err.code == -1003 || err.code == -1015)
+                {
+                    warn!(conn = %name, code = err.code, msg = %err.msg, "Binance rate limit — backing off");
+                    rate_limited = true;
+                    break;
+                }
+                warn!(conn = %name, symbol = %sym, status = %status, "snapshot HTTP error — skipping symbol");
+                continue;
+            }
+            match serde_json::from_str::<SnapshotRest>(&body) {
+                Err(_) => {
+                    if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
+                        && (err.code == -1003 || err.code == -1015)
+                    {
+                        warn!(conn = %name, code = err.code, msg = %err.msg, "Binance rate limit — backing off");
+                        rate_limited = true;
+                        break;
+                    }
+                    warn!(conn = %name, symbol = %sym, "snapshot parse failed — skipping symbol");
+                    continue;
+                }
+                Ok(snap) => {
+                    info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");
+                    let bids: Vec<(f64, f64)> = snap.bids.iter().filter_map(parse_level).collect();
+                    let asks: Vec<(f64, f64)> = snap.asks.iter().filter_map(parse_level).collect();
+                    books
+                        .entry(sym.clone())
+                        .or_default()
+                        .apply_snapshot(SnapshotMsg {
+                            symbol: sym,
+                            last_update_id: snap.last_update_id,
+                            bids,
+                            asks,
+                        });
                 }
             }
         }

@@ -131,10 +131,27 @@ fn test_gap_detection() {
     ));
 }
 
+/// Spot initial sync: when snapshot was fetched (last_update_id > 0) but WS
+/// events raced ahead, drop the event instead of reconnecting.
 #[test]
-fn test_pre_snapshot_gap_requires_resnapshot() {
+fn test_pre_snapshot_gap_drops_ahead_event() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 1.0)], vec![(3001.0, 1.0)]));
+
+    // U=103 > lastUpdateId+1=101 → ahead of snapshot, drop (not reconnect)
+    let result = book.apply_diff(&make_diff("ETHUSDT", 103, 105, vec![], vec![]));
+    assert!(
+        matches!(result, Ok(None)),
+        "ahead event should be dropped when snapshot was fetched"
+    );
+}
+
+/// Spot initial sync: when snapshot was NEVER fetched (last_update_id=0),
+/// SnapshotRequired must still fire.
+#[test]
+fn test_pre_snapshot_gap_requires_resnapshot_when_never_fetched() {
+    let mut book = OrderBook::new();
+    // No snapshot applied — last_update_id stays 0
 
     let result = book.apply_diff(&make_diff("ETHUSDT", 103, 105, vec![], vec![]));
     assert!(matches!(
