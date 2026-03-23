@@ -121,9 +121,9 @@ impl OrderBook {
                 }
                 // pu == last_update_id: valid sync
             } else {
-                // Spot: U <= lastUpdateId + 1 <= u
+                // Spot: during initial sync, drop events that haven't bridged yet
                 if big_u > self.last_update_id + 1 {
-                    return Err(AppError::SnapshotRequired(diff.symbol.clone()));
+                    return Ok(None); // not yet bridged, keep waiting
                 }
             }
             self.synced = true;
