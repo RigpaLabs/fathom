@@ -758,3 +758,27 @@ fn test_consecutive_diffs_update_book() {
     let asks = book.asks_top_n(10);
     assert_eq!(asks[0], (3001.0, 7.0));
 }
+
+// ── has_snapshot guard ──────────────────────────────────────────────────────
+
+/// OrderBook with NO snapshot applied must return SnapshotRequired on the first diff.
+/// This catches the case where a REST snapshot fetch failed — the book stays without
+/// a snapshot, so apply_diff should force a reconnect rather than silently dropping data.
+#[test]
+fn test_no_snapshot_returns_snapshot_required() {
+    let mut book = OrderBook::new();
+    assert!(!book.synced);
+
+    let diff = make_diff(
+        "ETHUSDT",
+        100,
+        105,
+        vec![(3000.0, 5.0)],
+        vec![(3001.0, 4.0)],
+    );
+    let result = book.apply_diff(&diff);
+    assert!(
+        matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))),
+        "book without snapshot must return SnapshotRequired, got: {result:?}"
+    );
+}
