@@ -40,6 +40,11 @@ pub struct DiffApplied {
     pub ask_abs_change: f64,
 }
 
+/// Max consecutive dropped events before escalating to SnapshotRequired.
+/// Prevents silent data starvation when the bridging event never arrives
+/// (e.g. fast market, WS buffer flushed during snapshot fetch).
+const MAX_CONSECUTIVE_DROPS: u32 = 20;
+
 /// Level-2 order book with Binance sync protocol.
 pub struct OrderBook {
     /// Price → quantity, descending iteration (best bid first)
@@ -54,6 +59,9 @@ pub struct OrderBook {
     pub last_update_id: i64,
     /// True once we've found the sync event and applied it
     pub synced: bool,
+    /// Consecutive events dropped during initial sync (no bridging event yet).
+    /// Reset to 0 on successful sync. Triggers SnapshotRequired when exceeding threshold.
+    consecutive_drops: u32,
     /// Best bid qty at last OFI calculation point
     prev_best_bid_qty: f64,
     /// Best ask qty at last OFI calculation point
@@ -69,6 +77,7 @@ impl OrderBook {
             ask_last: HashMap::new(),
             last_update_id: 0,
             synced: false,
+            consecutive_drops: 0,
             prev_best_bid_qty: 0.0,
             prev_best_ask_qty: 0.0,
         }
@@ -96,6 +105,7 @@ impl OrderBook {
         }
         self.last_update_id = snap.last_update_id;
         self.synced = false;
+        self.consecutive_drops = 0;
         self.prev_best_bid_qty = self.best_bid_qty();
         self.prev_best_ask_qty = self.best_ask_qty();
     }
@@ -117,7 +127,7 @@ impl OrderBook {
                     return Err(AppError::SnapshotRequired(diff.symbol.clone()));
                 }
                 if pu < self.last_update_id {
-                    return Ok(None); // stale, drop
+                    return self.drop_or_escalate(&diff.symbol);
                 }
                 // pu == last_update_id: valid sync
             } else {
@@ -132,10 +142,11 @@ impl OrderBook {
                     // With parallel snapshot fetch the gap is typically ~3 IDs.
                     // Drop and wait — the bridging event is likely still in the
                     // forwarder buffer from before the snapshot was taken.
-                    return Ok(None);
+                    return self.drop_or_escalate(&diff.symbol);
                 }
             }
             self.synced = true;
+            self.consecutive_drops = 0;
         } else {
             // Ongoing: detect gap.
             // Perp (USDM Futures) events carry `pu` (prev_final_update_id); use it
@@ -169,6 +180,16 @@ impl OrderBook {
         let result = self.apply_levels(diff);
         self.last_update_id = u;
         Ok(Some(result))
+    }
+
+    /// Drop a pre-sync event, or escalate to SnapshotRequired if too many
+    /// consecutive events have been dropped (bridging event likely lost).
+    fn drop_or_escalate(&mut self, symbol: &str) -> Result<Option<DiffApplied>> {
+        self.consecutive_drops += 1;
+        if self.consecutive_drops >= MAX_CONSECUTIVE_DROPS {
+            return Err(AppError::SnapshotRequired(symbol.to_string()));
+        }
+        Ok(None)
     }
 
     fn apply_levels(&mut self, diff: &DepthDiff) -> DiffApplied {
@@ -580,5 +601,88 @@ mod tests {
             result.is_err(),
             "must return SnapshotRequired when snapshot was never fetched"
         );
+    }
+
+    /// Spot: after MAX_CONSECUTIVE_DROPS dropped events (bridging event never
+    /// arrived), escalate to SnapshotRequired instead of dropping forever.
+    #[test]
+    fn test_spot_drop_counter_escalates_to_snapshot_required() {
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+        // Send MAX_CONSECUTIVE_DROPS events all ahead of snapshot — they get dropped
+        for i in 0..super::MAX_CONSECUTIVE_DROPS - 1 {
+            let event = diff(200 + i64::from(i), 105, vec![], vec![]);
+            let result = book.apply_diff(&event);
+            assert!(matches!(result, Ok(None)), "event {i} should be dropped");
+        }
+
+        // The next drop should escalate to SnapshotRequired
+        let event = diff(300, 105, vec![], vec![]);
+        let result = book.apply_diff(&event);
+        assert!(
+            result.is_err(),
+            "must escalate to SnapshotRequired after {} consecutive drops",
+            super::MAX_CONSECUTIVE_DROPS
+        );
+    }
+
+    /// Perp: stale events during initial sync also count toward the drop limit.
+    #[test]
+    fn test_perp_drop_counter_escalates_on_stale_events() {
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+        for i in 0..super::MAX_CONSECUTIVE_DROPS - 1 {
+            let event = DepthDiff {
+                exchange: "test".into(),
+                symbol: "ETHUSDT".into(),
+                timestamp_us: i64::from(i) * 1_000,
+                seq_id: 200 + i64::from(i),
+                prev_seq_id: 105,
+                prev_final_update_id: Some(90), // pu < last_update_id=100 → stale
+                bids: vec![],
+                asks: vec![],
+            };
+            let result = book.apply_diff(&event);
+            assert!(matches!(result, Ok(None)), "event {i} should be dropped");
+        }
+
+        // Next stale event should escalate
+        let event = DepthDiff {
+            exchange: "test".into(),
+            symbol: "ETHUSDT".into(),
+            timestamp_us: 999_000,
+            seq_id: 999,
+            prev_seq_id: 105,
+            prev_final_update_id: Some(90),
+            bids: vec![],
+            asks: vec![],
+        };
+        let result = book.apply_diff(&event);
+        assert!(
+            result.is_err(),
+            "must escalate to SnapshotRequired after too many stale perp drops"
+        );
+    }
+
+    /// Successful sync resets the drop counter.
+    #[test]
+    fn test_drop_counter_resets_on_sync() {
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+        // Drop a few events
+        for i in 0..5 {
+            let event = diff(200 + i, 105, vec![], vec![]);
+            book.apply_diff(&event).unwrap();
+        }
+        assert_eq!(book.consecutive_drops, 5);
+
+        // Bridge event syncs the book — resets counter
+        let bridge = diff(103, 100, vec![(3000.0, 6.0)], vec![]);
+        let result = book.apply_diff(&bridge);
+        assert!(result.unwrap().is_some(), "bridge event must sync");
+        assert_eq!(book.consecutive_drops, 0, "sync must reset drop counter");
     }
 }
