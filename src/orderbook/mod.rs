@@ -119,16 +119,16 @@ impl OrderBook {
             if u <= self.last_update_id {
                 return Ok(None);
             }
-            // Perp: use pu for initial sync — drop until bridging event
+            // Perp: use pu for initial sync
             if let Some(pu) = diff.prev_final_update_id {
                 if pu != self.last_update_id {
-                    return Ok(None); // not yet bridged, keep waiting
+                    return Err(AppError::SnapshotRequired(diff.symbol.clone()));
                 }
                 // pu == last_update_id: valid sync
             } else {
-                // Spot: during initial sync, drop events that haven't bridged yet
+                // Spot: U <= lastUpdateId+1 <= u
                 if big_u > self.last_update_id + 1 {
-                    return Ok(None); // not yet bridged, keep waiting
+                    return Err(AppError::SnapshotRequired(diff.symbol.clone()));
                 }
             }
             self.synced = true;
