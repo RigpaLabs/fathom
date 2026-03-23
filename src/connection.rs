@@ -182,24 +182,32 @@ pub async fn connection_task(
             // Dropping fwd_tx signals the main loop that the stream is done.
         });
 
-        // Fetch REST snapshots per symbol.
+        // Fetch REST snapshots for all symbols in parallel.
         // A failure for one symbol only skips that symbol — other symbols keep
         // their WS stream.  The skipped symbol's book stays unsynced and will
         // return SnapshotRequired on the first incoming diff, triggering a full
         // reconnect (which re-fetches all snapshots).
         let mut rate_limited = false;
-        for sym in &symbols {
-            // Build snapshot URL — use override template if provided
-            let snap_url = conn
-                .snapshot_url_override
-                .as_ref()
-                .map(|t| t.replace("{symbol}", sym))
-                .unwrap_or_else(|| adapter.snapshot_url(sym));
 
-            match http_client.get(&snap_url).send().await {
+        let snap_futures: Vec<_> = symbols
+            .iter()
+            .map(|sym| {
+                let snap_url = conn
+                    .snapshot_url_override
+                    .as_ref()
+                    .map(|t| t.replace("{symbol}", sym))
+                    .unwrap_or_else(|| adapter.snapshot_url(sym));
+                let client = &http_client;
+                async move { (sym.clone(), client.get(&snap_url).send().await) }
+            })
+            .collect();
+
+        let snap_results = futures_util::future::join_all(snap_futures).await;
+
+        for (sym, result) in snap_results {
+            match result {
                 Err(e) => {
                     warn!(conn = %name, symbol = %sym, error = %e, "snapshot fetch failed — skipping symbol");
-                    continue;
                 }
                 Ok(resp) => {
                     let status = resp.status();
@@ -232,7 +240,6 @@ pub async fn connection_task(
                                 break;
                             }
                             warn!(conn = %name, symbol = %sym, "snapshot parse failed — skipping symbol");
-                            continue;
                         }
                         Ok(snap) => {
                             info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");

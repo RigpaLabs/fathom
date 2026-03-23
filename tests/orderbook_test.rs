@@ -132,15 +132,49 @@ fn test_gap_detection() {
 }
 
 #[test]
-fn test_pre_snapshot_gap_requires_resnapshot() {
+fn test_pre_snapshot_gap_drops_instead_of_resnapshot() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 1.0)], vec![(3001.0, 1.0)]));
 
+    // Spot: U=103 > last_update_id+1=101 → drop (wait for bridging event)
     let result = book.apply_diff(&make_diff("ETHUSDT", 103, 105, vec![], vec![]));
-    assert!(matches!(
-        result,
-        Err(fathom::error::AppError::SnapshotRequired(_))
-    ));
+    assert!(result.is_ok(), "should not error: {result:?}");
+    assert!(
+        result.unwrap().is_none(),
+        "ahead event should be dropped during initial sync"
+    );
+    assert!(!book.synced, "book must remain unsynced");
+}
+
+#[test]
+fn test_spot_initial_sync_drops_ahead_events() {
+    let mut book = OrderBook::new();
+    book.apply_snapshot(snapshot(1000, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
+
+    // Event far ahead: U=1200, u=1210 (no pu → spot) — should be dropped
+    let ahead = make_diff("ETHUSDT", 1200, 1210, vec![(3000.0, 6.0)], vec![]);
+    let result = book.apply_diff(&ahead);
+    assert!(result.is_ok(), "ahead event must not error: {result:?}");
+    assert!(
+        result.unwrap().is_none(),
+        "ahead event must be dropped (Ok(None))"
+    );
+    assert!(!book.synced, "book must remain unsynced after ahead event");
+    assert_eq!(book.last_update_id, 1000, "last_update_id must not change");
+
+    // Bridging event: U=1001, u=1005 (spans snapshot) — should sync
+    let bridge = make_diff("ETHUSDT", 1001, 1005, vec![(3000.0, 7.0)], vec![]);
+    let result2 = book.apply_diff(&bridge);
+    assert!(
+        result2.is_ok(),
+        "bridging event must not error: {result2:?}"
+    );
+    assert!(
+        result2.unwrap().is_some(),
+        "bridging event must be applied (Ok(Some))"
+    );
+    assert!(book.synced, "book must be synced after bridging event");
+    assert_eq!(book.last_update_id, 1005);
 }
 
 // ── Empty book edge cases ─────────────────────────────────────────────────────
@@ -723,4 +757,28 @@ fn test_consecutive_diffs_update_book() {
 
     let asks = book.asks_top_n(10);
     assert_eq!(asks[0], (3001.0, 7.0));
+}
+
+// ── has_snapshot guard ──────────────────────────────────────────────────────
+
+/// OrderBook with NO snapshot applied must return SnapshotRequired on the first diff.
+/// This catches the case where a REST snapshot fetch failed — the book stays without
+/// a snapshot, so apply_diff should force a reconnect rather than silently dropping data.
+#[test]
+fn test_no_snapshot_returns_snapshot_required() {
+    let mut book = OrderBook::new();
+    assert!(!book.synced);
+
+    let diff = make_diff(
+        "ETHUSDT",
+        100,
+        105,
+        vec![(3000.0, 5.0)],
+        vec![(3001.0, 4.0)],
+    );
+    let result = book.apply_diff(&diff);
+    assert!(
+        matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))),
+        "book without snapshot must return SnapshotRequired, got: {result:?}"
+    );
 }
