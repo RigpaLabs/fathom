@@ -54,6 +54,9 @@ pub struct OrderBook {
     pub last_update_id: i64,
     /// True once we've found the sync event and applied it
     pub synced: bool,
+    /// True once a REST snapshot has been applied — guards against processing
+    /// diffs for symbols whose snapshot fetch failed.
+    pub has_snapshot: bool,
     /// Best bid qty at last OFI calculation point
     prev_best_bid_qty: f64,
     /// Best ask qty at last OFI calculation point
@@ -69,6 +72,7 @@ impl OrderBook {
             ask_last: HashMap::new(),
             last_update_id: 0,
             synced: false,
+            has_snapshot: false,
             prev_best_bid_qty: 0.0,
             prev_best_ask_qty: 0.0,
         }
@@ -95,6 +99,7 @@ impl OrderBook {
             }
         }
         self.last_update_id = snap.last_update_id;
+        self.has_snapshot = true;
         self.synced = false;
         self.prev_best_bid_qty = self.best_bid_qty();
         self.prev_best_ask_qty = self.best_ask_qty();
@@ -107,17 +112,17 @@ impl OrderBook {
         let big_u = diff.prev_seq_id; // first_update_id
 
         if !self.synced {
+            if !self.has_snapshot {
+                return Err(AppError::SnapshotRequired(diff.symbol.clone()));
+            }
             // Drop events where u <= last_update_id (already in snapshot)
             if u <= self.last_update_id {
                 return Ok(None);
             }
-            // Perp: use pu for initial sync — mirror the ongoing stale-drop logic
+            // Perp: use pu for initial sync — drop until bridging event
             if let Some(pu) = diff.prev_final_update_id {
-                if pu > self.last_update_id {
-                    return Err(AppError::SnapshotRequired(diff.symbol.clone()));
-                }
-                if pu < self.last_update_id {
-                    return Ok(None); // stale, drop
+                if pu != self.last_update_id {
+                    return Ok(None); // not yet bridged, keep waiting
                 }
                 // pu == last_update_id: valid sync
             } else {

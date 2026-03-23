@@ -183,12 +183,16 @@ pub async fn connection_task(
         });
 
         // Fetch REST snapshots for all symbols in parallel.
-        // A failure for one symbol only skips that symbol — other symbols keep
-        // their WS stream.  The skipped symbol's book stays unsynced and will
-        // return SnapshotRequired on the first incoming diff, triggering a full
-        // reconnect (which re-fetches all snapshots).
+        // If a symbol's fetch fails, its book has no snapshot — apply_diff
+        // will return SnapshotRequired on the first diff, triggering a reconnect.
+        // Symbols with valid snapshots but ahead WS events (U > lastUpdateId+1)
+        // drop events until a bridging event arrives (no reconnect needed).
         let mut rate_limited = false;
 
+        // NOTE: All snapshot requests fire in parallel — if Binance rate-limits one,
+        // remaining requests have already been sent (6× weight vs 1× sequential).
+        // Acceptable: normal ops never hit limits, 300s backoff prevents damage,
+        // and parallel fetch reduces snapshot-to-stream gap from ~200 to ~3 IDs.
         let snap_futures: Vec<_> = symbols
             .iter()
             .map(|sym| {
@@ -198,7 +202,19 @@ pub async fn connection_task(
                     .map(|t| t.replace("{symbol}", sym))
                     .unwrap_or_else(|| adapter.snapshot_url(sym));
                 let client = &http_client;
-                async move { (sym.clone(), client.get(&snap_url).send().await) }
+                let sym = sym.clone();
+                async move {
+                    match client.get(&snap_url).send().await {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            match resp.text().await {
+                                Ok(body) => (sym, Ok((status, body))),
+                                Err(e) => (sym, Err(e)),
+                            }
+                        }
+                        Err(e) => (sym, Err(e)),
+                    }
+                }
             })
             .collect();
 
@@ -209,15 +225,7 @@ pub async fn connection_task(
                 Err(e) => {
                     warn!(conn = %name, symbol = %sym, error = %e, "snapshot fetch failed — skipping symbol");
                 }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = match resp.text().await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            warn!(conn = %name, symbol = %sym, error = %e, "snapshot read failed — skipping symbol");
-                            continue;
-                        }
-                    };
+                Ok((status, body)) => {
                     if !status.is_success() {
                         if let Ok(err) = serde_json::from_str::<BinanceError>(&body)
                             && (err.code == -1003 || err.code == -1015)
