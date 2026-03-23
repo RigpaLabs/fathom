@@ -528,13 +528,14 @@ fn test_perp_initial_sync_with_batched_u() {
     assert_eq!(book.last_update_id, 125);
 }
 
-/// Perp initial sync with a genuine gap: pu != snapshot last_update_id.
+/// Perp initial sync with pu > snapshot: snapshot aged, drop and wait for bridging event.
+/// The has_snapshot guard handles the "no snapshot at all" case separately.
 #[test]
 fn test_perp_initial_sync_genuine_gap() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
 
-    // Perp diff: pu=150 != 100 → genuine gap, need re-snapshot
+    // Perp diff: pu=150 != 100 → not bridged yet, drop and keep waiting
     let diff = DepthDiff {
         exchange: "binance_perp".into(),
         symbol: "ETHUSDT".into(),
@@ -547,10 +548,14 @@ fn test_perp_initial_sync_genuine_gap() {
     };
     let result = book.apply_diff(&diff);
     assert!(
-        matches!(result, Err(fathom::error::AppError::SnapshotRequired(_))),
-        "perp initial sync with pu != last_update_id must require re-snapshot: {result:?}"
+        result.is_ok(),
+        "perp initial sync with pu > last_update_id must not error: {result:?}"
     );
-    assert!(!book.synced, "book must not be synced after gap");
+    assert!(
+        result.unwrap().is_none(),
+        "perp initial sync with pu > last_update_id must be dropped (Ok(None))"
+    );
+    assert!(!book.synced, "book must not be synced after dropped event");
 }
 
 /// Stale perp event during initial sync: u <= last_update_id → dropped by generic stale guard.
