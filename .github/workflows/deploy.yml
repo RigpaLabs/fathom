@@ -102,7 +102,7 @@ jobs:
               -e DATA_DIR=/app/data/${IMAGE_TAG} \
               -v fathom-data:/app/data \
               -v ${{ secrets.DEPLOY_DIR }}/config.toml:/app/config.toml:ro \
-              --memory 192m \
+              --memory 384m \
               --log-driver json-file \
               --log-opt max-size=50m \
               --log-opt max-file=5 \

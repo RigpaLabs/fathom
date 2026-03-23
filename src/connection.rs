@@ -193,28 +193,35 @@ pub async fn connection_task(
                     warn!(conn = %name, symbol = %sym, error = %e, "snapshot fetch failed — skipping symbol");
                     continue;
                 }
-                Ok(resp) => match resp.json::<SnapshotRest>().await {
-                    Err(e) => {
-                        warn!(conn = %name, symbol = %sym, error = %e, "snapshot parse failed — skipping symbol");
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        warn!(conn = %name, symbol = %sym, status = %status, "snapshot HTTP error — skipping symbol");
                         continue;
                     }
-                    Ok(snap) => {
-                        info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");
-                        let bids: Vec<(f64, f64)> =
-                            snap.bids.iter().filter_map(parse_level).collect();
-                        let asks: Vec<(f64, f64)> =
-                            snap.asks.iter().filter_map(parse_level).collect();
-                        books
-                            .entry(sym.clone())
-                            .or_default()
-                            .apply_snapshot(SnapshotMsg {
-                                symbol: sym.clone(),
-                                last_update_id: snap.last_update_id,
-                                bids,
-                                asks,
-                            });
+                    match resp.json::<SnapshotRest>().await {
+                        Err(e) => {
+                            warn!(conn = %name, symbol = %sym, error = %e, "snapshot parse failed — skipping symbol. This may indicate schema mismatch or API response change");
+                            continue;
+                        }
+                        Ok(snap) => {
+                            info!(conn = %name, symbol = %sym, last_update_id = snap.last_update_id, "snapshot ok");
+                            let bids: Vec<(f64, f64)> =
+                                snap.bids.iter().filter_map(parse_level).collect();
+                            let asks: Vec<(f64, f64)> =
+                                snap.asks.iter().filter_map(parse_level).collect();
+                            books
+                                .entry(sym.clone())
+                                .or_default()
+                                .apply_snapshot(SnapshotMsg {
+                                    symbol: sym.clone(),
+                                    last_update_id: snap.last_update_id,
+                                    bids,
+                                    asks,
+                                });
+                        }
                     }
-                },
+                }
             }
         }
 
