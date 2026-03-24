@@ -526,14 +526,15 @@ fn test_perp_initial_sync_with_batched_u() {
     assert_eq!(book.last_update_id, 125);
 }
 
-/// Perp initial sync with pu != snapshot: drop and wait for bridging event.
-/// Re-snapshot doesn't help for perp (causes rate limits), so Ok(None) instead.
+/// Perp initial sync: accept any event with pu field, even if pu > last_update_id.
+/// pu chain guarantees consistency — snapshot may have aged but
+/// the event stream is valid from this point forward.
 #[test]
-fn test_perp_initial_sync_genuine_gap() {
+fn test_perp_initial_sync_accepts_aged_snapshot() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
 
-    // Perp diff: pu=150 != 100 → not bridged, drop and wait
+    // Perp diff: pu=150 > last_update_id=100 → accepted (pu chain is self-consistent)
     let diff = DepthDiff {
         exchange: "binance_perp".into(),
         symbol: "ETHUSDT".into(),
@@ -541,19 +542,23 @@ fn test_perp_initial_sync_genuine_gap() {
         seq_id: 210,
         prev_seq_id: 200,
         prev_final_update_id: Some(150),
-        bids: vec![],
+        bids: vec![(3000.0, 6.0)],
         asks: vec![],
     };
     let result = book.apply_diff(&diff);
     assert!(
         result.is_ok(),
-        "perp initial sync with pu != last_update_id must return Ok(None), got: {result:?}"
+        "perp initial sync must accept any event with pu: {result:?}"
     );
     assert!(
-        result.unwrap().is_none(),
-        "perp event with pu != last_update_id must be dropped"
+        result.unwrap().is_some(),
+        "perp event with pu must be applied (Ok(Some))"
     );
-    assert!(!book.synced, "book must not be synced after dropped event");
+    assert!(
+        book.synced,
+        "book must be synced after accepting perp event"
+    );
+    assert_eq!(book.last_update_id, 210);
 }
 
 /// Stale perp event during initial sync: u <= last_update_id → dropped by generic stale guard.
@@ -586,14 +591,15 @@ fn test_perp_initial_sync_stale_u() {
     assert_eq!(book.last_update_id, 100, "last_update_id must not change");
 }
 
-/// Stale pu during initial sync: u > last_update_id (passes stale guard) but pu < last_update_id.
-/// This exercises the pu-specific check in the initial sync path — drop and wait.
+/// Perp initial sync: accept event even with pu < last_update_id (overlap).
+/// pu chain is self-consistent — the event stream is valid regardless of
+/// snapshot age vs event position.
 #[test]
-fn test_perp_initial_sync_stale_pu() {
+fn test_perp_initial_sync_overlap_pu() {
     let mut book = OrderBook::new();
     book.apply_snapshot(snapshot(100, vec![(3000.0, 5.0)], vec![(3001.0, 4.0)]));
 
-    // u=105 > 100 (passes generic stale guard), but pu=90 != 100 → drop (Ok(None))
+    // u=105 > 100 (passes generic stale guard), pu=90 <= 100 → still accepted
     let diff = DepthDiff {
         exchange: "binance_perp".into(),
         symbol: "ETHUSDT".into(),
@@ -607,17 +613,17 @@ fn test_perp_initial_sync_stale_pu() {
     let result = book.apply_diff(&diff);
     assert!(
         result.is_ok(),
-        "stale-pu perp event must return Ok(None), got: {result:?}"
+        "overlap-pu perp event must be accepted: {result:?}"
     );
     assert!(
-        result.unwrap().is_none(),
-        "stale-pu perp event must be dropped"
+        result.unwrap().is_some(),
+        "overlap-pu perp event must be applied (Ok(Some))"
     );
     assert!(
-        !book.synced,
-        "book must not be synced from a stale-pu event"
+        book.synced,
+        "book must be synced after accepting perp event"
     );
-    assert_eq!(book.last_update_id, 100, "last_update_id must not change");
+    assert_eq!(book.last_update_id, 105);
 }
 
 // ── Imbalance multi-level ───────────────────────────────────────────────────

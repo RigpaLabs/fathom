@@ -11,7 +11,7 @@ use rand::Rng;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     accumulator::{Snapshot1s, WindowAccumulator},
@@ -184,9 +184,9 @@ pub async fn connection_task(
 
         // Fetch REST snapshots for all symbols in parallel.
         // If a symbol's fetch fails, its book has no snapshot — apply_diff
-        // will return SnapshotRequired on the first diff, triggering a reconnect.
-        // Symbols with valid snapshots but ahead WS events (U > lastUpdateId+1)
-        // drop events until a bridging event arrives (no reconnect needed).
+        // will return SnapshotRequired on the first diff, triggering reconnect.
+        // Spot symbols that don't bridge sync via re-snapshot in the sync phase.
+        // Perp symbols accept any event with pu field (pu chain is self-consistent).
         let mut rate_limited = false;
 
         // NOTE: All snapshot requests fire in parallel — if Binance rate-limits one,
@@ -299,6 +299,11 @@ pub async fn connection_task(
         }
 
         // ── Sync phase: drain buffered WS events → replay → re-snapshot unsynced ──
+        // Let WS events buffer before first drain. Binance sends first event
+        // ~100ms after connect; without delay the buffer is empty.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let is_perp = exchange_name == "binance_perp";
         let mut sync_gap_detected = false;
         'sync: for attempt in 0..3u32 {
             // Drain buffered events
@@ -306,6 +311,7 @@ pub async fn connection_task(
             while let Ok(msg) = fwd_rx.try_recv() {
                 buf.push(msg);
             }
+            debug!(conn = %name, attempt, buf_size = buf.len(), "sync phase drain");
             if buf.is_empty() && attempt > 0 {
                 break 'sync;
             }
@@ -410,7 +416,7 @@ pub async fn connection_task(
                 break 'sync;
             }
 
-            if attempt < 2 {
+            if attempt < 2 && !is_perp {
                 info!(conn = %name, attempt, unsynced = ?unsynced, "re-snapshot for unsynced symbols");
                 // Re-fetch snapshots only for unsynced symbols (parallel)
                 let re_snap_futures: Vec<_> = unsynced

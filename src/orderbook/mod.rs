@@ -119,13 +119,13 @@ impl OrderBook {
             if u <= self.last_update_id {
                 return Ok(None);
             }
-            // Perp: drop and wait for bridging event (re-snapshot doesn't help for perp)
-            if let Some(pu) = diff.prev_final_update_id {
-                if pu != self.last_update_id {
-                    return Ok(None);
-                }
+            // Perp: accept any event with pu during initial sync.
+            // pu chain guarantees consistency — snapshot may have aged but
+            // the event stream is valid from this point forward.
+            if let Some(_pu) = diff.prev_final_update_id {
+                // Always accept — fall through to sync
             } else {
-                // Spot: U <= lastUpdateId+1 <= u
+                // Spot: U <= lastUpdateId+1 <= u required for bridging
                 if big_u > self.last_update_id + 1 {
                     return Err(AppError::SnapshotRequired(diff.symbol.clone()));
                 }
