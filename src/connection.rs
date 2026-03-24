@@ -13,6 +13,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     accumulator::{Snapshot1s, WindowAccumulator},
     config::ConnectionConfig,
@@ -74,6 +76,35 @@ pub fn parse_level(v: &[serde_json::Value; 2]) -> Option<(f64, f64)> {
     Some((px, qty))
 }
 
+/// Parse bid/ask levels from a DepthUpdate, counting parse failures instead of silently dropping.
+#[allow(clippy::type_complexity)]
+fn parse_depth_levels(depth: &DepthUpdate) -> (Vec<(f64, f64)>, Vec<(f64, f64)>, usize) {
+    let mut errs = 0usize;
+    let bids: Vec<(f64, f64)> = depth
+        .bids
+        .iter()
+        .filter_map(|v| match parse_level(v) {
+            Some(l) => Some(l),
+            None => {
+                errs += 1;
+                None
+            }
+        })
+        .collect();
+    let asks: Vec<(f64, f64)> = depth
+        .asks
+        .iter()
+        .filter_map(|v| match parse_level(v) {
+            Some(l) => Some(l),
+            None => {
+                errs += 1;
+                None
+            }
+        })
+        .collect();
+    (bids, asks, errs)
+}
+
 // ── Connection task ───────────────────────────────────────────────────────────
 
 pub async fn connection_task(
@@ -83,10 +114,12 @@ pub async fn connection_task(
     monitor: MonitorState,
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
+    cancel: CancellationToken,
 ) {
     let name = conn.name.clone();
     let exchange_name = adapter.name().to_string();
     let symbols: Vec<String> = conn.symbols.iter().map(|s| s.to_uppercase()).collect();
+    let symbols_set: std::collections::HashSet<String> = symbols.iter().cloned().collect();
 
     let mut books: HashMap<String, OrderBook> = symbols
         .iter()
@@ -111,6 +144,10 @@ pub async fn connection_task(
         .expect("reqwest client");
 
     loop {
+        if cancel.is_cancelled() {
+            info!(conn = %name, "shutdown signal received, exiting connection loop");
+            break;
+        }
         info!(conn = %name, "connecting...");
 
         // Build WS URL — use override if provided (for tests)
@@ -189,11 +226,10 @@ pub async fn connection_task(
         // Perp symbols accept any event with pu field (pu chain is self-consistent).
         let mut rate_limited = false;
 
-        // NOTE: All snapshot requests fire in parallel — if Binance rate-limits one,
-        // remaining requests have already been sent (6× weight vs 1× sequential).
-        // Acceptable: normal ops never hit limits, 300s backoff prevents damage,
-        // and parallel fetch reduces snapshot-to-stream gap from ~200 to ~3 IDs.
-        let snap_futures: Vec<_> = symbols
+        // Bounded concurrency: at most 8 parallel snapshot fetches to avoid
+        // fanning out unbounded during reconnect storms.
+        use futures_util::stream;
+        let snap_futs: Vec<_> = symbols
             .iter()
             .map(|sym| {
                 let snap_url = conn
@@ -217,8 +253,7 @@ pub async fn connection_task(
                 }
             })
             .collect();
-
-        let snap_results = futures_util::future::join_all(snap_futures).await;
+        let snap_results: Vec<_> = stream::iter(snap_futs).buffer_unordered(8).collect().await;
 
         for (sym, result) in snap_results {
             match result {
@@ -325,7 +360,7 @@ pub async fn connection_task(
 
                 let sym_lower = combined.stream.split('@').next().unwrap_or("").to_string();
                 let symbol = sym_lower.to_uppercase();
-                if !symbols.contains(&symbol) {
+                if !symbols_set.contains(&symbol) {
                     continue;
                 }
 
@@ -334,8 +369,10 @@ pub async fn connection_task(
                     Err(_) => continue,
                 };
 
-                let bids: Vec<(f64, f64)> = depth.bids.iter().filter_map(parse_level).collect();
-                let asks: Vec<(f64, f64)> = depth.asks.iter().filter_map(parse_level).collect();
+                let (bids, asks, parse_errs) = parse_depth_levels(&depth);
+                if parse_errs > 0 {
+                    warn!(conn = %name, symbol = %symbol, errors = parse_errs, "parse errors in depth levels (sync)");
+                }
                 let timestamp_us = depth.event_time_ms * 1_000;
 
                 let diff = DepthDiff {
@@ -418,8 +455,8 @@ pub async fn connection_task(
 
             if attempt < 2 && !is_perp {
                 info!(conn = %name, attempt, unsynced = ?unsynced, "re-snapshot for unsynced symbols");
-                // Re-fetch snapshots only for unsynced symbols (parallel)
-                let re_snap_futures: Vec<_> = unsynced
+                // Re-fetch snapshots only for unsynced symbols (bounded concurrency)
+                let re_futs: Vec<_> = unsynced
                     .iter()
                     .map(|sym| {
                         let snap_url = conn
@@ -443,8 +480,8 @@ pub async fn connection_task(
                         }
                     })
                     .collect();
-
-                let re_snap_results = futures_util::future::join_all(re_snap_futures).await;
+                let re_snap_results: Vec<_> =
+                    stream::iter(re_futs).buffer_unordered(8).collect().await;
 
                 for (sym, result) in re_snap_results {
                     match result {
@@ -535,6 +572,11 @@ pub async fn connection_task(
 
         'inner: loop {
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!(conn = %name, "shutdown signal — exiting event loop");
+                    break 'inner;
+                }
+
                 msg = fwd_rx.recv() => {
                     let text = match msg {
                         None => break 'inner, // forwarder closed (stream ended, timeout, or error)
@@ -548,15 +590,17 @@ pub async fn connection_task(
 
                     let sym_lower = combined.stream.split('@').next().unwrap_or("").to_string();
                     let symbol = sym_lower.to_uppercase();
-                    if !symbols.contains(&symbol) { continue; }
+                    if !symbols_set.contains(&symbol) { continue; }
 
                     let depth: DepthUpdate = match serde_json::from_value(combined.data) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
 
-                    let bids: Vec<(f64, f64)> = depth.bids.iter().filter_map(parse_level).collect();
-                    let asks: Vec<(f64, f64)> = depth.asks.iter().filter_map(parse_level).collect();
+                    let (bids, asks, parse_errs) = parse_depth_levels(&depth);
+                    if parse_errs > 0 {
+                        warn!(conn = %name, symbol = %symbol, errors = parse_errs, "parse errors in depth levels");
+                    }
                     let timestamp_us = depth.event_time_ms * 1_000;
 
                     let diff = DepthDiff {

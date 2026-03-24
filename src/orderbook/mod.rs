@@ -179,6 +179,8 @@ impl OrderBook {
             let key = OrderedFloat(px);
             let prev = self.bid_last.get(&key).copied().unwrap_or(0.0);
             bid_abs_change += (qty - prev).abs();
+            // Exact float comparison: Binance sends literal "0.00000000" for removed
+            // levels, which parses to exact 0.0. No epsilon needed here.
             if qty == 0.0 {
                 self.bid_last.remove(&key);
                 self.bids.remove(&key);

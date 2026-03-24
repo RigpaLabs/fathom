@@ -15,6 +15,7 @@ use fathom::{
     writer::{raw::RawDiff, snap_1s::run_snap_writer},
 };
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use fathom::accumulator::Snapshot1s;
@@ -44,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(cfg.data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
+    let cancel = CancellationToken::new();
     let monitor_state = monitor::new_state();
     let start = Instant::now();
 
@@ -59,7 +61,11 @@ async fn main() -> anyhow::Result<()> {
         RAW_FLUSH_INTERVAL_S,
         cfg.raw_rotate_hours,
     ));
-    let snap_handle = tokio::spawn(run_snap_writer(data_dir.clone(), snap_rx_parquet));
+    let snap_handle = tokio::spawn(run_snap_writer(
+        data_dir.clone(),
+        snap_rx_parquet,
+        cancel.clone(),
+    ));
     let mon_handle = tokio::spawn(monitor::run_monitor(
         data_dir.clone(),
         monitor_state.clone(),
@@ -96,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         let mon = monitor_state.clone();
         let rtx = raw_tx.clone();
         let stx = snap_tx.clone();
+        let ct = cancel.clone();
         match conn.exchange {
             Exchange::BinanceSpot => {
                 handles.push(tokio::spawn(connection_task(
@@ -105,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
                     mon,
                     rtx,
                     stx,
+                    ct,
                 )));
             }
             Exchange::BinancePerp => {
@@ -115,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
                     mon,
                     rtx,
                     stx,
+                    ct,
                 )));
             }
             Exchange::Hyperliquid => {
@@ -125,11 +134,12 @@ async fn main() -> anyhow::Result<()> {
                     mon,
                     rtx,
                     stx,
+                    ct,
                 )));
             }
             Exchange::Dydx => {
                 handles.push(tokio::spawn(connection_task_dydx(
-                    conn, data_dir, mon, rtx, stx,
+                    conn, data_dir, mon, rtx, stx, ct,
                 )));
             }
         }
@@ -150,9 +160,12 @@ async fn main() -> anyhow::Result<()> {
 
     info!("shutting down fathom...");
 
-    // Abort connection tasks (they loop forever and have no shutdown channel).
-    for handle in &handles {
-        handle.abort();
+    // Signal all connection tasks to exit cooperatively.
+    cancel.cancel();
+
+    // Wait for connection tasks to drain and exit (with timeout).
+    for handle in handles {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
     // Dropping senders closes the broadcast channel, signaling writers to finish.

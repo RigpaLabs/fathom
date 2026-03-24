@@ -19,7 +19,6 @@ pub struct WindowAccumulator {
     mid_sum: f64,
     /// Running sum of mid² (for population variance via E[x²] - E[x]²)
     mid_sq_sum: f64,
-    window_start_us: i64,
     // ── Trade accumulators ───────────────────────────────────────────────
     volume_delta: f64,
     buy_vol: f64,
@@ -28,7 +27,7 @@ pub struct WindowAccumulator {
 }
 
 impl WindowAccumulator {
-    pub fn new(exchange: &str, symbol: &str, now_us: i64) -> Self {
+    pub fn new(exchange: &str, symbol: &str, _now_us: i64) -> Self {
         Self {
             exchange: exchange.to_string(),
             symbol: symbol.to_string(),
@@ -39,7 +38,6 @@ impl WindowAccumulator {
             open_px: None,
             mid_sum: 0.0,
             mid_sq_sum: 0.0,
-            window_start_us: now_us,
             volume_delta: 0.0,
             buy_vol: 0.0,
             sell_vol: 0.0,
@@ -244,7 +242,7 @@ impl WindowAccumulator {
         self.open_px = None;
         self.mid_sum = 0.0;
         self.mid_sq_sum = 0.0;
-        self.window_start_us = now_us;
+
         self.volume_delta = 0.0;
         self.buy_vol = 0.0;
         self.sell_vol = 0.0;
@@ -312,7 +310,7 @@ impl WindowAccumulator {
         self.open_px = None;
         self.mid_sum = 0.0;
         self.mid_sq_sum = 0.0;
-        self.window_start_us = now_us;
+
         self.volume_delta = 0.0;
         self.buy_vol = 0.0;
         self.sell_vol = 0.0;

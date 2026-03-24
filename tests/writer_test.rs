@@ -16,6 +16,7 @@ use fathom::{
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 // ── Raw writer ────────────────────────────────────────────────────────────────
 
@@ -129,7 +130,11 @@ async fn test_raw_writer_empty_channel() {
 async fn test_snap_writer_creates_file() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
-    let writer = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), rx));
+    let writer = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        rx,
+        CancellationToken::new(),
+    ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
     for i in 0..3u64 {
@@ -171,7 +176,11 @@ async fn test_snap_writer_creates_file() {
 async fn test_snap_writer_verifies_data_values() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
-    let writer = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), rx));
+    let writer = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        rx,
+        CancellationToken::new(),
+    ));
 
     let ts = 1_700_000_000_000_000_i64;
     tx.send(Snapshot1s {
@@ -238,7 +247,11 @@ async fn test_snap_writer_verifies_data_values() {
 async fn test_snap_writer_multiple_symbols() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
-    let writer = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), rx));
+    let writer = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        rx,
+        CancellationToken::new(),
+    ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
     for sym in &["ETHUSDT", "BTCUSDT", "BNBUSDT"] {
@@ -273,6 +286,7 @@ async fn test_snap_writer_periodic_disk_flush() {
         dir.path().to_path_buf(),
         rx,
         flush_interval,
+        CancellationToken::new(),
     ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -507,6 +521,102 @@ async fn test_two_writers_different_data_dirs_no_interference() {
     let rows_new = count_parquet_rows(&files_new[0]);
     assert_eq!(rows_old, 3, "old writer: 3 rows");
     assert_eq!(rows_new, 5, "new writer: 5 rows");
+}
+
+// ── Event-time rollover tests ─────────────────────────────────────────────────
+
+/// Verify snap_writer partitions by event timestamp (ts_us), not wall clock.
+/// Sends snapshots with timestamps from two different UTC days and asserts
+/// they land in separate daily files.
+#[tokio::test]
+async fn test_snap_writer_event_time_rollover() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
+    let writer = tokio::spawn(run_snap_writer_with_flush_interval(
+        dir.path().to_path_buf(),
+        rx,
+        1, // flush every row
+        CancellationToken::new(),
+    ));
+
+    // Day 1: 2025-01-15 12:00:00 UTC
+    let day1_ts = 1736942400_000_000_i64; // 2025-01-15T12:00:00Z in µs
+    tx.send(make_snap("binance_spot", "ETHUSDT", day1_ts))
+        .unwrap();
+    tx.send(make_snap("binance_spot", "ETHUSDT", day1_ts + 1_000_000))
+        .unwrap();
+
+    // Day 2: 2025-01-16 00:00:01 UTC (next day)
+    let day2_ts = day1_ts + 12 * 3600 * 1_000_000 + 1_000_000; // +12h1s → crosses midnight
+    tx.send(make_snap("binance_spot", "ETHUSDT", day2_ts))
+        .unwrap();
+
+    drop(tx);
+    writer.await.unwrap();
+
+    // Should have exactly 2 parquet files: one for 2025-01-15, one for 2025-01-16
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(
+        files.len(),
+        2,
+        "event-time rollover should create 2 daily files, got {}: {:?}",
+        files.len(),
+        files
+    );
+
+    // Verify file paths contain correct dates
+    let file_names: Vec<String> = files
+        .iter()
+        .map(|f| f.to_string_lossy().to_string())
+        .collect();
+    assert!(
+        file_names.iter().any(|f| f.contains("2025-01-15")),
+        "expected a file for 2025-01-15"
+    );
+    assert!(
+        file_names.iter().any(|f| f.contains("2025-01-16")),
+        "expected a file for 2025-01-16"
+    );
+
+    // Verify row counts: 2 rows in day1, 1 row in day2
+    let total_rows: usize = files.iter().map(|f| count_parquet_rows(f)).sum();
+    assert_eq!(total_rows, 3, "all 3 rows should be present");
+}
+
+/// Verify that CancellationToken triggers graceful shutdown of snap writer,
+/// flushing buffered data before exit.
+#[tokio::test]
+async fn test_snap_writer_cancellation_shutdown() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
+    let cancel = CancellationToken::new();
+    let writer = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        rx,
+        cancel.clone(),
+    ));
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    for i in 0..3u64 {
+        tx.send(make_snap(
+            "binance_spot",
+            "ETHUSDT",
+            now_us + i as i64 * 1_000_000,
+        ))
+        .unwrap();
+    }
+
+    // Small delay so writer processes the messages
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cancel instead of dropping the sender
+    cancel.cancel();
+    writer.await.unwrap();
+
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert!(!files.is_empty(), "cancellation should flush data to disk");
+    let total: usize = files.iter().map(|f| count_parquet_rows(f)).sum();
+    assert_eq!(total, 3, "all 3 rows should survive cancellation");
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
