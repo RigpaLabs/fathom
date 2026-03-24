@@ -12,6 +12,7 @@ pub mod connection_dydx;
 pub mod connection_hl;
 pub mod error;
 pub mod exchange;
+pub mod metrics;
 pub mod monitor;
 pub mod nats_sink;
 pub mod orderbook;
