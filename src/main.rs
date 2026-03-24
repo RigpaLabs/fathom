@@ -11,7 +11,7 @@ use fathom::{
     connection_dydx::connection_task_dydx,
     connection_hl::connection_task_hl,
     exchange::{BinancePerp, BinanceSpot, Hyperliquid},
-    monitor, nats_sink,
+    metrics, monitor, nats_sink,
     writer::{raw::RawDiff, snap_1s::run_snap_writer},
 };
 use tokio::sync::broadcast;
@@ -63,6 +63,17 @@ async fn main() -> anyhow::Result<()> {
     let mon_handle = tokio::spawn(monitor::run_monitor(
         data_dir.clone(),
         monitor_state.clone(),
+        start,
+    ));
+
+    // Metrics: Prometheus /metrics + /health HTTP server
+    let metrics_handle_data = metrics::new_metrics();
+    let metrics_server_handle = tokio::spawn(metrics::run_metrics_server(
+        metrics_handle_data.registry.clone(),
+    ));
+    let metrics_sync_handle = tokio::spawn(metrics::sync_monitor_to_metrics(
+        monitor_state.clone(),
+        metrics_handle_data.metrics.clone(),
         start,
     ));
 
@@ -156,6 +167,8 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.await;
     }
     mon_handle.abort();
+    metrics_server_handle.abort();
+    metrics_sync_handle.abort();
 
     info!("shutdown complete");
 

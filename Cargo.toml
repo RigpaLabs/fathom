@@ -23,6 +23,8 @@ reqwest            = { version = "0.12", features = ["json", "rustls-tls"], defa
 chrono             = { version = "0.4", features = ["serde"] }
 rand               = "0.8"
 async-nats         = "0.38"
+axum               = "0.8"
+prometheus-client  = "0.23"
 
 [lints.rust]
 unsafe_code = "forbid"
