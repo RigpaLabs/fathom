@@ -11,10 +11,10 @@ use fathom::{
     connection_dydx::connection_task_dydx,
     connection_hl::connection_task_hl,
     exchange::{BinancePerp, BinanceSpot, Hyperliquid},
-    monitor,
+    monitor, nats_sink,
     writer::{raw::RawDiff, snap_1s::run_snap_writer},
 };
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tracing::info;
 
 use fathom::accumulator::Snapshot1s;
@@ -47,21 +47,37 @@ async fn main() -> anyhow::Result<()> {
     let monitor_state = monitor::new_state();
     let start = Instant::now();
 
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(CHANNEL_BUFFER);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(CHANNEL_BUFFER);
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(CHANNEL_BUFFER);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(CHANNEL_BUFFER);
+
+    let raw_rx_parquet = raw_tx.subscribe();
+    let snap_rx_parquet = snap_tx.subscribe();
 
     let raw_handle = tokio::spawn(fathom::writer::raw::run_raw_writer(
         data_dir.clone(),
-        raw_rx,
+        raw_rx_parquet,
         RAW_FLUSH_INTERVAL_S,
         cfg.raw_rotate_hours,
     ));
-    let snap_handle = tokio::spawn(run_snap_writer(data_dir.clone(), snap_rx));
+    let snap_handle = tokio::spawn(run_snap_writer(data_dir.clone(), snap_rx_parquet));
     let mon_handle = tokio::spawn(monitor::run_monitor(
         data_dir.clone(),
         monitor_state.clone(),
         start,
     ));
+
+    // Optionally start the NATS sink
+    let nats_handle = if let Some(nats_cfg) = cfg.nats.as_ref().filter(|c| c.enabled) {
+        let raw_rx_nats = raw_tx.subscribe();
+        let snap_rx_nats = snap_tx.subscribe();
+        Some(tokio::spawn(nats_sink::run(
+            nats_cfg.clone(),
+            snap_rx_nats,
+            raw_rx_nats,
+        )))
+    } else {
+        None
+    };
 
     let mut handles = Vec::new();
     for conn in cfg.connections {
@@ -128,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
         handle.abort();
     }
 
-    // Closing senders signals writers to drain their channels and finalize files.
+    // Dropping senders closes the broadcast channel, signaling writers to finish.
     drop(raw_tx);
     drop(snap_tx);
 
@@ -136,6 +152,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = raw_handle.await;
     let _ = snap_handle.await;
     mon_handle.abort();
+
+    if let Some(h) = nats_handle {
+        h.abort();
+    }
 
     info!("shutdown complete");
 

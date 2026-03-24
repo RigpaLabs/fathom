@@ -15,7 +15,7 @@ use fathom::{
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 // ── Raw writer ────────────────────────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ async fn test_raw_writer_creates_file() {
     let dir = TempDir::new().unwrap();
     let data_dir = dir.path().to_path_buf();
 
-    let (tx, rx) = mpsc::channel::<RawDiff>(64);
+    let (tx, rx) = broadcast::channel::<RawDiff>(64);
 
     // Spawn writer with very short flush interval (1s for test)
     let writer = tokio::spawn(run_raw_writer(data_dir.clone(), rx, 1, 1));
@@ -41,7 +41,6 @@ async fn test_raw_writer_creates_file() {
             bids: vec![(3000.0, 5.0), (2999.0, 3.0)],
             asks: vec![(3001.0, 4.0)],
         })
-        .await
         .unwrap();
     }
 
@@ -80,7 +79,7 @@ async fn test_raw_writer_creates_file() {
 #[tokio::test]
 async fn test_raw_writer_multiple_symbols() {
     let dir = TempDir::new().unwrap();
-    let (tx, rx) = mpsc::channel::<RawDiff>(64);
+    let (tx, rx) = broadcast::channel::<RawDiff>(64);
     let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
 
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -95,7 +94,6 @@ async fn test_raw_writer_multiple_symbols() {
                 bids: vec![(3000.0, 1.0)],
                 asks: vec![(3001.0, 1.0)],
             })
-            .await
             .unwrap();
         }
     }
@@ -113,7 +111,7 @@ async fn test_raw_writer_multiple_symbols() {
 #[tokio::test]
 async fn test_raw_writer_empty_channel() {
     let dir = TempDir::new().unwrap();
-    let (tx, rx) = mpsc::channel::<RawDiff>(64);
+    let (tx, rx) = broadcast::channel::<RawDiff>(64);
     let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
 
     // Close immediately without sending anything
@@ -130,7 +128,7 @@ async fn test_raw_writer_empty_channel() {
 #[tokio::test]
 async fn test_snap_writer_creates_file() {
     let dir = TempDir::new().unwrap();
-    let (tx, rx) = mpsc::channel::<Snapshot1s>(64);
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
     let writer = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), rx));
 
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -140,7 +138,6 @@ async fn test_snap_writer_creates_file() {
             "ETHUSDT",
             now_us + i as i64 * 1_000_000,
         ))
-        .await
         .unwrap();
     }
 
@@ -173,7 +170,7 @@ async fn test_snap_writer_creates_file() {
 #[tokio::test]
 async fn test_snap_writer_verifies_data_values() {
     let dir = TempDir::new().unwrap();
-    let (tx, rx) = mpsc::channel::<Snapshot1s>(64);
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
     let writer = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), rx));
 
     let ts = 1_700_000_000_000_000_i64;
@@ -205,7 +202,6 @@ async fn test_snap_writer_verifies_data_values() {
         sell_vol: 0.0,
         trade_count: 0,
     })
-    .await
     .unwrap();
 
     drop(tx);
@@ -241,14 +237,12 @@ async fn test_snap_writer_verifies_data_values() {
 #[tokio::test]
 async fn test_snap_writer_multiple_symbols() {
     let dir = TempDir::new().unwrap();
-    let (tx, rx) = mpsc::channel::<Snapshot1s>(64);
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
     let writer = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), rx));
 
     let now_us = chrono::Utc::now().timestamp_micros();
     for sym in &["ETHUSDT", "BTCUSDT", "BNBUSDT"] {
-        tx.send(make_snap("binance_spot", sym, now_us))
-            .await
-            .unwrap();
+        tx.send(make_snap("binance_spot", sym, now_us)).unwrap();
     }
 
     drop(tx);
@@ -272,7 +266,7 @@ async fn test_snap_writer_periodic_disk_flush() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     let dir = TempDir::new().unwrap();
-    let (tx, rx) = mpsc::channel::<Snapshot1s>(64);
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
     let flush_interval = 10;
     let total_rows = 25;
     let writer = tokio::spawn(run_snap_writer_with_flush_interval(
@@ -288,7 +282,6 @@ async fn test_snap_writer_periodic_disk_flush() {
             "ETHUSDT",
             now_us + i as i64 * 1_000_000,
         ))
-        .await
         .unwrap();
     }
 
@@ -386,7 +379,7 @@ fn test_bucket_open_rotation_triggers_at_boundary() {
 #[tokio::test]
 async fn test_raw_writer_rotate_hours_1_creates_correct_bucket_file() {
     let dir = TempDir::new().unwrap();
-    let (tx, rx) = mpsc::channel::<RawDiff>(64);
+    let (tx, rx) = broadcast::channel::<RawDiff>(64);
     let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
 
     let now = chrono::Utc::now();
@@ -400,7 +393,6 @@ async fn test_raw_writer_rotate_hours_1_creates_correct_bucket_file() {
         bids: vec![(3000.0, 1.0)],
         asks: vec![(3001.0, 1.0)],
     })
-    .await
     .unwrap();
 
     drop(tx);
@@ -420,7 +412,7 @@ async fn test_raw_writer_rotate_hours_1_creates_correct_bucket_file() {
 #[tokio::test]
 async fn test_raw_writer_rotate_hours_6_creates_correct_bucket_file() {
     let dir = TempDir::new().unwrap();
-    let (tx, rx) = mpsc::channel::<RawDiff>(64);
+    let (tx, rx) = broadcast::channel::<RawDiff>(64);
     let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 6));
 
     let now = chrono::Utc::now();
@@ -434,7 +426,6 @@ async fn test_raw_writer_rotate_hours_6_creates_correct_bucket_file() {
         bids: vec![(3000.0, 1.0)],
         asks: vec![(3001.0, 1.0)],
     })
-    .await
     .unwrap();
 
     drop(tx);
@@ -462,8 +453,8 @@ async fn test_two_writers_different_data_dirs_no_interference() {
     let dir_old = dir.path().join("v1");
     let dir_new = dir.path().join("v2");
 
-    let (tx_old, rx_old) = mpsc::channel::<RawDiff>(64);
-    let (tx_new, rx_new) = mpsc::channel::<RawDiff>(64);
+    let (tx_old, rx_old) = broadcast::channel::<RawDiff>(64);
+    let (tx_new, rx_new) = broadcast::channel::<RawDiff>(64);
 
     let w_old = tokio::spawn(run_raw_writer(dir_old.clone(), rx_old, 1, 1));
     let w_new = tokio::spawn(run_raw_writer(dir_new.clone(), rx_new, 1, 1));
@@ -482,7 +473,6 @@ async fn test_two_writers_different_data_dirs_no_interference() {
                 bids: vec![(3000.0, 1.0)],
                 asks: vec![(3001.0, 1.0)],
             })
-            .await
             .unwrap();
     }
 
@@ -498,7 +488,6 @@ async fn test_two_writers_different_data_dirs_no_interference() {
                 bids: vec![(3000.0, 2.0)],
                 asks: vec![(3001.0, 2.0)],
             })
-            .await
             .unwrap();
     }
 

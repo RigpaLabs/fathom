@@ -1,41 +1,7 @@
 use crate::orderbook::{DiffApplied, OrderBook};
 
-/// Bid/ask level data: Vec of (price, size) pairs.
-pub type Levels = Vec<(f64, f64)>;
-
-/// One-second snapshot row emitted by WindowAccumulator::flush()
-#[derive(Debug, Clone)]
-pub struct Snapshot1s {
-    pub ts_us: i64,
-    pub exchange: String,
-    pub symbol: String,
-    /// Top 10 bid levels: (price, size) descending
-    pub bids: Vec<(f64, f64)>,
-    /// Top 10 ask levels: (price, size) ascending
-    pub asks: Vec<(f64, f64)>,
-    pub mid_px: Option<f64>,
-    pub microprice: Option<f64>,
-    pub spread_bps: Option<f32>,
-    pub imbalance_l1: Option<f32>,
-    pub imbalance_l5: Option<f32>,
-    pub imbalance_l10: Option<f32>,
-    pub bid_depth_l5: f64,
-    pub bid_depth_l10: f64,
-    pub ask_depth_l5: f64,
-    pub ask_depth_l10: f64,
-    pub ofi_l1: f64,
-    pub churn_bid: f64,
-    pub churn_ask: f64,
-    pub intra_sigma: f32,
-    pub open_px: Option<f64>,
-    pub close_px: Option<f64>,
-    pub n_events: u32,
-    // ── Trade fields (populated by HL/dYdX trade streams; zero for Binance) ──
-    pub volume_delta: f64,
-    pub buy_vol: f64,
-    pub sell_vol: f64,
-    pub trade_count: u32,
-}
+// Re-export shared types from fathom-types crate.
+pub use fathom_types::{Levels, Snapshot1s};
 
 /// Accumulates per-second stats for one symbol.
 pub struct WindowAccumulator {

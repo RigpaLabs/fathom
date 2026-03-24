@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 mod helpers;
 use helpers::parquet::{collect_parquets, count_rows, read_f32_col, read_f64_col, read_u32_col};
@@ -54,8 +54,8 @@ fn hl_conn(name: &str, symbols: Vec<&str>) -> ConnectionConfig {
 #[ignore = "live Hyperliquid — run: cargo test --test smoke_hl_test -- --include-ignored"]
 async fn live_hl_eth_pipeline() {
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(1_024);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(1_024);
+    let (raw_tx, raw_rx) = broadcast::channel::<RawDiff>(1_024);
+    let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
@@ -157,8 +157,8 @@ async fn live_hl_eth_pipeline() {
 #[ignore = "live Hyperliquid — run: cargo test --test smoke_hl_test -- --include-ignored"]
 async fn live_hl_multi_symbol() {
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(1_024);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(1_024);
+    let (raw_tx, raw_rx) = broadcast::channel::<RawDiff>(1_024);
+    let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
     let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));

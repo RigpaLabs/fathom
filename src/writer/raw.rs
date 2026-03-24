@@ -11,22 +11,13 @@ use arrow_array::{
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::{error::Result, schema::raw_schema};
 
-/// A raw diff event ready to be written to Parquet.
-#[derive(Debug, Clone)]
-pub struct RawDiff {
-    pub timestamp_us: i64,
-    pub exchange: String,
-    pub symbol: String,
-    pub seq_id: i64,
-    pub prev_seq_id: i64,
-    pub bids: Vec<(f64, f64)>,
-    pub asks: Vec<(f64, f64)>,
-}
+// Re-export from fathom-types crate.
+pub use fathom_types::RawDiff;
 
 /// Which hourly bucket does a UTC hour belong to?
 /// `interval` must divide 24 evenly (1, 2, 3, 4, 6, 8, 12, 24).
@@ -162,10 +153,10 @@ where
     builder.finish()
 }
 
-/// Raw Parquet writer — receives RawDiff via channel, buffers, flushes periodically, rotates on hour boundary.
+/// Raw Parquet writer — receives RawDiff via broadcast channel, buffers, flushes periodically, rotates on hour boundary.
 pub async fn run_raw_writer(
     data_dir: PathBuf,
-    mut rx: mpsc::Receiver<RawDiff>,
+    mut rx: broadcast::Receiver<RawDiff>,
     flush_interval_s: u64,
     rotate_hours: u32,
 ) {
@@ -176,11 +167,15 @@ pub async fn run_raw_writer(
     loop {
         // Try to receive with timeout so we can flush periodically
         match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
-            Ok(None) => {
-                // Channel closed → graceful shutdown
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                // All senders dropped → graceful shutdown
                 break;
             }
-            Ok(Some(event)) => {
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                warn!("raw_writer lagged by {n} messages");
+                continue;
+            }
+            Ok(Ok(event)) => {
                 let key = format!("{}:{}", event.exchange, event.symbol);
                 let now_utc = Utc::now();
                 let exchange = event.exchange.clone();

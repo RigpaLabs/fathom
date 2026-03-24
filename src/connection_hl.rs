@@ -7,7 +7,7 @@ use std::{
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
@@ -79,8 +79,8 @@ pub async fn connection_task_hl(
     adapter: Box<dyn ExchangeAdapter>,
     _data_dir: PathBuf,
     monitor: MonitorState,
-    raw_tx: mpsc::Sender<RawDiff>,
-    snap_tx: mpsc::Sender<Snapshot1s>,
+    raw_tx: broadcast::Sender<RawDiff>,
+    snap_tx: broadcast::Sender<Snapshot1s>,
 ) {
     let name = conn.name.clone();
     let exchange_name = adapter.name().to_string();
@@ -269,7 +269,7 @@ pub async fn connection_task_hl(
 
                             // Write raw snapshot as diff
                             if raw_tx
-                                .try_send(RawDiff {
+                                .send(RawDiff {
                                     timestamp_us,
                                     exchange: exchange_name.clone(),
                                     symbol: symbol.clone(),
@@ -280,7 +280,7 @@ pub async fn connection_task_hl(
                                 })
                                 .is_err()
                             {
-                                warn!(conn = %name, symbol = %symbol, "raw channel full — snapshot dropped");
+                                warn!(conn = %name, symbol = %symbol, "raw: no receivers");
                             }
 
                             // OFI: compare current best bid/ask with previous snapshot
@@ -379,8 +379,8 @@ pub async fn connection_task_hl(
                         if let Some(acc) = accumulators.get_mut(sym) {
                             let levels = last_levels.get(sym).map(top10);
                             let snap = acc.flush_with_levels(levels.as_ref().map(|(b, a)| (b, a)), ts_us);
-                            if snap_tx.try_send(snap).is_err() {
-                                warn!(conn = %name, symbol = %sym, "snap channel full — 1s snap dropped");
+                            if snap_tx.send(snap).is_err() {
+                                warn!(conn = %name, symbol = %sym, "snap: no receivers");
                             }
                         }
                     }
@@ -423,8 +423,8 @@ pub async fn connection_task_hl(
                         (b10, a10)
                     });
                     let snap = acc.flush_with_levels(levels.as_ref().map(|(b, a)| (b, a)), ts_us);
-                    if snap_tx.try_send(snap).is_err() {
-                        warn!(conn = %name, symbol = %sym, "snap channel full — disconnect flush dropped");
+                    if snap_tx.send(snap).is_err() {
+                        warn!(conn = %name, symbol = %sym, "snap: no receivers (disconnect flush)");
                     }
                 }
             }

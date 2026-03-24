@@ -13,6 +13,7 @@ pub mod connection_hl;
 pub mod error;
 pub mod exchange;
 pub mod monitor;
+pub mod nats_sink;
 pub mod orderbook;
 pub mod schema;
 pub mod writer;
