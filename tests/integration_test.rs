@@ -17,7 +17,7 @@ use futures_util::SinkExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use fathom::{
     accumulator::Snapshot1s,
@@ -207,12 +207,12 @@ async fn test_integration_binance_spot_pipeline() {
     let dir = TempDir::new().unwrap();
     let data_dir = dir.path().to_path_buf();
 
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(64);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(64);
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(64);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(64);
 
     // flush_interval_s=60: writers buffer in memory, flush on channel close
-    let raw_writer = tokio::spawn(run_raw_writer(data_dir.clone(), raw_rx, 60, 1));
-    let snap_writer = tokio::spawn(run_snap_writer(data_dir.clone(), snap_rx));
+    let raw_writer = tokio::spawn(run_raw_writer(data_dir.clone(), raw_tx.subscribe(), 60, 1));
+    let snap_writer = tokio::spawn(run_snap_writer(data_dir.clone(), snap_tx.subscribe()));
 
     // ── Connection task with mock URL overrides ───────────────────────────────
     let conn = ConnectionConfig {
@@ -324,10 +324,18 @@ async fn test_integration_monitor_state_updated() {
     let ws_port = spawn_mock_ws(ws_messages).await;
 
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(64);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(64);
-    let _raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let _snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(64);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(64);
+    let _raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+    ));
+    let _snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+    ));
 
     let conn = ConnectionConfig {
         name: "btc_conn".to_string(),

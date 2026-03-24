@@ -8,7 +8,7 @@ use arrow_array::{ArrayRef, Float32Array, Float64Array, Int64Array, StringArray,
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::{accumulator::Snapshot1s, error::Result, schema::snap_1s_schema};
@@ -209,7 +209,7 @@ impl DayWriter {
 }
 
 /// 1s snapshot writer — one daily file per (exchange, symbol), flush on each row.
-pub async fn run_snap_writer(data_dir: PathBuf, rx: mpsc::Receiver<Snapshot1s>) {
+pub async fn run_snap_writer(data_dir: PathBuf, rx: broadcast::Receiver<Snapshot1s>) {
     run_snap_writer_inner(data_dir, rx, DEFAULT_DISK_FLUSH_INTERVAL).await;
 }
 
@@ -217,7 +217,7 @@ pub async fn run_snap_writer(data_dir: PathBuf, rx: mpsc::Receiver<Snapshot1s>) 
 #[doc(hidden)]
 pub async fn run_snap_writer_with_flush_interval(
     data_dir: PathBuf,
-    rx: mpsc::Receiver<Snapshot1s>,
+    rx: broadcast::Receiver<Snapshot1s>,
     disk_flush_interval: usize,
 ) {
     run_snap_writer_inner(data_dir, rx, disk_flush_interval).await;
@@ -225,15 +225,19 @@ pub async fn run_snap_writer_with_flush_interval(
 
 async fn run_snap_writer_inner(
     data_dir: PathBuf,
-    mut rx: mpsc::Receiver<Snapshot1s>,
+    mut rx: broadcast::Receiver<Snapshot1s>,
     disk_flush_interval: usize,
 ) {
     let mut writers: HashMap<String, DayWriter> = HashMap::new();
 
     loop {
         match rx.recv().await {
-            None => break,
-            Some(snap) => {
+            Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("snap_writer lagged by {n} messages");
+                continue;
+            }
+            Ok(snap) => {
                 let now_utc = Utc::now();
                 let date_str = now_utc.format("%Y-%m-%d").to_string();
                 let key = format!("{}:{}", snap.exchange, snap.symbol);

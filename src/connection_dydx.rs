@@ -7,7 +7,7 @@ use std::{
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use ordered_float::OrderedFloat;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
@@ -215,8 +215,8 @@ pub async fn connection_task_dydx(
     conn: ConnectionConfig,
     _data_dir: PathBuf,
     monitor: MonitorState,
-    raw_tx: mpsc::Sender<RawDiff>,
-    snap_tx: mpsc::Sender<Snapshot1s>,
+    raw_tx: broadcast::Sender<RawDiff>,
+    snap_tx: broadcast::Sender<Snapshot1s>,
 ) {
     let name = conn.name.clone();
     let exchange_name = EXCHANGE_NAME.to_string();
@@ -485,7 +485,7 @@ pub async fn connection_task_dydx(
                             last_msg_id.insert(symbol.clone(), msg_id);
 
                             if raw_tx
-                                .try_send(RawDiff {
+                                .send(RawDiff {
                                     timestamp_us: ts_us,
                                     exchange: exchange_name.clone(),
                                     symbol: symbol.clone(),
@@ -496,7 +496,7 @@ pub async fn connection_task_dydx(
                                 })
                                 .is_err()
                             {
-                                warn!(conn = %name, symbol = %symbol, "raw channel full — diff dropped");
+                                warn!(conn = %name, symbol = %symbol, "raw: no receivers");
                             }
 
                             let book = books.entry(symbol.clone()).or_insert_with(DydxBook::new);
@@ -568,8 +568,8 @@ pub async fn connection_task_dydx(
                         {
                             let (bids, asks) = book.top_n(10);
                             let snap = acc.flush_with_levels(Some((&bids, &asks)), ts_us);
-                            if snap_tx.try_send(snap).is_err() {
-                                warn!(conn = %name, symbol = %sym, "snap channel full — 1s snap dropped");
+                            if snap_tx.send(snap).is_err() {
+                                warn!(conn = %name, symbol = %sym, "snap: no receivers");
                             }
                         }
                     }
@@ -610,8 +610,8 @@ pub async fn connection_task_dydx(
                 {
                     let (bids, asks) = book.top_n(10);
                     let snap = acc.flush_with_levels(Some((&bids, &asks)), ts_us);
-                    if snap_tx.try_send(snap).is_err() {
-                        warn!(conn = %name, symbol = %sym, "snap channel full — disconnect flush dropped");
+                    if snap_tx.send(snap).is_err() {
+                        warn!(conn = %name, symbol = %sym, "snap: no receivers (disconnect flush)");
                     }
                 }
             }

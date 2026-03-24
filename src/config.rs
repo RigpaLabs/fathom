@@ -29,6 +29,17 @@ pub struct ConnectionConfig {
     pub snapshot_url_override: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct NatsConfig {
+    pub url: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -37,6 +48,8 @@ pub struct Config {
     #[serde(default = "default_raw_rotate_hours")]
     pub raw_rotate_hours: u32,
     pub connections: Vec<ConnectionConfig>,
+    #[serde(default)]
+    pub nats: Option<NatsConfig>,
 }
 
 fn default_raw_rotate_hours() -> u32 {

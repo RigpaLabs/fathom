@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use fathom::{
     accumulator::Snapshot1s,
@@ -188,10 +188,18 @@ async fn test_e2e_reconnect_after_ws_close() {
     server.push_ws_round(round2);
 
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+    ));
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+    ));
 
     let state = monitor::new_state();
     let conn = make_conn("reconnect_test", vec!["ETHUSDT"], &server);
@@ -284,10 +292,18 @@ async fn test_e2e_multi_symbol_single_connection() {
     server.push_ws_round(round);
 
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+    ));
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+    ));
 
     let state = monitor::new_state();
     let conn = make_conn("multi_sym", vec!["ETHUSDT", "BTCUSDT"], &server);
@@ -362,10 +378,18 @@ async fn test_e2e_snapshot_http_error_then_retry() {
     ]);
 
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+    ));
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+    ));
 
     let state = monitor::new_state();
     let conn = make_conn("retry_test", vec!["ETHUSDT"], &server);
@@ -455,10 +479,18 @@ async fn test_e2e_gap_triggers_reconnect() {
     ]);
 
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+    ));
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+    ));
 
     let state = monitor::new_state();
     let state_check = Arc::clone(&state);
@@ -576,10 +608,18 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
     ]);
 
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+    ));
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+    ));
 
     let state = monitor::new_state();
     // ETH listed first so its snapshot attempt fires first and returns 500.
@@ -666,10 +706,18 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
     ]);
 
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+    ));
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+    ));
 
     let state = monitor::new_state();
     let conn = make_conn("slow_snap_test", vec!["ETHUSDT"], &server);
@@ -759,10 +807,18 @@ async fn test_e2e_snap_parquet_created() {
     ]);
 
     let dir = TempDir::new().unwrap();
-    let (raw_tx, raw_rx) = mpsc::channel::<RawDiff>(128);
-    let (snap_tx, snap_rx) = mpsc::channel::<Snapshot1s>(128);
-    let raw_w = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_w = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+    ));
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+    ));
 
     let state = monitor::new_state();
     let conn = make_conn("snap_test", vec!["ETHUSDT"], &server);
