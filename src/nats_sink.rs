@@ -27,7 +27,11 @@ pub async fn run(
     };
 
     let js = jetstream::new(client.clone());
-    ensure_streams(&js).await;
+
+    if let Err(e) = ensure_streams(&js).await {
+        warn!("NATS stream setup failed: {e}. Running without NATS.");
+        return;
+    }
 
     info!("NATS sink connected to {}", config.url);
 
@@ -38,36 +42,32 @@ pub async fn run(
     info!("NATS sink stopped");
 }
 
-async fn ensure_streams(js: &jetstream::Context) {
+/// Ensure JetStream streams exist. Returns error if either fails — caller should
+/// abort the sink rather than publish into void.
+async fn ensure_streams(js: &jetstream::Context) -> Result<(), async_nats::Error> {
     // 1s snapshots: file storage, 24h retention, 200 MB limit
-    if let Err(e) = js
-        .get_or_create_stream(stream::Config {
-            name: "FATHOM_SNAPSHOTS".into(),
-            subjects: vec!["fathom.v1.*.*.snapshot".into()],
-            storage: stream::StorageType::File,
-            max_age: std::time::Duration::from_secs(24 * 3600),
-            max_bytes: 200 * 1024 * 1024,
-            ..Default::default()
-        })
-        .await
-    {
-        warn!("failed to ensure FATHOM_SNAPSHOTS stream: {e}");
-    }
+    js.get_or_create_stream(stream::Config {
+        name: "FATHOM_SNAPSHOTS".into(),
+        subjects: vec!["fathom.v1.*.*.snapshot".into()],
+        storage: stream::StorageType::File,
+        max_age: std::time::Duration::from_secs(24 * 3600),
+        max_bytes: 200 * 1024 * 1024,
+        ..Default::default()
+    })
+    .await?;
 
     // Raw depth diffs: memory storage, 1h retention, 500 MB limit
-    if let Err(e) = js
-        .get_or_create_stream(stream::Config {
-            name: "FATHOM_DEPTH".into(),
-            subjects: vec!["fathom.v1.*.*.depth".into()],
-            storage: stream::StorageType::Memory,
-            max_age: std::time::Duration::from_secs(3600),
-            max_bytes: 500 * 1024 * 1024,
-            ..Default::default()
-        })
-        .await
-    {
-        warn!("failed to ensure FATHOM_DEPTH stream: {e}");
-    }
+    js.get_or_create_stream(stream::Config {
+        name: "FATHOM_DEPTH".into(),
+        subjects: vec!["fathom.v1.*.*.depth".into()],
+        storage: stream::StorageType::Memory,
+        max_age: std::time::Duration::from_secs(3600),
+        max_bytes: 500 * 1024 * 1024,
+        ..Default::default()
+    })
+    .await?;
+
+    Ok(())
 }
 
 async fn publish_snapshots(js: jetstream::Context, mut rx: broadcast::Receiver<Snapshot1s>) {
@@ -77,8 +77,15 @@ async fn publish_snapshots(js: jetstream::Context, mut rx: broadcast::Receiver<S
                 let subject = snapshot_subject(&snap.exchange, &snap.symbol);
                 match wire_encode(&snap) {
                     Ok(payload) => {
-                        if let Err(e) = js.publish(subject, payload.into()).await {
-                            warn!("NATS snapshot publish error: {e}");
+                        // Double-await: first sends the publish request, second
+                        // awaits the JetStream ACK confirming durable storage.
+                        match js.publish(subject, payload.into()).await {
+                            Ok(ack_future) => {
+                                if let Err(e) = ack_future.await {
+                                    warn!("NATS snapshot ACK error: {e}");
+                                }
+                            }
+                            Err(e) => warn!("NATS snapshot publish error: {e}"),
                         }
                     }
                     Err(e) => warn!("snapshot encode error: {e}"),
@@ -111,5 +118,34 @@ async fn publish_depth(client: async_nats::Client, mut rx: broadcast::Receiver<R
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_subject_format() {
+        assert_eq!(
+            snapshot_subject("binance_perp", "ETHUSDT"),
+            "fathom.v1.binance_perp.ETHUSDT.snapshot"
+        );
+        assert_eq!(
+            snapshot_subject("hyperliquid", "ETH"),
+            "fathom.v1.hyperliquid.ETH.snapshot"
+        );
+    }
+
+    #[test]
+    fn depth_subject_format() {
+        assert_eq!(
+            depth_subject("binance_spot", "BTCUSDT"),
+            "fathom.v1.binance_spot.BTCUSDT.depth"
+        );
+        assert_eq!(
+            depth_subject("dydx", "ETH-USD"),
+            "fathom.v1.dydx.ETH-USD.depth"
+        );
     }
 }

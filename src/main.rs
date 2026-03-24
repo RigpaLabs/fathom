@@ -148,14 +148,14 @@ async fn main() -> anyhow::Result<()> {
     drop(raw_tx);
     drop(snap_tx);
 
-    // Await writers so all buffered data is flushed to disk before exit.
+    // Await writers so all buffered data is flushed before exit.
     let _ = raw_handle.await;
     let _ = snap_handle.await;
-    mon_handle.abort();
-
+    // Await NATS sink so in-flight JetStream publishes complete.
     if let Some(h) = nats_handle {
-        h.abort();
+        let _ = h.await;
     }
+    mon_handle.abort();
 
     info!("shutdown complete");
 
