@@ -10,7 +10,7 @@ use prometheus_client::encoding::text::encode;
 fn test_metrics_registry_contains_all_metrics() {
     let handle = new_metrics();
     let mut buf = String::new();
-    let registry = handle.registry.lock().unwrap();
+    let registry = handle.registry.read().unwrap();
     encode(&mut buf, &registry).unwrap();
 
     let expected = [

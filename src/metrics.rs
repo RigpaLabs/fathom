@@ -1,5 +1,6 @@
 use std::{
-    sync::{Arc, Mutex, atomic::AtomicU64},
+    collections::HashMap,
+    sync::{Arc, RwLock, atomic::AtomicU64},
     time::Instant,
 };
 
@@ -9,7 +10,7 @@ use prometheus_client::{
     metrics::{counter::Counter, family::Family, gauge::Gauge},
     registry::Registry,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::monitor::{MonitorState, lock_state};
 
@@ -31,7 +32,7 @@ pub struct ConnLabel {
 pub struct Metrics {
     pub events_total: Family<ConnLabel, Counter>,
     pub events_per_sec: Family<ConnLabel, GaugeF64>,
-    pub uptime_seconds: Family<ConnLabel, GaugeF64>,
+    pub uptime_seconds: GaugeF64,
     pub symbols_active: Family<ConnLabel, Gauge>,
     pub ws_connected: Family<ConnLabel, Gauge>,
     pub ws_reconnects_total: Family<ConnLabel, Counter>,
@@ -55,10 +56,10 @@ impl Metrics {
             events_per_sec.clone(),
         );
 
-        let uptime_seconds = Family::<ConnLabel, GaugeF64>::default();
+        let uptime_seconds = GaugeF64::default();
         registry.register(
             "fathom_uptime_seconds",
-            "Connection uptime in seconds",
+            "Process uptime in seconds",
             uptime_seconds.clone(),
         );
 
@@ -112,7 +113,7 @@ impl Metrics {
 
 /// Shared handle to the metrics registry + metrics.
 pub struct MetricsHandle {
-    pub registry: Arc<Mutex<Registry>>,
+    pub registry: Arc<RwLock<Registry>>,
     pub metrics: Arc<Metrics>,
 }
 
@@ -121,7 +122,7 @@ pub fn new_metrics() -> MetricsHandle {
     let mut registry = Registry::default();
     let metrics = Arc::new(Metrics::new(&mut registry));
     MetricsHandle {
-        registry: Arc::new(Mutex::new(registry)),
+        registry: Arc::new(RwLock::new(registry)),
         metrics,
     }
 }
@@ -131,7 +132,13 @@ pub fn new_metrics() -> MetricsHandle {
 /// Background task that periodically syncs MonitorState into Prometheus gauges.
 /// Runs every 15s so /metrics always has fresh data without coupling monitor to prometheus.
 pub async fn sync_monitor_to_metrics(monitor: MonitorState, metrics: Arc<Metrics>, start: Instant) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    const SYNC_INTERVAL_SECS: u64 = 15;
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
+
+    // Track previous reconnects_today per connection to detect midnight resets
+    let mut prev_reconnects: HashMap<String, u64> = HashMap::new();
+    // Track previous events_total counter values to compute rate
+    let mut prev_events: HashMap<String, u64> = HashMap::new();
 
     loop {
         interval.tick().await;
@@ -141,7 +148,9 @@ pub async fn sync_monitor_to_metrics(monitor: MonitorState, metrics: Arc<Metrics
             guard.clone()
         };
 
+        // Process uptime: set once outside the per-connection loop
         let uptime = start.elapsed().as_secs_f64();
+        metrics.uptime_seconds.set(uptime);
 
         for (conn_name, conn) in &conns_snap {
             let label = ConnLabel {
@@ -153,17 +162,22 @@ pub async fn sync_monitor_to_metrics(monitor: MonitorState, metrics: Arc<Metrics
                 .get_or_create(&label)
                 .set(i64::from(conn.connected));
 
-            // Reconnects: counter can only go up, so set to max of current
-            // We track reconnects_today in MonitorState as a running total already,
-            // so we use it directly. Counter::inner returns current value.
-            let current_reconnects = metrics.ws_reconnects_total.get_or_create(&label).get();
-            let diff = conn.reconnects_today.saturating_sub(current_reconnects);
-            if diff > 0 {
+            // Reconnects: detect midnight reset of reconnects_today and add
+            // fresh increments so the monotonic Prometheus counter stays correct.
+            let prev = prev_reconnects.get(conn_name).copied().unwrap_or(0);
+            let increment = if conn.reconnects_today >= prev {
+                conn.reconnects_today - prev
+            } else {
+                // Midnight reset detected — treat the new value as fresh increments
+                conn.reconnects_today
+            };
+            if increment > 0 {
                 metrics
                     .ws_reconnects_total
                     .get_or_create(&label)
-                    .inc_by(diff);
+                    .inc_by(increment);
             }
+            prev_reconnects.insert(conn_name.clone(), conn.reconnects_today);
 
             // Active symbols: count those with a recent event (< 120s)
             let now = Instant::now();
@@ -177,8 +191,16 @@ pub async fn sync_monitor_to_metrics(monitor: MonitorState, metrics: Arc<Metrics
                 .count() as i64;
             metrics.symbols_active.get_or_create(&label).set(active);
 
-            // Uptime: same for all connections (process uptime)
-            metrics.uptime_seconds.get_or_create(&label).set(uptime);
+            // Events per second: compute rate from events_total counter delta
+            let current_events = metrics.events_total.get_or_create(&label).get();
+            let prev_count = prev_events
+                .get(conn_name)
+                .copied()
+                .unwrap_or(current_events);
+            let event_diff = current_events.saturating_sub(prev_count);
+            let rate = event_diff as f64 / SYNC_INTERVAL_SECS as f64;
+            metrics.events_per_sec.get_or_create(&label).set(rate);
+            prev_events.insert(conn_name.clone(), current_events);
         }
     }
 }
@@ -187,7 +209,7 @@ pub async fn sync_monitor_to_metrics(monitor: MonitorState, metrics: Arc<Metrics
 
 #[derive(Clone)]
 struct AppState {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<RwLock<Registry>>,
 }
 
 async fn metrics_handler(
@@ -200,7 +222,7 @@ async fn metrics_handler(
     let mut buf = String::new();
     let registry = state
         .registry
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match encode(&mut buf, &registry) {
         Ok(()) => (
@@ -227,7 +249,7 @@ async fn health_handler() -> axum::Json<serde_json::Value> {
 }
 
 /// Build the axum router (public for testing).
-pub fn build_router(registry: Arc<Mutex<Registry>>) -> Router {
+pub fn build_router(registry: Arc<RwLock<Registry>>) -> Router {
     let state = AppState { registry };
     Router::new()
         .route("/metrics", get(metrics_handler))
@@ -236,7 +258,8 @@ pub fn build_router(registry: Arc<Mutex<Registry>>) -> Router {
 }
 
 /// Start the metrics HTTP server. Returns when the server shuts down.
-pub async fn run_metrics_server(registry: Arc<Mutex<Registry>>) {
+/// Panics on bind failure so Docker restarts the container.
+pub async fn run_metrics_server(registry: Arc<RwLock<Registry>>) {
     let port: u16 = std::env::var("FATHOM_METRICS_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -247,14 +270,13 @@ pub async fn run_metrics_server(registry: Arc<Mutex<Registry>>) {
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) => {
-            warn!(error = %e, port, "failed to bind metrics server");
-            return;
+            panic!("FATAL: failed to bind metrics server on port {port}: {e}");
         }
     };
 
     info!(port, "metrics server listening");
     if let Err(e) = axum::serve(listener, app).await {
-        warn!(error = %e, "metrics server error");
+        tracing::error!(error = %e, "metrics server error");
     }
 }
 
@@ -268,7 +290,7 @@ mod tests {
     fn test_new_metrics_creates_registry() {
         let handle = new_metrics();
         let mut buf = String::new();
-        let registry = handle.registry.lock().unwrap();
+        let registry = handle.registry.read().unwrap();
         encode(&mut buf, &registry).unwrap();
         // Should contain our metric names
         assert!(buf.contains("fathom_events_total"));
@@ -325,7 +347,7 @@ mod tests {
         handle.metrics.ws_connected.get_or_create(&label).set(1);
 
         let mut buf = String::new();
-        let registry = handle.registry.lock().unwrap();
+        let registry = handle.registry.read().unwrap();
         encode(&mut buf, &registry).unwrap();
 
         // Verify Prometheus text exposition format
