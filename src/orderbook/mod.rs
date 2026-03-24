@@ -119,12 +119,11 @@ impl OrderBook {
             if u <= self.last_update_id {
                 return Ok(None);
             }
-            // Perp: use pu for initial sync
+            // Perp: drop and wait for bridging event (re-snapshot doesn't help for perp)
             if let Some(pu) = diff.prev_final_update_id {
                 if pu != self.last_update_id {
-                    return Err(AppError::SnapshotRequired(diff.symbol.clone()));
+                    return Ok(None);
                 }
-                // pu == last_update_id: valid sync
             } else {
                 // Spot: U <= lastUpdateId+1 <= u
                 if big_u > self.last_update_id + 1 {
