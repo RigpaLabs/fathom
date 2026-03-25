@@ -1,4 +1,4 @@
-name: Deploy
+name: Build & Push
 
 on:
   workflow_dispatch:
@@ -7,12 +7,19 @@ on:
         description: "Version tag (leave blank for auto: vYYYYMMDD-sha)"
         required: false
         default: ""
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
 
 env:
   REGISTRY: ghcr.io
 
 concurrency:
-  group: deploy
+  group: build
   cancel-in-progress: false
 
 jobs:
@@ -61,79 +68,3 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  deploy:
-    name: Deploy to VPS
-    needs: build
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set env
-        run: |
-          echo "IMAGE_TAG=${{ needs.build.outputs.version }}" >> "$GITHUB_ENV"
-          echo "GITHUB_REPO=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-
-      - name: Setup SSH
-        run: |
-          install -m 600 -D /dev/null ~/.ssh/id_rsa
-          echo "${{ secrets.VULTR_TOKYO_SSH_KEY }}" > ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.VULTR_TOKYO_HOST }} >> ~/.ssh/known_hosts
-
-      - name: Deploy (blue-green)
-        run: |
-          ssh ${{ secrets.VULTR_TOKYO_USER }}@${{ secrets.VULTR_TOKYO_HOST }} "
-            set -e
-            cd ${{ secrets.DEPLOY_DIR }}
-
-            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-            # Pull new image while old container is still running
-            docker pull ghcr.io/${GITHUB_REPO}:${IMAGE_TAG}
-
-            # Start new container alongside old one (versioned data dir = no file conflicts)
-            docker rm -f fathom-new 2>/dev/null || true
-            docker run -d \
-              --name fathom-new \
-              --restart unless-stopped \
-              --stop-timeout 30 \
-              -e RUST_LOG=fathom=info \
-              -e DATA_DIR=/app/data/${IMAGE_TAG} \
-              -v fathom-data:/app/data \
-              -v ${{ secrets.DEPLOY_DIR }}/config.toml:/app/config.toml:ro \
-              --memory 384m \
-              --log-driver json-file \
-              --log-opt max-size=50m \
-              --log-opt max-file=5 \
-              ghcr.io/${GITHUB_REPO}:${IMAGE_TAG}
-
-            # Wait for new container to write status.json (monitor writes every 30s)
-            echo 'Waiting for new container to become healthy...'
-            HEALTHY=false
-            for i in \$(seq 1 8); do
-              sleep 15
-              if docker exec fathom-new find /app/data/${IMAGE_TAG}/metadata/status.json -mmin -3 2>/dev/null | grep -q .; then
-                HEALTHY=true
-                echo \"  -> healthy after \$((i * 15))s\"
-                break
-              fi
-              echo \"  -> waiting... (\$((i * 15))s elapsed)\"
-            done
-
-            if [ \"\$HEALTHY\" = false ]; then
-              echo 'ERROR: new container not healthy after 120s — rolling back'
-              docker logs fathom-new --tail 30 2>&1 || true
-              docker stop fathom-new && docker rm fathom-new
-              exit 1
-            fi
-
-            # New container is healthy — stop old one gracefully (30s for writers to flush)
-            docker stop -t 30 fathom 2>/dev/null && docker rm fathom 2>/dev/null || true
-
-            # Promote new container to canonical name
-            docker rename fathom-new fathom
-
-            echo 'Deploy OK: ${IMAGE_TAG}'
-            docker ps --filter name=fathom --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
-          "
