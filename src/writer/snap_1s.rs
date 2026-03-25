@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::{accumulator::Snapshot1s, error::Result, schema::snap_1s_schema};
+use crate::{accumulator::Snapshot1s, error::Result, metrics::Metrics, schema::snap_1s_schema};
 
 /// Derive UTC date string from event timestamp in microseconds.
 fn date_from_ts_us(ts_us: i64) -> String {
@@ -222,8 +222,9 @@ pub async fn run_snap_writer(
     data_dir: PathBuf,
     rx: broadcast::Receiver<Snapshot1s>,
     cancel: CancellationToken,
+    metrics: std::sync::Arc<Metrics>,
 ) {
-    run_snap_writer_inner(data_dir, rx, DEFAULT_DISK_FLUSH_INTERVAL, cancel).await;
+    run_snap_writer_inner(data_dir, rx, DEFAULT_DISK_FLUSH_INTERVAL, cancel, metrics).await;
 }
 
 /// Testable entry point with configurable disk flush interval.
@@ -233,8 +234,9 @@ pub async fn run_snap_writer_with_flush_interval(
     rx: broadcast::Receiver<Snapshot1s>,
     disk_flush_interval: usize,
     cancel: CancellationToken,
+    metrics: std::sync::Arc<Metrics>,
 ) {
-    run_snap_writer_inner(data_dir, rx, disk_flush_interval, cancel).await;
+    run_snap_writer_inner(data_dir, rx, disk_flush_interval, cancel, metrics).await;
 }
 
 async fn run_snap_writer_inner(
@@ -242,6 +244,7 @@ async fn run_snap_writer_inner(
     mut rx: broadcast::Receiver<Snapshot1s>,
     disk_flush_interval: usize,
     cancel: CancellationToken,
+    metrics: std::sync::Arc<Metrics>,
 ) {
     let mut writers: HashMap<String, DayWriter> = HashMap::new();
 
@@ -300,8 +303,14 @@ async fn run_snap_writer_inner(
                 if let Some(dw) = writers.get_mut(&key) {
                     dw.buffer.push(snap);
                     // Flush immediately — 1 row/sec per symbol, no buffering needed
-                    if let Err(e) = dw.flush() {
-                        warn!(error = %e, "snap flush error");
+                    match dw.flush() {
+                        Ok(()) => {
+                            metrics.parquet_writes_total.inc();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "snap flush error");
+                            metrics.parquet_write_errors_total.inc();
+                        }
                     }
                 }
             }
@@ -335,16 +344,28 @@ async fn run_snap_writer_inner(
 
         if let Some(dw) = writers.get_mut(&key) {
             dw.buffer.push(snap);
-            if let Err(e) = dw.flush() {
-                warn!(error = %e, "drain: snap flush error");
+            match dw.flush() {
+                Ok(()) => {
+                    metrics.parquet_writes_total.inc();
+                }
+                Err(e) => {
+                    warn!(error = %e, "drain: snap flush error");
+                    metrics.parquet_write_errors_total.inc();
+                }
             }
         }
     }
 
     // Graceful shutdown — close all writers (writes Parquet footers)
     for (_, dw) in writers {
-        if let Err(e) = dw.close() {
-            warn!(error = %e, "shutdown: failed to close snap writer");
+        match dw.close() {
+            Ok(()) => {
+                metrics.parquet_writes_total.inc();
+            }
+            Err(e) => {
+                warn!(error = %e, "shutdown: failed to close snap writer");
+                metrics.parquet_write_errors_total.inc();
+            }
         }
     }
     info!("snap_writer shutdown complete");

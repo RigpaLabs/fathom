@@ -97,7 +97,7 @@ When deployed with `DATA_DIR` env override, files are written under `{data_dir}/
 | `connections[].name` | string | required | Logical name for the connection group |
 | `connections[].exchange` | string | required | `binance_spot`, `binance_perp`, `hyperliquid`, or `dydx` |
 | `connections[].symbols` | string[] | required | Trading pairs (format varies by exchange, e.g. `ETHUSDT` / `ETH` / `ETH-USD`) |
-| `connections[].depth_ms` | integer | required | WebSocket update speed in ms (Binance: `100`/`1000`, HL: `500`, dYdX: `250`) |
+| `connections[].depth_ms` | integer | required | WebSocket update speed in ms (Binance: `100`/`1000`, HL: `500`). Not used for `dydx` — the dYdX WebSocket uses a fixed update interval controlled by the exchange. |
 
 ### Environment variables
 

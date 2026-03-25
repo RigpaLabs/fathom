@@ -18,6 +18,7 @@ use crate::{
     config::ConnectionConfig,
     connection::sleep_backoff,
     exchange::dydx::{EXCHANGE_NAME, WS_URL},
+    metrics::{ConnLabel, Metrics},
     monitor::{MonitorState, lock_state},
     orderbook::DiffApplied,
     writer::raw::RawDiff,
@@ -220,6 +221,7 @@ pub async fn connection_task_dydx(
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
     cancel: CancellationToken,
+    metrics: std::sync::Arc<Metrics>,
 ) {
     let name = conn.name.clone();
     let exchange_name = EXCHANGE_NAME.to_string();
@@ -534,6 +536,10 @@ pub async fn connection_task_dydx(
                             let ask_px = if best_ask.0 == f64::INFINITY { None } else { Some(best_ask.0) };
                             acc.on_diff_from_levels(bid_px, ask_px, &applied);
                             event_count += 1;
+                            metrics
+                                .events_total
+                                .get_or_create(&ConnLabel { conn: name.clone() })
+                                .inc();
                         }
 
                         ("channel_batch_data", "v4_trades") => {

@@ -28,7 +28,13 @@ async fn test_raw_writer_creates_file() {
     let (tx, rx) = broadcast::channel::<RawDiff>(64);
 
     // Spawn writer with very short flush interval (1s for test)
-    let writer = tokio::spawn(run_raw_writer(data_dir.clone(), rx, 1, 1));
+    let writer = tokio::spawn(run_raw_writer(
+        data_dir.clone(),
+        rx,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
 
     // Send 5 events
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -81,7 +87,13 @@ async fn test_raw_writer_creates_file() {
 async fn test_raw_writer_multiple_symbols() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = broadcast::channel::<RawDiff>(64);
-    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
+    let writer = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
     for sym in &["ETHUSDT", "BTCUSDT"] {
@@ -113,7 +125,13 @@ async fn test_raw_writer_multiple_symbols() {
 async fn test_raw_writer_empty_channel() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = broadcast::channel::<RawDiff>(64);
-    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
+    let writer = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
 
     // Close immediately without sending anything
     drop(tx);
@@ -134,6 +152,7 @@ async fn test_snap_writer_creates_file() {
         dir.path().to_path_buf(),
         rx,
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -180,6 +199,7 @@ async fn test_snap_writer_verifies_data_values() {
         dir.path().to_path_buf(),
         rx,
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     let ts = 1_700_000_000_000_000_i64;
@@ -251,6 +271,7 @@ async fn test_snap_writer_multiple_symbols() {
         dir.path().to_path_buf(),
         rx,
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -287,6 +308,7 @@ async fn test_snap_writer_periodic_disk_flush() {
         rx,
         flush_interval,
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -394,7 +416,13 @@ fn test_bucket_open_rotation_triggers_at_boundary() {
 async fn test_raw_writer_rotate_hours_1_creates_correct_bucket_file() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = broadcast::channel::<RawDiff>(64);
-    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 1));
+    let writer = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
 
     let now = chrono::Utc::now();
     let now_us = now.timestamp_micros();
@@ -427,7 +455,13 @@ async fn test_raw_writer_rotate_hours_1_creates_correct_bucket_file() {
 async fn test_raw_writer_rotate_hours_6_creates_correct_bucket_file() {
     let dir = TempDir::new().unwrap();
     let (tx, rx) = broadcast::channel::<RawDiff>(64);
-    let writer = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), rx, 1, 6));
+    let writer = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        6,
+        fathom::metrics::new_metrics().metrics,
+    ));
 
     let now = chrono::Utc::now();
     let now_us = now.timestamp_micros();
@@ -470,8 +504,20 @@ async fn test_two_writers_different_data_dirs_no_interference() {
     let (tx_old, rx_old) = broadcast::channel::<RawDiff>(64);
     let (tx_new, rx_new) = broadcast::channel::<RawDiff>(64);
 
-    let w_old = tokio::spawn(run_raw_writer(dir_old.clone(), rx_old, 1, 1));
-    let w_new = tokio::spawn(run_raw_writer(dir_new.clone(), rx_new, 1, 1));
+    let w_old = tokio::spawn(run_raw_writer(
+        dir_old.clone(),
+        rx_old,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+    let w_new = tokio::spawn(run_raw_writer(
+        dir_new.clone(),
+        rx_new,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
 
@@ -537,6 +583,7 @@ async fn test_snap_writer_event_time_rollover() {
         rx,
         1, // flush every row
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     // Day 1: 2025-01-15 12:00:00 UTC
@@ -594,6 +641,7 @@ async fn test_snap_writer_cancellation_shutdown() {
         dir.path().to_path_buf(),
         rx,
         cancel.clone(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     let now_us = chrono::Utc::now().timestamp_micros();
