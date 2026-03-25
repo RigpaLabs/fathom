@@ -19,6 +19,8 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
+use tokio_util::sync::CancellationToken;
+
 use fathom::{
     accumulator::Snapshot1s,
     config::{ConnectionConfig, Exchange},
@@ -212,7 +214,11 @@ async fn test_integration_binance_spot_pipeline() {
 
     // flush_interval_s=60: writers buffer in memory, flush on channel close
     let raw_writer = tokio::spawn(run_raw_writer(data_dir.clone(), raw_tx.subscribe(), 60, 1));
-    let snap_writer = tokio::spawn(run_snap_writer(data_dir.clone(), snap_tx.subscribe()));
+    let snap_writer = tokio::spawn(run_snap_writer(
+        data_dir.clone(),
+        snap_tx.subscribe(),
+        CancellationToken::new(),
+    ));
 
     // ── Connection task with mock URL overrides ───────────────────────────────
     let conn = ConnectionConfig {
@@ -233,6 +239,7 @@ async fn test_integration_binance_spot_pipeline() {
     let adapter: Box<dyn fathom::exchange::ExchangeAdapter> = Box::new(BinanceSpot);
     let state = monitor::new_state();
 
+    let cancel = CancellationToken::new();
     let conn_task = tokio::spawn(connection_task(
         conn,
         adapter,
@@ -240,16 +247,16 @@ async fn test_integration_binance_spot_pipeline() {
         state,
         raw_tx,
         snap_tx,
+        cancel.clone(),
     ));
 
     // Allow enough time for: WS connect + snapshot fetch + all 6 messages + Close frame.
     // On loopback this is <50ms; 400ms is a generous ceiling.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    // Abort the connection task (it would otherwise sleep in backoff then reconnect).
-    // Aborting drops the Senders, which closes the channels → writers flush & exit.
-    conn_task.abort();
-    let _ = conn_task.await; // Err(JoinError::Cancelled) — expected, ignore
+    // Signal the connection task to exit cooperatively.
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
 
     raw_writer.await.unwrap();
     snap_writer.await.unwrap();
@@ -335,6 +342,7 @@ async fn test_integration_monitor_state_updated() {
     let _snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
+        CancellationToken::new(),
     ));
 
     let conn = ConnectionConfig {
@@ -356,6 +364,7 @@ async fn test_integration_monitor_state_updated() {
     let state = monitor::new_state();
     let state_check = Arc::clone(&state);
 
+    let cancel = CancellationToken::new();
     let conn_task = tokio::spawn(connection_task(
         conn,
         adapter,
@@ -363,11 +372,12 @@ async fn test_integration_monitor_state_updated() {
         state,
         raw_tx,
         snap_tx,
+        cancel.clone(),
     ));
 
     tokio::time::sleep(Duration::from_millis(400)).await;
-    conn_task.abort();
-    let _ = conn_task.await;
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
 
     // After abort: connected should be false (set to false on WS close/reconnect)
     // and symbol "BTCUSDT" should exist in state

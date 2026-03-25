@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 mod helpers;
 use helpers::parquet::{collect_parquets, count_rows, read_f64_col};
@@ -62,7 +63,11 @@ async fn live_spot_ethusdt_pipeline() {
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let snap_handle = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_rx,
+        CancellationToken::new(),
+    ));
 
     let state = monitor::new_state();
     let task = tokio::spawn(connection_task(
@@ -72,6 +77,7 @@ async fn live_spot_ethusdt_pipeline() {
         state.clone(),
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     tokio::time::sleep(Duration::from_secs(8)).await;
@@ -135,7 +141,11 @@ async fn live_spot_multi_symbol() {
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let snap_handle = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_rx,
+        CancellationToken::new(),
+    ));
 
     let state = monitor::new_state();
     let task = tokio::spawn(connection_task(
@@ -149,6 +159,7 @@ async fn live_spot_multi_symbol() {
         state.clone(),
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -206,7 +217,11 @@ async fn live_perp_ethusdt_pipeline() {
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let snap_handle = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_rx,
+        CancellationToken::new(),
+    ));
 
     let state = monitor::new_state();
     let task = tokio::spawn(connection_task(
@@ -216,6 +231,7 @@ async fn live_perp_ethusdt_pipeline() {
         state.clone(),
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     tokio::time::sleep(Duration::from_secs(6)).await;

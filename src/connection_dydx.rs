@@ -11,6 +11,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     accumulator::{Snapshot1s, WindowAccumulator},
     config::ConnectionConfig,
@@ -217,6 +219,7 @@ pub async fn connection_task_dydx(
     monitor: MonitorState,
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
+    cancel: CancellationToken,
 ) {
     let name = conn.name.clone();
     let exchange_name = EXCHANGE_NAME.to_string();
@@ -237,6 +240,10 @@ pub async fn connection_task_dydx(
     let mut backoff_ms = BACKOFF_START_MS;
 
     loop {
+        if cancel.is_cancelled() {
+            info!(conn = %name, "shutdown signal received, exiting connection loop");
+            break;
+        }
         info!(conn = %name, "connecting...");
 
         let ws_url = conn
@@ -398,6 +405,11 @@ pub async fn connection_task_dydx(
 
         'inner: loop {
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!(conn = %name, "shutdown signal — exiting event loop");
+                    break 'inner;
+                }
+
                 msg = fwd_rx.recv() => {
                     let text = match msg {
                         None => break 'inner,

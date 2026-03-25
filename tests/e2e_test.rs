@@ -14,6 +14,7 @@ use std::time::Duration;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use fathom::{
     accumulator::Snapshot1s,
@@ -199,6 +200,7 @@ async fn test_e2e_reconnect_after_ws_close() {
     let snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
+        CancellationToken::new(),
     ));
 
     let state = monitor::new_state();
@@ -210,6 +212,7 @@ async fn test_e2e_reconnect_after_ws_close() {
         state,
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     // Round 1 (~50 ms) + backoff (~1 000–1 250 ms) + round 2 (~50 ms) + slack.
@@ -303,6 +306,7 @@ async fn test_e2e_multi_symbol_single_connection() {
     let snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
+        CancellationToken::new(),
     ));
 
     let state = monitor::new_state();
@@ -314,6 +318,7 @@ async fn test_e2e_multi_symbol_single_connection() {
         state,
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -389,6 +394,7 @@ async fn test_e2e_snapshot_http_error_then_retry() {
     let snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
+        CancellationToken::new(),
     ));
 
     let state = monitor::new_state();
@@ -400,6 +406,7 @@ async fn test_e2e_snapshot_http_error_then_retry() {
         state,
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     // Attempt 1 fails fast + backoff (~1 s) + attempt 2 (~100 ms) + slack.
@@ -490,6 +497,7 @@ async fn test_e2e_gap_triggers_reconnect() {
     let snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
+        CancellationToken::new(),
     ));
 
     let state = monitor::new_state();
@@ -502,6 +510,7 @@ async fn test_e2e_gap_triggers_reconnect() {
         state,
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     // Gap detected in round 1 + backoff (~1 s) + round 2 + slack.
@@ -619,6 +628,7 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
     let snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
+        CancellationToken::new(),
     ));
 
     let state = monitor::new_state();
@@ -631,6 +641,7 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
         state,
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     // BTC round-1 msgs (~50 ms) + ETH triggers reconnect + backoff (~1 s) + round 2 + slack.
@@ -717,6 +728,7 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
     let snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
+        CancellationToken::new(),
     ));
 
     let state = monitor::new_state();
@@ -728,6 +740,7 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
         state,
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     // Snapshot delay (300 ms) + event processing + writer flush + slack.
@@ -818,6 +831,7 @@ async fn test_e2e_snap_parquet_created() {
     let snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
+        CancellationToken::new(),
     ));
 
     let state = monitor::new_state();
@@ -829,6 +843,7 @@ async fn test_e2e_snap_parquet_created() {
         state,
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     // Round 1 (~50 ms) + backoff (~1 000–1 250 ms) + round 2 (~50 ms) + slack.

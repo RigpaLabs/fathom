@@ -25,6 +25,7 @@ rand               = "0.8"
 async-nats         = "0.38"
 axum               = "0.8"
 prometheus-client  = "0.23"
+tokio-util         = { version = "0.7", features = ["rt"] }
 
 [lints.rust]
 unsafe_code = "forbid"

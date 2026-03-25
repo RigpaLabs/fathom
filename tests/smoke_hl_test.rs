@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 mod helpers;
 use helpers::parquet::{collect_parquets, count_rows, read_f32_col, read_f64_col, read_u32_col};
@@ -58,7 +59,11 @@ async fn live_hl_eth_pipeline() {
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let snap_handle = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_rx,
+        CancellationToken::new(),
+    ));
 
     let state = monitor::new_state();
     let task = tokio::spawn(connection_task_hl(
@@ -68,6 +73,7 @@ async fn live_hl_eth_pipeline() {
         state.clone(),
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     // Hyperliquid updates ~every 500ms, need 10s+ for reliable snap rows
@@ -161,7 +167,11 @@ async fn live_hl_multi_symbol() {
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
-    let snap_handle = tokio::spawn(run_snap_writer(dir.path().to_path_buf(), snap_rx));
+    let snap_handle = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_rx,
+        CancellationToken::new(),
+    ));
 
     let state = monitor::new_state();
     let task = tokio::spawn(connection_task_hl(
@@ -171,6 +181,7 @@ async fn live_hl_multi_symbol() {
         state.clone(),
         raw_tx,
         snap_tx,
+        CancellationToken::new(),
     ));
 
     tokio::time::sleep(Duration::from_secs(10)).await;

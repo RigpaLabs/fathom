@@ -6,12 +6,21 @@ use std::{
 
 use arrow_array::{ArrayRef, Float32Array, Float64Array, Int64Array, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::{accumulator::Snapshot1s, error::Result, schema::snap_1s_schema};
+
+/// Derive UTC date string from event timestamp in microseconds.
+fn date_from_ts_us(ts_us: i64) -> String {
+    DateTime::from_timestamp_micros(ts_us)
+        .unwrap_or_else(Utc::now)
+        .format("%Y-%m-%d")
+        .to_string()
+}
 
 /// Flush the Parquet row group to disk every this many rows.
 /// At 1 row/sec this equals 1 hour — matches raw writer rotation cadence.
@@ -209,8 +218,12 @@ impl DayWriter {
 }
 
 /// 1s snapshot writer — one daily file per (exchange, symbol), flush on each row.
-pub async fn run_snap_writer(data_dir: PathBuf, rx: broadcast::Receiver<Snapshot1s>) {
-    run_snap_writer_inner(data_dir, rx, DEFAULT_DISK_FLUSH_INTERVAL).await;
+pub async fn run_snap_writer(
+    data_dir: PathBuf,
+    rx: broadcast::Receiver<Snapshot1s>,
+    cancel: CancellationToken,
+) {
+    run_snap_writer_inner(data_dir, rx, DEFAULT_DISK_FLUSH_INTERVAL, cancel).await;
 }
 
 /// Testable entry point with configurable disk flush interval.
@@ -219,27 +232,33 @@ pub async fn run_snap_writer_with_flush_interval(
     data_dir: PathBuf,
     rx: broadcast::Receiver<Snapshot1s>,
     disk_flush_interval: usize,
+    cancel: CancellationToken,
 ) {
-    run_snap_writer_inner(data_dir, rx, disk_flush_interval).await;
+    run_snap_writer_inner(data_dir, rx, disk_flush_interval, cancel).await;
 }
 
 async fn run_snap_writer_inner(
     data_dir: PathBuf,
     mut rx: broadcast::Receiver<Snapshot1s>,
     disk_flush_interval: usize,
+    cancel: CancellationToken,
 ) {
     let mut writers: HashMap<String, DayWriter> = HashMap::new();
 
     loop {
-        match rx.recv().await {
+        let recv_result = tokio::select! {
+            r = rx.recv() => r,
+            _ = cancel.cancelled() => break,
+        };
+        match recv_result {
             Err(broadcast::error::RecvError::Closed) => break,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("snap_writer lagged by {n} messages");
                 continue;
             }
             Ok(snap) => {
-                let now_utc = Utc::now();
-                let date_str = now_utc.format("%Y-%m-%d").to_string();
+                // Partition by event time, not wall-clock
+                let date_str = date_from_ts_us(snap.ts_us);
                 let key = format!("{}:{}", snap.exchange, snap.symbol);
                 let exchange = snap.exchange.clone();
                 let symbol = snap.symbol.clone();
@@ -289,7 +308,40 @@ async fn run_snap_writer_inner(
         }
     }
 
-    // Graceful shutdown
+    // Drain in-flight messages buffered before cancellation/channel close
+    while let Ok(snap) = rx.try_recv() {
+        let date_str = date_from_ts_us(snap.ts_us);
+        let key = format!("{}:{}", snap.exchange, snap.symbol);
+        let exchange = snap.exchange.clone();
+        let symbol = snap.symbol.clone();
+
+        if !writers.contains_key(&key) {
+            match DayWriter::open(
+                &data_dir,
+                &exchange,
+                &symbol,
+                &date_str,
+                disk_flush_interval,
+            ) {
+                Ok(dw) => {
+                    writers.insert(key.clone(), dw);
+                }
+                Err(e) => {
+                    warn!(error = %e, "drain: failed to open snap writer");
+                    continue;
+                }
+            }
+        }
+
+        if let Some(dw) = writers.get_mut(&key) {
+            dw.buffer.push(snap);
+            if let Err(e) = dw.flush() {
+                warn!(error = %e, "drain: snap flush error");
+            }
+        }
+    }
+
+    // Graceful shutdown — close all writers (writes Parquet footers)
     for (_, dw) in writers {
         if let Err(e) = dw.close() {
             warn!(error = %e, "shutdown: failed to close snap writer");
