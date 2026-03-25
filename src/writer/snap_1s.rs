@@ -23,8 +23,9 @@ fn date_from_ts_us(ts_us: i64) -> String {
 }
 
 /// Flush the Parquet row group to disk every this many rows.
-/// At 1 row/sec this equals 1 hour — matches raw writer rotation cadence.
-const DEFAULT_DISK_FLUSH_INTERVAL: usize = 3600;
+/// At 1 row/sec per symbol this equals 5 minutes.
+/// Keeps memory bounded and limits data loss on crash to ~5 min.
+const DEFAULT_DISK_FLUSH_INTERVAL: usize = 300;
 
 struct DayWriter {
     writer: ArrowWriter<std::fs::File>,
