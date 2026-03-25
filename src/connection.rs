@@ -253,7 +253,15 @@ pub async fn connection_task(
                 }
             })
             .collect();
-        let snap_results: Vec<_> = stream::iter(snap_futs).buffer_unordered(8).collect().await;
+        let snap_results: Vec<_> = tokio::select! {
+            results = stream::iter(snap_futs).buffer_unordered(8).collect() => results,
+            _ = cancel.cancelled() => {
+                warn!(conn = %name, "snapshot fetch cancelled during shutdown");
+                forwarder.abort();
+                let _ = forwarder.await;
+                break;
+            }
+        };
 
         for (sym, result) in snap_results {
             match result {

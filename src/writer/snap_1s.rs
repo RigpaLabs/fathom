@@ -308,7 +308,40 @@ async fn run_snap_writer_inner(
         }
     }
 
-    // Graceful shutdown
+    // Drain in-flight messages buffered before cancellation/channel close
+    while let Ok(snap) = rx.try_recv() {
+        let date_str = date_from_ts_us(snap.ts_us);
+        let key = format!("{}:{}", snap.exchange, snap.symbol);
+        let exchange = snap.exchange.clone();
+        let symbol = snap.symbol.clone();
+
+        if !writers.contains_key(&key) {
+            match DayWriter::open(
+                &data_dir,
+                &exchange,
+                &symbol,
+                &date_str,
+                disk_flush_interval,
+            ) {
+                Ok(dw) => {
+                    writers.insert(key.clone(), dw);
+                }
+                Err(e) => {
+                    warn!(error = %e, "drain: failed to open snap writer");
+                    continue;
+                }
+            }
+        }
+
+        if let Some(dw) = writers.get_mut(&key) {
+            dw.buffer.push(snap);
+            if let Err(e) = dw.flush() {
+                warn!(error = %e, "drain: snap flush error");
+            }
+        }
+    }
+
+    // Graceful shutdown — close all writers (writes Parquet footers)
     for (_, dw) in writers {
         if let Err(e) = dw.close() {
             warn!(error = %e, "shutdown: failed to close snap writer");
