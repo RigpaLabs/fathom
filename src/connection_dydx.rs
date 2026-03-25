@@ -18,7 +18,7 @@ use crate::{
     config::ConnectionConfig,
     connection::sleep_backoff,
     exchange::dydx::{EXCHANGE_NAME, WS_URL},
-    metrics::{ConnLabel, Metrics},
+    metrics::{ConnLabel, Metrics, SymbolLabel},
     monitor::{MonitorState, lock_state},
     orderbook::DiffApplied,
     writer::raw::RawDiff,
@@ -539,6 +539,10 @@ pub async fn connection_task_dydx(
                             metrics
                                 .events_total
                                 .get_or_create(&ConnLabel { conn: name.clone() })
+                                .inc();
+                            metrics
+                                .events_by_symbol
+                                .get_or_create(&SymbolLabel { conn: name.clone(), symbol: symbol.clone() })
                                 .inc();
                         }
 

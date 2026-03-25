@@ -26,11 +26,19 @@ pub struct ConnLabel {
     pub conn: String,
 }
 
+/// "conn" + "symbol" labels for per-symbol metrics.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+pub struct SymbolLabel {
+    pub conn: String,
+    pub symbol: String,
+}
+
 // ── Metrics registry ────────────────────────────────────────────────────────
 
 /// All Prometheus metrics exposed by Fathom.
 pub struct Metrics {
     pub events_total: Family<ConnLabel, Counter>,
+    pub events_by_symbol: Family<SymbolLabel, Counter>,
     pub events_per_sec: Family<ConnLabel, GaugeF64>,
     pub uptime_seconds: GaugeF64,
     pub symbols_active: Family<ConnLabel, Gauge>,
@@ -47,6 +55,13 @@ impl Metrics {
             "fathom_events_total",
             "Total events received per connection",
             events_total.clone(),
+        );
+
+        let events_by_symbol = Family::<SymbolLabel, Counter>::default();
+        registry.register(
+            "fathom_events_by_symbol",
+            "Total events received per connection per symbol",
+            events_by_symbol.clone(),
         );
 
         let events_per_sec = Family::<ConnLabel, GaugeF64>::default();
@@ -100,6 +115,7 @@ impl Metrics {
 
         Self {
             events_total,
+            events_by_symbol,
             events_per_sec,
             uptime_seconds,
             symbols_active,
@@ -309,6 +325,60 @@ mod tests {
         handle.metrics.events_total.get_or_create(&label).inc();
 
         assert_eq!(handle.metrics.events_total.get_or_create(&label).get(), 2);
+    }
+
+    #[test]
+    fn test_events_by_symbol_counter() {
+        let handle = new_metrics();
+        let label_a = SymbolLabel {
+            conn: "binance_spot".to_string(),
+            symbol: "ETHUSDT".to_string(),
+        };
+        let label_b = SymbolLabel {
+            conn: "binance_spot".to_string(),
+            symbol: "BTCUSDT".to_string(),
+        };
+
+        handle
+            .metrics
+            .events_by_symbol
+            .get_or_create(&label_a)
+            .inc();
+        handle
+            .metrics
+            .events_by_symbol
+            .get_or_create(&label_a)
+            .inc();
+        handle
+            .metrics
+            .events_by_symbol
+            .get_or_create(&label_b)
+            .inc();
+
+        assert_eq!(
+            handle
+                .metrics
+                .events_by_symbol
+                .get_or_create(&label_a)
+                .get(),
+            2
+        );
+        assert_eq!(
+            handle
+                .metrics
+                .events_by_symbol
+                .get_or_create(&label_b)
+                .get(),
+            1
+        );
+
+        // Verify it appears in Prometheus text output with both labels
+        let mut buf = String::new();
+        let registry = handle.registry.read().unwrap();
+        encode(&mut buf, &registry).unwrap();
+        assert!(buf.contains("fathom_events_by_symbol"));
+        assert!(buf.contains(r#"conn="binance_spot""#));
+        assert!(buf.contains(r#"symbol="ETHUSDT""#));
     }
 
     #[test]
