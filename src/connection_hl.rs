@@ -18,7 +18,7 @@ use crate::{
     config::ConnectionConfig,
     connection::sleep_backoff,
     exchange::ExchangeAdapter,
-    metrics::{ConnLabel, Metrics},
+    metrics::{ConnLabel, Metrics, SymbolLabel},
     monitor::{MonitorState, lock_state},
     orderbook::DiffApplied,
     writer::raw::RawDiff,
@@ -355,6 +355,10 @@ pub async fn connection_task_hl(
                             metrics
                                 .events_total
                                 .get_or_create(&ConnLabel { conn: name.clone() })
+                                .inc();
+                            metrics
+                                .events_by_symbol
+                                .get_or_create(&SymbolLabel { conn: name.clone(), symbol: symbol.clone() })
                                 .inc();
 
                             {

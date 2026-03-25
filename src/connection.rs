@@ -20,7 +20,7 @@ use crate::{
     config::ConnectionConfig,
     error::AppError,
     exchange::ExchangeAdapter,
-    metrics::{ConnLabel, Metrics},
+    metrics::{ConnLabel, Metrics, SymbolLabel},
     monitor::{MonitorState, lock_state},
     orderbook::{DepthDiff, OrderBook, SnapshotMsg},
     writer::raw::RawDiff,
@@ -670,6 +670,10 @@ pub async fn connection_task(
                             metrics
                                 .events_total
                                 .get_or_create(&ConnLabel { conn: name.clone() })
+                                .inc();
+                            metrics
+                                .events_by_symbol
+                                .get_or_create(&SymbolLabel { conn: name.clone(), symbol: symbol.clone() })
                                 .inc();
                         }
                     }
