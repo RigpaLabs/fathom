@@ -86,27 +86,24 @@ Ongoing:       pu > last_update_id  → OrderBookGap (missed events)
 **Hyperliquid** sends full snapshots (no diffs) — no gap detection needed.
 **dYdX v4** uses batched diffs after initial snapshot; the WS guarantees ordering.
 
-## Data locations
+## Data layout
 
-**Production (Vultr Tokyo):** SSH `fathom-root`, data inside Docker volume mounted at `/app/data/`.
-Each deploy creates a versioned dir: `/app/data/v{YYYYMMDD}-{sha7}/`.
+Data is written to `{data_dir}/` (configured in `config.toml`). When `DATA_DIR` env is set, it overrides the config value (useful for blue-green deploys).
 
-**Local backup (iCloud):** `~/Library/Mobile Documents/com~apple~CloudDocs/fathom-data/`
-- Contains all historical versions from v20260301 onward
-- Auto-synced daily at 10:00 WITA via launchd (`com.fathom.sync-data`)
-- Sync script: `scripts/sync-data.sh` (two-step: VPS → staging → iCloud)
-
-**Local staging:** `~/.local/fathom-staging/` — intermediate rsync target (avoids iCloud path spaces)
-
-**Data structure inside each version dir:**
 ```
-v{tag}/
+{data_dir}/
 ├── 1s/{exchange}/{symbol}/{date}.parquet    # 1-second snapshots (1 row/sec)
 ├── raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet  # raw diffs
-└── metadata/status.json
+└── metadata/status.json                     # health, updated every 30s
 ```
 
 **Exchanges:** `binance_spot`, `binance_perp`, `hyperliquid`, `dydx` (22 symbols total)
+
+## Deployment
+
+CI builds and pushes Docker images to GHCR on every push to `main`. Deploy to your own infrastructure by pulling the image and running via Docker Compose or `docker run`.
+
+See `docker-compose.yml` for local dev and `docker-compose.prod.yml` for production reference.
 
 ## Testing conventions
 
