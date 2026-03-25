@@ -55,23 +55,6 @@ async fn main() -> anyhow::Result<()> {
     let raw_rx_parquet = raw_tx.subscribe();
     let snap_rx_parquet = snap_tx.subscribe();
 
-    let raw_handle = tokio::spawn(fathom::writer::raw::run_raw_writer(
-        data_dir.clone(),
-        raw_rx_parquet,
-        RAW_FLUSH_INTERVAL_S,
-        cfg.raw_rotate_hours,
-    ));
-    let snap_handle = tokio::spawn(run_snap_writer(
-        data_dir.clone(),
-        snap_rx_parquet,
-        cancel.clone(),
-    ));
-    let mon_handle = tokio::spawn(monitor::run_monitor(
-        data_dir.clone(),
-        monitor_state.clone(),
-        start,
-    ));
-
     // Metrics: Prometheus /metrics + /health HTTP server
     let metrics_handle_data = metrics::new_metrics();
     let metrics_server_handle = tokio::spawn(metrics::run_metrics_server(
@@ -80,6 +63,25 @@ async fn main() -> anyhow::Result<()> {
     let metrics_sync_handle = tokio::spawn(metrics::sync_monitor_to_metrics(
         monitor_state.clone(),
         metrics_handle_data.metrics.clone(),
+        start,
+    ));
+
+    let raw_handle = tokio::spawn(fathom::writer::raw::run_raw_writer(
+        data_dir.clone(),
+        raw_rx_parquet,
+        RAW_FLUSH_INTERVAL_S,
+        cfg.raw_rotate_hours,
+        metrics_handle_data.metrics.clone(),
+    ));
+    let snap_handle = tokio::spawn(run_snap_writer(
+        data_dir.clone(),
+        snap_rx_parquet,
+        cancel.clone(),
+        metrics_handle_data.metrics.clone(),
+    ));
+    let mon_handle = tokio::spawn(monitor::run_monitor(
+        data_dir.clone(),
+        monitor_state.clone(),
         start,
     ));
 
@@ -103,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         let rtx = raw_tx.clone();
         let stx = snap_tx.clone();
         let ct = cancel.clone();
+        let m = metrics_handle_data.metrics.clone();
         match conn.exchange {
             Exchange::BinanceSpot => {
                 handles.push(tokio::spawn(connection_task(
@@ -113,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ct,
+                    m,
                 )));
             }
             Exchange::BinancePerp => {
@@ -124,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ct,
+                    m,
                 )));
             }
             Exchange::Hyperliquid => {
@@ -135,11 +140,12 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ct,
+                    m,
                 )));
             }
             Exchange::Dydx => {
                 handles.push(tokio::spawn(connection_task_dydx(
-                    conn, data_dir, mon, rtx, stx, ct,
+                    conn, data_dir, mon, rtx, stx, ct, m,
                 )));
             }
         }

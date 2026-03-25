@@ -18,6 +18,7 @@ use crate::{
     config::ConnectionConfig,
     connection::sleep_backoff,
     exchange::ExchangeAdapter,
+    metrics::{ConnLabel, Metrics},
     monitor::{MonitorState, lock_state},
     orderbook::DiffApplied,
     writer::raw::RawDiff,
@@ -76,6 +77,7 @@ struct PrevSnapshot {
 
 // ── Connection task ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connection_task_hl(
     conn: ConnectionConfig,
     adapter: Box<dyn ExchangeAdapter>,
@@ -84,6 +86,7 @@ pub async fn connection_task_hl(
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
     cancel: CancellationToken,
+    metrics: std::sync::Arc<Metrics>,
 ) {
     let name = conn.name.clone();
     let exchange_name = adapter.name().to_string();
@@ -349,6 +352,10 @@ pub async fn connection_task_hl(
                                 &applied,
                             );
                             event_count += 1;
+                            metrics
+                                .events_total
+                                .get_or_create(&ConnLabel { conn: name.clone() })
+                                .inc();
 
                             {
                                 let mut state = lock_state(&monitor);

@@ -14,7 +14,7 @@ use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterPr
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use crate::{error::Result, schema::raw_schema};
+use crate::{error::Result, metrics::Metrics, schema::raw_schema};
 
 // Re-export from fathom-types crate.
 pub use fathom_types::RawDiff;
@@ -159,6 +159,7 @@ pub async fn run_raw_writer(
     mut rx: broadcast::Receiver<RawDiff>,
     flush_interval_s: u64,
     rotate_hours: u32,
+    metrics: std::sync::Arc<Metrics>,
 ) {
     let mut writers: HashMap<String, SymbolWriter> = HashMap::new();
     let mut last_flush = tokio::time::Instant::now();
@@ -185,8 +186,14 @@ pub async fn run_raw_writer(
                 if let Some(sw) = writers.get_mut(&key)
                     && sw.should_rotate(now_utc, rotate_hours)
                 {
-                    if let Err(e) = sw.close_and_rename(now_utc) {
-                        warn!(error = %e, "failed to rotate raw file");
+                    match sw.close_and_rename(now_utc) {
+                        Ok(()) => {
+                            metrics.parquet_writes_total.inc();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to rotate raw file");
+                            metrics.parquet_write_errors_total.inc();
+                        }
                     }
                     writers.remove(&key);
                 }
@@ -220,8 +227,14 @@ pub async fn run_raw_writer(
         // Periodic flush
         if last_flush.elapsed() >= flush_dur {
             for sw in writers.values_mut() {
-                if let Err(e) = sw.flush_buffer() {
-                    warn!(error = %e, "raw flush error");
+                match sw.flush_buffer() {
+                    Ok(()) => {
+                        metrics.parquet_writes_total.inc();
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "raw flush error");
+                        metrics.parquet_write_errors_total.inc();
+                    }
                 }
             }
             last_flush = tokio::time::Instant::now();
@@ -231,8 +244,14 @@ pub async fn run_raw_writer(
     // Graceful shutdown: flush all and finalize
     let now_utc = Utc::now();
     for (_, mut sw) in writers {
-        if let Err(e) = sw.close_and_rename(now_utc) {
-            warn!(error = %e, "shutdown: failed to finalize raw file");
+        match sw.close_and_rename(now_utc) {
+            Ok(()) => {
+                metrics.parquet_writes_total.inc();
+            }
+            Err(e) => {
+                warn!(error = %e, "shutdown: failed to finalize raw file");
+                metrics.parquet_write_errors_total.inc();
+            }
         }
     }
     info!("raw_writer shutdown complete");

@@ -1,40 +1,48 @@
-# fathom — Binance LOB Collector
+# fathom — Multi-Exchange L2 Order Book Collector
 
-Collects Level-2 order book data from Binance Spot and USDM Futures via WebSocket. Maintains BTreeMap-based L2 books with Binance's sequence-sync protocol, accumulates per-second microstructure statistics (OFI, churn, microprice, imbalance), and writes Snappy-compressed Parquet files — both raw diffs and 1-second snapshots.
+Collects Level-2 order book data from **Binance Spot**, **Binance USDM Futures**, **Hyperliquid**, and **dYdX v4** via WebSocket. Maintains BTreeMap-based L2 books, accumulates per-second microstructure statistics (OFI, churn, microprice, imbalance, trade flow), and writes Snappy-compressed Parquet files — both raw diffs and 1-second snapshots.
+
+**22 symbols** across 4 exchanges, running continuously on a 256 MB VPS.
 
 ## Architecture
 
+Each exchange has its own connection strategy, but all paths converge to the same two writers:
+
 ```
+Binance Spot / USDM Futures:
+  WebSocket combined stream
+    → forwarder task (buffers during REST snapshot fetch)
+    → REST snapshot → initialize BTreeMap L2 book
+    → gap detection (per-symbol sequence validation)
+    → apply diff → OFI / churn / microprice accumulation
+
+Hyperliquid:
+  WebSocket (single endpoint, subscribe after connect)
+    → full L2 snapshots (~500ms) + trades
+    → snapshot-to-snapshot OFI / churn (no gap detection needed)
+
+dYdX v4:
+  WebSocket Indexer API (subscribe after connect)
+    → initial snapshot + batched diffs (~250ms) + trades
+    → local BTreeMap book (DydxBook)
+    → accumulation via WindowAccumulator::on_diff_from_levels
+
+All paths → two parallel writers:
 ┌─────────────────────────────────────────────────────────┐
-│  per connection (spot / perp)                           │
-│                                                         │
-│  WebSocket ──→ forwarder task ──→ fwd_rx channel        │
-│  (handles Ping/Pong,           (buffers events during   │
-│   heartbeat timeout 30s)        REST snapshot fetch)    │
-│                                                         │
-│  REST snapshot (per symbol) ──→ initialize L2 book      │
-│                                                         │
-│  inner loop (tokio::select!):                           │
-│    fwd_rx.recv()  → parse → apply_diff → BTreeMap book  │
-│    1s tick         → flush accumulators → snap_tx        │
-│    60s tick        → log event rate stats                │
-└────────────────────┬──────────────────┬─────────────────┘
-                     │                  │
-              ┌──────▼──────┐   ┌───────▼───────┐
-              │  raw_tx     │   │  snap_tx      │
-              │  (8192 buf) │   │  (8192 buf)   │
-              └──────┬──────┘   └───────┬───────┘
-                     │                  │
-              ┌──────▼──────┐   ┌───────▼───────┐
-              │ raw writer  │   │ 1s writer     │
-              │ 5-min flush │   │ hourly row    │
-              │ hourly      │   │ group flush   │
-              │ rotation    │   │ daily file    │
-              └──────┬──────┘   └───────┬───────┘
-                     │                  │
-                     ▼                  ▼
-              raw/*.parquet      1s/*.parquet
+│              raw_tx (8192)         snap_tx (8192)        │
+└──────────────────┬──────────────────────┬───────────────┘
+                   │                      │
+            ┌──────▼──────┐       ┌───────▼───────┐
+            │ raw writer  │       │ 1s writer     │
+            │ hourly      │       │ hourly row    │
+            │ rotation    │       │ group flush   │
+            └──────┬──────┘       └───────┬───────┘
+                   │                      │
+                   ▼                      ▼
+            raw/*.parquet          1s/*.parquet
 ```
+
+**Backpressure:** both channels use `try_send` — if a writer is full, the event is dropped with a warning rather than blocking the WS event loop.
 
 ## Quick start
 
@@ -65,7 +73,7 @@ IMAGE_TAG=latest docker compose -f docker-compose.prod.yml up -d
 ├── raw/{exchange}/{symbol}/{date}/
 │   └── depth_HHMM_HHMM.parquet      # rotated every raw_rotate_hours (default 1h)
 ├── 1s/{exchange}/{symbol}/
-│   └── {date}.parquet                # 1 row/second, 60 columns
+│   └── {date}.parquet                # 1 row/second, 64 columns
 └── metadata/
     └── status.json                   # health/monitoring, updated every 30s
 ```
@@ -76,9 +84,9 @@ When deployed with `DATA_DIR` env override, files are written under `{data_dir}/
 
 `timestamp_us`, `exchange`, `symbol`, `seq_id`, `prev_seq_id`, `bids` (list of [price, qty]), `asks` (list of [price, qty])
 
-### 1s snapshot columns (60)
+### 1s snapshot columns (64)
 
-`ts_us`, `exchange`, `symbol`, `bid_px_0..9`, `ask_px_0..9`, `bid_sz_0..9`, `ask_sz_0..9`, `mid_px`, `microprice`, `spread_bps`, `imbalance_l1`, `imbalance_l5`, `imbalance_l10`, `bid_depth_l5`, `bid_depth_l10`, `ask_depth_l5`, `ask_depth_l10`, `ofi_l1`, `churn_bid`, `churn_ask`, `intra_sigma`, `open_px`, `close_px`, `n_events`
+`ts_us`, `exchange`, `symbol`, `bid_px_0..9`, `ask_px_0..9`, `bid_sz_0..9`, `ask_sz_0..9`, `mid_px`, `microprice`, `spread_bps`, `imbalance_l1`, `imbalance_l5`, `imbalance_l10`, `bid_depth_l5`, `bid_depth_l10`, `ask_depth_l5`, `ask_depth_l10`, `ofi_l1`, `churn_bid`, `churn_ask`, `intra_sigma`, `open_px`, `close_px`, `n_events`, `volume_delta`, `buy_vol`, `sell_vol`, `trade_count`
 
 ## Config reference
 
@@ -87,9 +95,9 @@ When deployed with `DATA_DIR` env override, files are written under `{data_dir}/
 | `data_dir` | string | required | Root directory for Parquet output |
 | `raw_rotate_hours` | integer | `1` | Raw file rotation interval in hours (must divide 24: 1,2,3,4,6,8,12,24) |
 | `connections[].name` | string | required | Logical name for the connection group |
-| `connections[].exchange` | string | required | `binance_spot` or `binance_perp` |
-| `connections[].symbols` | string[] | required | Trading pairs, e.g. `["ETHUSDT", "BTCUSDT"]` |
-| `connections[].depth_ms` | integer | required | WebSocket update speed: `100` or `1000` ms |
+| `connections[].exchange` | string | required | `binance_spot`, `binance_perp`, `hyperliquid`, or `dydx` |
+| `connections[].symbols` | string[] | required | Trading pairs (format varies by exchange, e.g. `ETHUSDT` / `ETH` / `ETH-USD`) |
+| `connections[].depth_ms` | integer | required | WebSocket update speed in ms (Binance: `100`/`1000`, HL: `500`). Not used for `dydx` — the dYdX WebSocket uses a fixed update interval controlled by the exchange. |
 
 ### Environment variables
 
@@ -156,6 +164,10 @@ make lint           # cargo clippy -- -D warnings
 make fmt-check      # cargo fmt --check
 make docker-smoke   # build Docker image + run vs live Binance
 make cov            # coverage report (llvm-cov)
+
+# Exchange-specific smoke tests (live network, manual only):
+cargo test --test smoke_hl_test -- --include-ignored --test-threads 1 --nocapture
+cargo test --test smoke_dydx_test -- --include-ignored --test-threads 1 --nocapture
 ```
 
 **~117 tests** across 12 test files:
@@ -172,11 +184,11 @@ make cov            # coverage report (llvm-cov)
 | Schema | 5 | Parquet schema compatibility, roundtrip |
 | E2E | 7 | Full pipeline with axum mock WS/REST server (no real network) |
 | Integration | 2 | Multi-component pipeline tests |
-| Smoke | 3 | Real Binance (`#[ignore]`, manual via `make smoke`) |
+| Smoke | 3 | Real Binance/HL/dYdX (`#[ignore]`, manual only) |
 
 ## Design notes
 
-### Spot vs perp gap detection
+### Binance: spot vs perp gap detection
 
 Binance USDM Futures diffs carry a `pu` (prev_final_update_id) field absent from spot. Gap checks in `orderbook/mod.rs`:
 
@@ -185,14 +197,18 @@ Binance USDM Futures diffs carry a `pu` (prev_final_update_id) field absent from
 
 Using the wrong rule causes spurious reconnects. The code branches on `Option<i64>` presence.
 
-### Forwarder task
+### Hyperliquid: snapshot-based OFI
 
-Each WS connection spawns a forwarder that owns the socket, handles Ping/Pong frames, and buffers text events in a channel. This lets the main loop fetch REST snapshots without missing WS events — critical during initial sync when snapshot requests take 200-500ms per symbol.
+Hyperliquid sends full L2 snapshots every ~500ms rather than incremental diffs. OFI and churn are computed snapshot-to-snapshot via `WindowAccumulator::on_diff_from_levels`, which synthesizes a synthetic diff by comparing consecutive snapshots. No gap detection needed.
+
+### dYdX v4: batched diffs
+
+dYdX v4 Indexer API delivers an initial snapshot followed by batched diffs. A local `DydxBook` (BTreeMap) applies each batch, and accumulation uses the same `on_diff_from_levels` path as Hyperliquid. The WebSocket guarantees ordering, so no sequence validation is required.
+
+### Forwarder task (Binance)
+
+Each Binance connection spawns a forwarder that owns the socket, handles Ping/Pong frames, and buffers text events in a channel. This lets the main loop fetch REST snapshots without missing WS events — critical during initial sync when snapshot requests take 200-500ms per symbol.
 
 ### 1s writer periodic flush
 
 `ArrowWriter` buffers rows in a row group until `flush()` or `finish()`. With 1 row/sec the default 1M-row threshold would never trigger, so the writer explicitly flushes every 3600 rows (~1 hour). This limits worst-case data loss on crash to 1 hour of 1s data instead of an entire day.
-
-### Backpressure
-
-Both `raw_tx` and `snap_tx` use `try_send` — if a writer channel is full (8192 buffer), the event is dropped with a warning log rather than blocking the WS event loop.

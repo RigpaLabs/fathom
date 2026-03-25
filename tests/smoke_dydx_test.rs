@@ -57,11 +57,18 @@ async fn live_dydx_eth_pipeline() {
     let (raw_tx, raw_rx) = broadcast::channel::<RawDiff>(1_024);
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
-    let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
+    let raw_handle = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_rx,
+        60,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
     let snap_handle = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_rx,
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     let state = monitor::new_state();
@@ -72,6 +79,7 @@ async fn live_dydx_eth_pipeline() {
         raw_tx,
         snap_tx,
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     // dYdX batched updates ~250ms, give 12s for reliable data
@@ -178,11 +186,18 @@ async fn live_dydx_multi_symbol() {
     let (raw_tx, raw_rx) = broadcast::channel::<RawDiff>(1_024);
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
 
-    let raw_handle = tokio::spawn(run_raw_writer(dir.path().to_path_buf(), raw_rx, 60, 1));
+    let raw_handle = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_rx,
+        60,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
     let snap_handle = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_rx,
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     let state = monitor::new_state();
@@ -193,6 +208,7 @@ async fn live_dydx_multi_symbol() {
         raw_tx,
         snap_tx,
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     tokio::time::sleep(Duration::from_secs(12)).await;

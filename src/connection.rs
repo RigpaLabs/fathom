@@ -20,6 +20,7 @@ use crate::{
     config::ConnectionConfig,
     error::AppError,
     exchange::ExchangeAdapter,
+    metrics::{ConnLabel, Metrics},
     monitor::{MonitorState, lock_state},
     orderbook::{DepthDiff, OrderBook, SnapshotMsg},
     writer::raw::RawDiff,
@@ -107,6 +108,7 @@ fn parse_depth_levels(depth: &DepthUpdate) -> (Vec<(f64, f64)>, Vec<(f64, f64)>,
 
 // ── Connection task ───────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connection_task(
     conn: ConnectionConfig,
     adapter: Box<dyn ExchangeAdapter>,
@@ -115,6 +117,7 @@ pub async fn connection_task(
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
     cancel: CancellationToken,
+    metrics: std::sync::Arc<Metrics>,
 ) {
     let name = conn.name.clone();
     let exchange_name = adapter.name().to_string();
@@ -664,6 +667,10 @@ pub async fn connection_task(
                             });
                             acc.on_diff(book, &applied);
                             event_count += 1;
+                            metrics
+                                .events_total
+                                .get_or_create(&ConnLabel { conn: name.clone() })
+                                .inc();
                         }
                     }
                 }

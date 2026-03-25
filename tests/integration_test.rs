@@ -213,11 +213,18 @@ async fn test_integration_binance_spot_pipeline() {
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(64);
 
     // flush_interval_s=60: writers buffer in memory, flush on channel close
-    let raw_writer = tokio::spawn(run_raw_writer(data_dir.clone(), raw_tx.subscribe(), 60, 1));
+    let raw_writer = tokio::spawn(run_raw_writer(
+        data_dir.clone(),
+        raw_tx.subscribe(),
+        60,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
     let snap_writer = tokio::spawn(run_snap_writer(
         data_dir.clone(),
         snap_tx.subscribe(),
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     // ── Connection task with mock URL overrides ───────────────────────────────
@@ -248,6 +255,7 @@ async fn test_integration_binance_spot_pipeline() {
         raw_tx,
         snap_tx,
         cancel.clone(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     // Allow enough time for: WS connect + snapshot fetch + all 6 messages + Close frame.
@@ -338,11 +346,13 @@ async fn test_integration_monitor_state_updated() {
         raw_tx.subscribe(),
         60,
         1,
+        fathom::metrics::new_metrics().metrics,
     ));
     let _snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
         CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     let conn = ConnectionConfig {
@@ -373,6 +383,7 @@ async fn test_integration_monitor_state_updated() {
         raw_tx,
         snap_tx,
         cancel.clone(),
+        fathom::metrics::new_metrics().metrics,
     ));
 
     tokio::time::sleep(Duration::from_millis(400)).await;
