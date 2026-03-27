@@ -112,8 +112,11 @@ Wire format: `[version: u8][bincode payload]` (version = 1). Types defined in `c
 
 ### Timestamp semantics
 
-- **`Snapshot1s.ts_us`** — start of the 1-second accumulation window, in microseconds since Unix epoch. This is the *event time* derived from exchange timestamps, not the wall-clock time of the Fathom process. Parquet files are partitioned by the date component of this field.
-- **`RawDiff.timestamp_us`** — exchange event time in microseconds since Unix epoch. For Binance, this is the `E` (event time) field from the WebSocket diff message. For dYdX, it is the timestamp of the batch.
+- **`Snapshot1s.ts_us`** — wall-clock time of the Fathom process at the end of the 1-second accumulation window (`Utc::now()` at flush), in microseconds since Unix epoch. This is **not** exchange event time — it reflects when Fathom flushed the accumulated stats, not when the underlying events occurred. Parquet files are partitioned by the date component of this field.
+- **`RawDiff.timestamp_us`** — per-exchange origin:
+  - **Binance (spot + perp):** exchange event time (`E` field from the WebSocket diff message), converted to microseconds.
+  - **Hyperliquid:** exchange-provided snapshot time (`time` field), converted to microseconds.
+  - **dYdX:** wall-clock receive time (`Utc::now()` when the batch is processed) — the dYdX WebSocket API does not provide per-batch timestamps.
 
 ### Configuration
 
