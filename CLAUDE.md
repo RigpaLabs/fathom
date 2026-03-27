@@ -39,9 +39,13 @@ dYdX v4:
     → local BTreeMap book (DydxBook in src/connection_dydx.rs)
     → accumulation via WindowAccumulator::on_diff_from_levels
 
-All paths → two parallel writers:
+All paths → two parallel writers + optional NATS sink:
   raw diff  → {data_dir}/raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet
   1s snap   → {data_dir}/1s/{exchange}/{symbol}/{date}.parquet  (64 columns, 1 row/sec)
+
+Optional NATS streaming (src/nats_sink.rs):
+  1s snap   → fathom.v1.{exchange}.{symbol}.snapshot  (FATHOM_SNAPSHOTS, file storage, critical)
+  raw diff  → fathom.v1.{exchange}.{symbol}.depth     (FATHOM_DEPTH, memory storage, best-effort)
 ```
 
 **1s snapshot columns:** `ts_us`, `exchange`, `symbol`, `bid_px_0..9`, `ask_px_0..9`, `bid_sz_0..9`, `ask_sz_0..9`,
@@ -63,6 +67,7 @@ All paths → two parallel writers:
 | `src/exchange/` | BinanceSpot / BinancePerp / Hyperliquid adapters, dYdX constants |
 | `src/writer/raw.rs` | Raw diff Parquet writer |
 | `src/writer/snap_1s.rs` | 1s snapshot Parquet writer |
+| `src/nats_sink.rs` | NATS JetStream publisher (snapshots + depth diffs) |
 | `src/monitor.rs` | Reconnect/gap/liveness tracking |
 
 ## Important gotcha: perp vs spot gap check
