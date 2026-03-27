@@ -1,5 +1,10 @@
 data_dir = "data"
 
+# Optional: enable NATS JetStream publishing (omit section to disable)
+# [nats]
+# url = "nats://127.0.0.1:4222"
+# enabled = true
+
 [[connections]]
 name     = "binance_spot"
 exchange = "binance_spot"

@@ -88,6 +88,44 @@ When deployed with `DATA_DIR` env override, files are written under `{data_dir}/
 
 `ts_us`, `exchange`, `symbol`, `bid_px_0..9`, `ask_px_0..9`, `bid_sz_0..9`, `ask_sz_0..9`, `mid_px`, `microprice`, `spread_bps`, `imbalance_l1`, `imbalance_l5`, `imbalance_l10`, `bid_depth_l5`, `bid_depth_l10`, `ask_depth_l5`, `ask_depth_l10`, `ofi_l1`, `churn_bid`, `churn_ask`, `intra_sigma`, `open_px`, `close_px`, `n_events`, `volume_delta`, `buy_vol`, `sell_vol`, `trade_count`
 
+## NATS streaming (optional)
+
+When a `[nats]` section is present in config, Fathom publishes data to NATS JetStream in addition to writing Parquet files. If NATS is disabled or the connection fails, Parquet output continues unaffected.
+
+### Topics
+
+| Subject pattern | Example | Rate |
+|-----------------|---------|------|
+| `fathom.v1.{exchange}.{symbol}.snapshot` | `fathom.v1.binance_perp.ETHUSDT.snapshot` | 1/sec per symbol |
+| `fathom.v1.{exchange}.{symbol}.depth` | `fathom.v1.dydx.ETH-USD.depth` | ~100ms per symbol |
+
+Wire format: `[version: u8][bincode payload]` (version = 1). Types defined in `crates/fathom-types`.
+
+### Streams
+
+| Stream | Subjects | Storage | Max age | Max bytes | Durability |
+|--------|----------|---------|---------|-----------|------------|
+| `FATHOM_SNAPSHOTS` | `fathom.v1.*.*.snapshot` | File | 24 h | 200 MB | **Critical** — JetStream ACK confirms durable write |
+| `FATHOM_DEPTH` | `fathom.v1.*.*.depth` | Memory | 1 h | 500 MB | **Best-effort** — plain publish, no ACK |
+
+**Critical vs best-effort:** Snapshot publishing uses the JetStream double-await pattern (send request → await ACK) to confirm each message is durably stored on disk. Depth publishing uses plain NATS `publish()` with no ACK — messages are held in memory for real-time subscribers but may be lost on NATS restart. Both log warnings on failure without blocking the main pipeline.
+
+### Timestamp semantics
+
+- **`Snapshot1s.ts_us`** — wall-clock time of the Fathom process at the end of the 1-second accumulation window (`Utc::now()` at flush), in microseconds since Unix epoch. This is **not** exchange event time — it reflects when Fathom flushed the accumulated stats, not when the underlying events occurred. Parquet files are partitioned by the date component of this field.
+- **`RawDiff.timestamp_us`** — per-exchange origin:
+  - **Binance (spot + perp):** exchange event time (`E` field from the WebSocket diff message), converted to microseconds.
+  - **Hyperliquid:** exchange-provided snapshot time (`time` field), converted to microseconds.
+  - **dYdX:** wall-clock receive time (`Utc::now()` when the batch is processed) — the dYdX WebSocket API does not provide per-batch timestamps.
+
+### Configuration
+
+```toml
+[nats]
+url = "nats://127.0.0.1:4222"
+enabled = true   # default: true when [nats] section is present
+```
+
 ## Config reference
 
 | Field | Type | Default | Description |
@@ -98,6 +136,8 @@ When deployed with `DATA_DIR` env override, files are written under `{data_dir}/
 | `connections[].exchange` | string | required | `binance_spot`, `binance_perp`, `hyperliquid`, or `dydx` |
 | `connections[].symbols` | string[] | required | Trading pairs (format varies by exchange, e.g. `ETHUSDT` / `ETH` / `ETH-USD`) |
 | `connections[].depth_ms` | integer | required | WebSocket update speed in ms (Binance: `100`/`1000`, HL: `500`). Not used for `dydx` — the dYdX WebSocket uses a fixed update interval controlled by the exchange. |
+| `nats.url` | string | — | NATS server URL (e.g. `nats://127.0.0.1:4222`). Omit `[nats]` section to disable. |
+| `nats.enabled` | bool | `true` | Set `false` to disable NATS while keeping the config section. |
 
 ### Environment variables
 
