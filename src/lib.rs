@@ -8,8 +8,6 @@ pub const CHANNEL_BUFFER: usize = 4_096;
 pub mod accumulator;
 pub mod config;
 pub mod connection;
-pub mod connection_dydx;
-pub mod connection_hl;
 pub mod error;
 pub mod exchange;
 pub mod metrics;

@@ -7,9 +7,7 @@ use std::{path::PathBuf, time::Instant};
 use fathom::{
     CHANNEL_BUFFER,
     config::{Config, Exchange},
-    connection::connection_task,
-    connection_dydx::connection_task_dydx,
-    connection_hl::connection_task_hl,
+    connection::{connection_task, connection_task_dydx, connection_task_hl},
     exchange::{BinancePerp, BinanceSpot, Hyperliquid},
     metrics, monitor, nats_sink,
     writer::{raw::RawDiff, snap_1s::run_snap_writer},
