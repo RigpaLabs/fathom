@@ -2,6 +2,12 @@
 name = "fathom"
 version = "0.3.0"
 edition = "2024"
+description = "Multi-exchange L2 order book collector with 1s Parquet snapshots"
+repository = "https://github.com/RigpaLabs/fathom"
+homepage = "https://github.com/RigpaLabs/fathom"
+license = "MIT"
+keywords = ["orderbook", "market-data", "parquet", "websocket", "trading"]
+categories = ["finance", "data-structures"]
 
 [dependencies]
 fathom-types       = { path = "crates/fathom-types" }
