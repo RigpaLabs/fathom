@@ -3,6 +3,8 @@ name = "fathom-types"
 version = "0.1.0"
 edition = "2024"
 description = "Shared types for Fathom L2 order book data"
+repository = "https://github.com/RigpaLabs/fathom"
+license = "MIT"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
