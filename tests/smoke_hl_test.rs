@@ -20,7 +20,7 @@ use helpers::parquet::{collect_parquets, count_rows, read_f32_col, read_f64_col,
 use fathom::{
     accumulator::Snapshot1s,
     config::{ConnectionConfig, Exchange},
-    connection_hl::connection_task_hl,
+    connection::connection_task_hl,
     exchange::Hyperliquid,
     monitor,
     writer::{
