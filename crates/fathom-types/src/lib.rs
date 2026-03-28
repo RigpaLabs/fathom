@@ -58,6 +58,24 @@ pub struct RawDiff {
     pub asks: Vec<(f64, f64)>,
 }
 
+/// Envelope wrapping any payload with metadata for cross-service traceability.
+/// Opt-in — existing consumers can still decode raw payloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope<T> {
+    /// Wire format version (currently 1).
+    pub schema_version: u16,
+    /// Producer identifier (e.g. "fathom-0.3.1").
+    pub producer: String,
+    /// Original exchange event timestamp (microseconds).
+    pub source_ts_us: i64,
+    /// Timestamp when the producer ingested the event (microseconds).
+    pub ingest_ts_us: i64,
+    /// Optional correlation ID for request tracing.
+    pub correlation_id: Option<String>,
+    /// The actual payload.
+    pub payload: T,
+}
+
 /// Encode a value into the Fathom NATS wire format: `[version][bincode]`.
 pub fn wire_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, bincode::Error> {
     let payload = bincode::serialize(value)?;
@@ -169,5 +187,22 @@ mod tests {
     fn empty_payload() {
         let result = wire_decode::<u32>(&[]);
         assert!(matches!(result, Err(WireDecodeError::Empty)));
+    }
+
+    #[test]
+    fn envelope_roundtrip() {
+        let envelope = EventEnvelope {
+            schema_version: 1,
+            producer: "fathom-test".into(),
+            source_ts_us: 1234567890,
+            ingest_ts_us: 1234567891,
+            correlation_id: None,
+            payload: "test data".to_string(),
+        };
+        let bytes = wire_encode(&envelope).unwrap();
+        let decoded: EventEnvelope<String> = wire_decode(&bytes).unwrap();
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.producer, "fathom-test");
+        assert_eq!(decoded.payload, "test data");
     }
 }
