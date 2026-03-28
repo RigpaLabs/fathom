@@ -20,6 +20,23 @@ use fathom::accumulator::Snapshot1s;
 
 const RAW_FLUSH_INTERVAL_S: u64 = 5;
 
+/// Task supervision policy
+///
+/// | Task                | Failure policy                                       |
+/// |---------------------|------------------------------------------------------|
+/// | Connection tasks    | Restart with backoff (handled inside connection_task)|
+/// | Raw Parquet writer  | **Fatal** — process exit                             |
+/// | Snap Parquet writer | **Fatal** — process exit                             |
+/// | NATS sink           | Warn + continue                                      |
+/// | Metrics server      | Warn + continue                                      |
+/// | Monitor             | Warn + continue                                      |
+///
+/// Writers are the core data durability path. If either dies unexpectedly
+/// (e.g. disk full, IO error, panic), we cannot silently lose data — so we
+/// treat writer exit as fatal and let the process restart via Docker/systemd.
+///
+/// NATS, metrics, and monitor are best-effort ancillaries. Their failure does
+/// not compromise data integrity, so we log a warning and keep running.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -54,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let snap_rx_parquet = snap_tx.subscribe();
 
     // Metrics: Prometheus /metrics + /health HTTP server
+    // Failure policy: Warn + continue (ancillary, does not affect data integrity)
     let metrics_handle_data = metrics::new_metrics();
     let metrics_server_handle = tokio::spawn(metrics::run_metrics_server(
         metrics_handle_data.registry.clone(),
@@ -64,26 +82,29 @@ async fn main() -> anyhow::Result<()> {
         start,
     ));
 
-    let raw_handle = tokio::spawn(fathom::writer::raw::run_raw_writer(
+    // Writers: Fatal on unexpected exit — losing a writer means silent data loss.
+    let mut raw_handle = tokio::spawn(fathom::writer::raw::run_raw_writer(
         data_dir.clone(),
         raw_rx_parquet,
         RAW_FLUSH_INTERVAL_S,
         cfg.raw_rotate_hours,
         metrics_handle_data.metrics.clone(),
     ));
-    let snap_handle = tokio::spawn(run_snap_writer(
+    let mut snap_handle = tokio::spawn(run_snap_writer(
         data_dir.clone(),
         snap_rx_parquet,
         cancel.clone(),
         metrics_handle_data.metrics.clone(),
     ));
+
+    // Monitor: Warn + continue (health tracking only, not on the write path)
     let mon_handle = tokio::spawn(monitor::run_monitor(
         data_dir.clone(),
         monitor_state.clone(),
         start,
     ));
 
-    // Optionally start the NATS sink
+    // NATS sink: Warn + continue (best-effort streaming, not required for durability)
     let nats_handle = if let Some(nats_cfg) = cfg.nats.as_ref().filter(|c| c.enabled) {
         let raw_rx_nats = raw_tx.subscribe();
         let snap_rx_nats = snap_tx.subscribe();
@@ -149,18 +170,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Handle both SIGINT (Ctrl-C) and SIGTERM (Docker stop).
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate())?;
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
+    // Supervision loop: run until a shutdown signal OR a fatal writer exit.
+    //
+    // Writers (raw + snap Parquet) are watched directly. If either exits before
+    // a clean shutdown signal, we log FATAL and call `process::exit(1)`.
+    // The container orchestrator (Docker restart / systemd) will restart us.
+    //
+    // On a clean signal we fall through to the graceful drain below.
+    //
+    // NATS, metrics, and monitor are intentionally NOT supervised here;
+    // their failure is non-fatal. Connection tasks manage their own restart loop.
+    wait_for_shutdown_or_writer_exit(&mut raw_handle, &mut snap_handle, &cancel).await?;
 
     info!("shutting down fathom...");
 
@@ -188,6 +208,60 @@ async fn main() -> anyhow::Result<()> {
     metrics_sync_handle.abort();
 
     info!("shutdown complete");
+
+    Ok(())
+}
+
+/// Watches Parquet writer tasks and the OS shutdown signal concurrently.
+///
+/// Returns `Ok(())` on a clean shutdown signal (SIGINT / SIGTERM / Ctrl-C),
+/// allowing the caller to proceed with the graceful buffer flush.
+///
+/// If either writer exits before a shutdown signal, this function logs a FATAL
+/// message and calls [`std::process::exit`]`(1)`. Writers are the sole
+/// mechanism for data durability; continuing without a working writer would
+/// silently lose data, which is worse than a visible crash-restart cycle.
+/// The container orchestrator (Docker `restart: unless-stopped` / systemd)
+/// will restart the process automatically.
+async fn wait_for_shutdown_or_writer_exit(
+    raw_handle: &mut tokio::task::JoinHandle<()>,
+    snap_handle: &mut tokio::task::JoinHandle<()>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = &mut *raw_handle => {
+                tracing::error!("FATAL: raw parquet writer exited unexpectedly: {:?}", result);
+                std::process::exit(1);
+            }
+            result = &mut *snap_handle => {
+                tracing::error!("FATAL: snap parquet writer exited unexpectedly: {:?}", result);
+                std::process::exit(1);
+            }
+            _ = cancel.cancelled() => {}
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            result = &mut *raw_handle => {
+                tracing::error!("FATAL: raw parquet writer exited unexpectedly: {:?}", result);
+                std::process::exit(1);
+            }
+            result = &mut *snap_handle => {
+                tracing::error!("FATAL: snap parquet writer exited unexpectedly: {:?}", result);
+                std::process::exit(1);
+            }
+            _ = cancel.cancelled() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
 
     Ok(())
 }
