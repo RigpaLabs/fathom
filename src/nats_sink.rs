@@ -26,7 +26,7 @@ pub async fn run(
         }
     };
 
-    let js = jetstream::new(client.clone());
+    let js = jetstream::new(client);
 
     if let Err(e) = ensure_streams(&js).await {
         warn!("NATS stream setup failed: {e}. Running without NATS.");
@@ -35,8 +35,8 @@ pub async fn run(
 
     info!("NATS sink connected to {}", config.url);
 
-    let snap_handle = tokio::spawn(publish_snapshots(js, snap_rx));
-    let raw_handle = tokio::spawn(publish_depth(client, raw_rx));
+    let snap_handle = tokio::spawn(publish_snapshots(js.clone(), snap_rx));
+    let raw_handle = tokio::spawn(publish_depth(js, raw_rx));
 
     let _ = tokio::join!(snap_handle, raw_handle);
     info!("NATS sink stopped");
@@ -99,17 +99,20 @@ async fn publish_snapshots(js: jetstream::Context, mut rx: broadcast::Receiver<S
     }
 }
 
-async fn publish_depth(client: async_nats::Client, mut rx: broadcast::Receiver<RawDiff>) {
+async fn publish_depth(js: jetstream::Context, mut rx: broadcast::Receiver<RawDiff>) {
     loop {
         match rx.recv().await {
             Ok(diff) => {
                 let subject = depth_subject(&diff.exchange, &diff.symbol);
                 match wire_encode(&diff) {
-                    Ok(payload) => {
-                        if let Err(e) = client.publish(subject, payload.into()).await {
-                            warn!("NATS depth publish error: {e}");
+                    Ok(payload) => match js.publish(subject, payload.into()).await {
+                        Ok(ack_future) => {
+                            if let Err(e) = ack_future.await {
+                                warn!("NATS depth ACK error: {e}");
+                            }
                         }
-                    }
+                        Err(e) => warn!("NATS depth publish error: {e}"),
+                    },
                     Err(e) => warn!("depth encode error: {e}"),
                 }
             }
