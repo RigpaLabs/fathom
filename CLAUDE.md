@@ -45,7 +45,7 @@ All paths → two parallel writers + optional NATS sink:
 
 Optional NATS streaming (src/nats_sink.rs):
   1s snap   → fathom.v1.{exchange}.{symbol}.snapshot  (FATHOM_SNAPSHOTS, file storage, critical)
-  raw diff  → fathom.v1.{exchange}.{symbol}.depth     (FATHOM_DEPTH, memory storage, best-effort)
+  raw diff  → fathom.v1.{exchange}.{symbol}.depth     (FATHOM_DEPTH, file storage, 1h retention)
 ```
 
 **1s snapshot columns:** `ts_us`, `exchange`, `symbol`, `bid_px_0..9`, `ask_px_0..9`, `bid_sz_0..9`, `ask_sz_0..9`,
