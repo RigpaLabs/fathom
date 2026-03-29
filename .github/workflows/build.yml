@@ -1,4 +1,4 @@
-name: Build & Push
+name: Build
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   build:
-    name: Build & Push
+    name: Build
     needs: ci
     runs-on: ubuntu-24.04-arm
     permissions:
@@ -56,6 +56,7 @@ jobs:
         with:
           context: .
           push: true
+          no-cache: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
