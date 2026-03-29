@@ -1,4 +1,4 @@
-name: Build & Push
+name: Build & Deploy
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ on:
     branches: [main]
     paths:
       - "src/**"
+      - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
@@ -19,7 +20,7 @@ env:
   REGISTRY: ghcr.io
 
 concurrency:
-  group: build
+  group: deploy
   cancel-in-progress: false
 
 jobs:
@@ -68,5 +69,30 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           build-args: |
             COMMIT_SHA=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to fathom-tokyo
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Setup SSH
+        run: |
+          install -m 600 -D /dev/null ~/.ssh/id_rsa
+          echo "${{ secrets.FATHOM_TOKYO_SSH_KEY }}" > ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.FATHOM_TOKYO_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy via compose
+        run: |
+          ssh ${{ secrets.FATHOM_TOKYO_USER }}@${{ secrets.FATHOM_TOKYO_HOST }} "
+            set -e
+            cd ${{ secrets.BOTS_COMPOSE_DIR }}
+
+            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            FATHOM_TAG=${{ needs.build.outputs.version }} docker compose pull fathom
+            FATHOM_TAG=${{ needs.build.outputs.version }} docker compose up -d fathom
+
+            echo 'Deploy OK: ${{ needs.build.outputs.version }}'
+            docker ps --filter name=fathom --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+          "
