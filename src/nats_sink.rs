@@ -56,11 +56,11 @@ async fn ensure_streams(js: &jetstream::Context) -> Result<(), async_nats::Error
     })
     .await?;
 
-    // Raw depth diffs: memory storage, 1h retention, 500 MB limit
+    // Raw depth diffs: file storage, 1h retention, 500 MB limit
     js.get_or_create_stream(stream::Config {
         name: "FATHOM_DEPTH".into(),
         subjects: vec!["fathom.v1.*.*.depth".into()],
-        storage: stream::StorageType::Memory,
+        storage: stream::StorageType::File,
         max_age: std::time::Duration::from_secs(3600),
         max_bytes: 500 * 1024 * 1024,
         ..Default::default()
