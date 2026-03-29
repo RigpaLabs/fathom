@@ -1,14 +1,6 @@
 name: Build
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "Dockerfile"
   workflow_dispatch:
     inputs:
       version:
