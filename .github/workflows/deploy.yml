@@ -7,14 +7,6 @@ on:
         description: "Version tag (leave blank for auto: vYYYYMMDD-sha)"
         required: false
         default: ""
-  push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "Dockerfile"
 
 env:
   REGISTRY: ghcr.io
