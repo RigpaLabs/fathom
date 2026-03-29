@@ -1,6 +1,14 @@
 name: Build
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
   workflow_dispatch:
     inputs:
       version:
@@ -53,12 +61,24 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           push: true
           no-cache: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           build-args: |
             COMMIT_SHA=${{ github.sha }}
+
+      - name: Trigger infra promotion
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_PROMOTE_PAT }}
+        run: |
+          gh workflow run promote-image.yml \
+            --repo RigpaLabs/infra \
+            --ref main \
+            -f service=fathom \
+            -f digest=${{ steps.build.outputs.digest }} \
+            -f tag=${{ steps.version.outputs.version }}
