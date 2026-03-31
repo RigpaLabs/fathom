@@ -17,7 +17,7 @@ WARN NATS depth ACK error: timed out: didn't receive ack in time
 WARN NATS depth sink lagged by 697 messages
 ```
 
-The system recovered on its own. No data loss, no OOM kill. But 97.6% is not a margin you want to rely on.
+The system recovered on its own. No OOM kill, no process crash, Parquet output intact. But 697 NATS depth messages were permanently skipped (broadcast `Lagged` means the consumer fell behind and those messages are gone). Downstream consumers saw a gap in the depth stream. 97.6% is not a margin you want to rely on.
 
 ## Where the memory goes
 
@@ -72,7 +72,7 @@ Parquet flush starts (multiple symbols aligned)
 
 The disk I/O is low in steady state (1-2% utilization). The bottleneck is not the disk itself but tokio task scheduling under memory pressure. Parquet serialization and NATS publishing compete for the same thread pool. When one spikes, the other starves.
 
-Fathom uses `try_send` (non-blocking) on its internal broadcast channel ([ADR-002](../adr/002-drop-on-backpressure.md)). If a writer can't keep up, events drop instead of blocking the WebSocket event loop. This keeps connections alive during pressure. NATS publishes lag but catch up once the flush completes.
+Fathom uses `tokio::sync::broadcast` for its internal fan-out channel ([ADR-002](../adr/002-drop-on-backpressure.md)). Broadcast `send` is non-blocking, but if a receiver falls behind by more than the channel capacity, it gets a `Lagged(n)` error and those `n` messages are permanently skipped. This keeps the WebSocket event loop and other consumers running. The cost: slow consumers lose messages instead of blocking fast ones.
 
 ## The numbers
 
