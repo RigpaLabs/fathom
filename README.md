@@ -106,9 +106,9 @@ Wire format: `[version: u8][bincode payload]` (version = 1). Types defined in `c
 | Stream | Subjects | Storage | Max age | Max bytes | Durability |
 |--------|----------|---------|---------|-----------|------------|
 | `FATHOM_SNAPSHOTS` | `fathom.v1.*.*.snapshot` | File | 24 h | 200 MB | **Critical** — JetStream ACK confirms durable write |
-| `FATHOM_DEPTH` | `fathom.v1.*.*.depth` | Memory | 1 h | 500 MB | **Best-effort** — plain publish, no ACK |
+| `FATHOM_DEPTH` | `fathom.v1.*.*.depth` | File | 1 h | 500 MB | **Durable** — JetStream ACK, file storage persists across restarts |
 
-**Critical vs best-effort:** Snapshot publishing uses the JetStream double-await pattern (send request → await ACK) to confirm each message is durably stored on disk. Depth publishing uses plain NATS `publish()` with no ACK — messages are held in memory for real-time subscribers but may be lost on NATS restart. Both log warnings on failure without blocking the main pipeline.
+Both streams use the JetStream double-await pattern (send request → await ACK) to confirm each message is durably stored. Both use file-backed storage that survives NATS restarts. Publish failures log warnings without blocking the main pipeline.
 
 ### Timestamp semantics
 
@@ -287,3 +287,7 @@ Key architectural trade-offs are documented as ADRs in [`docs/adr/`](docs/adr/):
 | [004](docs/adr/004-order-book-invariants-and-gap-semantics.md) | Order book invariants and gap semantics |
 | [005](docs/adr/005-acceptable-data-loss-window.md) | Acceptable data loss window by component |
 | [006](docs/adr/006-completeness-vs-uptime.md) | Completeness vs uptime trade-off |
+
+## Engineering Blog
+
+Production insights from running fathom at scale: [`docs/engineering/`](docs/engineering/)

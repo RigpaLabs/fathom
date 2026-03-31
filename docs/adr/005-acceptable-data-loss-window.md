@@ -50,7 +50,7 @@ Docker's 30-second grace period is sufficient for writers to drain and flush.
 
 ### NATS sink
 
-NATS publishing is fire-and-forget for depth diffs (plain `publish`, no ACK) and double-await for snapshots (JetStream ACK). If NATS is down, messages are dropped — the Parquet writers are the durable store, not NATS.
+Both NATS streams (snapshots and depth diffs) use JetStream with file-backed storage and double-await ACK. If NATS is down or the broadcast channel lags, messages are dropped on the fathom side. The Parquet writers are the durable store, not NATS. Under memory pressure, the NATS depth sink can lag behind the broadcast channel, causing permanent message gaps for downstream consumers (see [engineering blog: memory pressure incident](../engineering/2026-03-31-memory-pressure-nats-backpressure.md)).
 
 ## Consequences
 
