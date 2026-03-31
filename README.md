@@ -226,6 +226,28 @@ cargo test --test smoke_dydx_test -- --include-ignored --test-threads 1 --nocapt
 | Integration | 2 | Multi-component pipeline tests |
 | Smoke | 3 | Real Binance/HL/dYdX (`#[ignore]`, manual only) |
 
+## Non-goals
+
+What fathom deliberately does **not** do:
+
+- **Order routing or execution** — fathom is a passive collector, never places orders
+- **Real-time alerting** — use external alerting on `/metrics` or `status.json`
+- **Cross-exchange arbitrage signal generation** — that's [sigil](https://github.com/RigpaLabs/sigil)'s job
+- **Data normalization beyond raw L2 diffs and 1s snapshots** — consumers handle further aggregation
+
+## Roadmap
+
+### Near-term
+
+- [ ] Additional venues (Bybit, OKX)
+- [ ] OHLCV aggregation writer (5m, 1h)
+- [ ] Schema versioning for Parquet columns (see [docs/schema-versioning.md](docs/schema-versioning.md))
+
+### Long-term
+
+- [ ] Sigil integration: NATS → signal engine
+- [ ] Replay mode: serve historical snapshots via HTTP
+
 ## Design notes
 
 ### Binance: spot vs perp gap detection
