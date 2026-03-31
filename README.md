@@ -42,7 +42,7 @@ All paths → two parallel writers:
             raw/*.parquet          1s/*.parquet
 ```
 
-**Backpressure:** both channels use `try_send` — if a writer is full, the event is dropped with a warning rather than blocking the WS event loop.
+**Backpressure:** broadcast channels overwrite the oldest unread messages for slow subscribers, who receive `Lagged(n)` warnings — the producer never blocks the WS event loop. See [ADR-002](docs/adr/002-drop-on-backpressure.md).
 
 ## Quick start
 
@@ -251,4 +251,17 @@ Each Binance connection spawns a forwarder that owns the socket, handles Ping/Po
 
 ### 1s writer periodic flush
 
-`ArrowWriter` buffers rows in a row group until `flush()` or `finish()`. With 1 row/sec the default 1M-row threshold would never trigger, so the writer explicitly flushes every 3600 rows (~1 hour). This limits worst-case data loss on crash to 1 hour of 1s data instead of an entire day.
+`ArrowWriter` buffers rows in a row group until `flush()` or `finish()`. With 1 row/sec the default 1M-row threshold would never trigger, so the writer explicitly flushes every 300 rows (~5 minutes). This limits worst-case data loss on crash to ~5 minutes of 1s data instead of an entire day.
+
+## Architecture Decision Records
+
+Key architectural trade-offs are documented as ADRs in [`docs/adr/`](docs/adr/):
+
+| ADR | Decision |
+|-----|----------|
+| [001](docs/adr/001-broadcast-channel-over-mpsc.md) | Broadcast channel over mpsc/worker pool |
+| [002](docs/adr/002-drop-on-backpressure.md) | Drop on backpressure over block/retry |
+| [003](docs/adr/003-btreemap-for-order-book.md) | BTreeMap for order book |
+| [004](docs/adr/004-order-book-invariants-and-gap-semantics.md) | Order book invariants and gap semantics |
+| [005](docs/adr/005-acceptable-data-loss-window.md) | Acceptable data loss window by component |
+| [006](docs/adr/006-completeness-vs-uptime.md) | Completeness vs uptime trade-off |
