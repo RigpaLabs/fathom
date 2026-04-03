@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag (leave blank for auto: vYYYYMMDD-sha)"
+        description: "Version tag (leave blank for auto)"
         required: false
         default: ""
+  push:
+    tags: ['v*']
 
 env:
   REGISTRY: ghcr.io
@@ -39,6 +41,8 @@ jobs:
         run: |
           if [[ -n "${{ inputs.version }}" ]]; then
             VERSION="${{ inputs.version }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
           else
             VERSION="v$(date +%Y%m%d)-${GITHUB_SHA::7}"
           fi

@@ -1,0 +1,277 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Auto-version & Tag
+    if: "!startsWith(github.event.head_commit.message, 'chore: bump version')"
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.bump.outputs.new_version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      changelog: ${{ steps.bump.outputs.changelog }}
+      skipped: ${{ steps.bump.outputs.skipped }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Get latest tag
+        id: latest_tag
+        run: |
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest tag: $TAG"
+
+      - name: Parse commits & determine bump
+        id: bump
+        run: |
+          LATEST_TAG="${{ steps.latest_tag.outputs.tag }}"
+          echo "Analyzing commits since $LATEST_TAG..."
+
+          COMMITS=$(git log "$LATEST_TAG"..HEAD --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")
+
+          if [ -z "$COMMITS" ]; then
+            echo "No new commits since $LATEST_TAG"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Commits:"
+          echo "$COMMITS"
+
+          BUMP="none"
+          CHANGELOG=""
+
+          # Check for breaking changes (minor while 0.x)
+          if echo "$COMMITS" | grep -qE '^(feat|fix|refactor|perf)!:|^FAT-[0-9]+ (feat|fix|refactor|perf)!:|BREAKING CHANGE:'; then
+            BUMP="minor"
+          fi
+
+          # Check for features (minor bump)
+          FEATS=$(echo "$COMMITS" | grep -E '^feat(\(.+\))?:|^FAT-[0-9]+ feat(\(.+\))?:' || true)
+          if [ -n "$FEATS" ]; then
+            BUMP="minor"
+            while IFS= read -r line; do
+              [ -n "$line" ] && CHANGELOG="${CHANGELOG:+${CHANGELOG}\n}- ${line}"
+            done <<< "$FEATS"
+          fi
+
+          # Check for fixes (patch bump, unless already minor)
+          FIXES=$(echo "$COMMITS" | grep -E '^fix(\(.+\))?:|^FAT-[0-9]+ fix(\(.+\))?:' || true)
+          if [ -n "$FIXES" ]; then
+            [ "$BUMP" = "none" ] && BUMP="patch"
+            while IFS= read -r line; do
+              [ -n "$line" ] && CHANGELOG="${CHANGELOG:+${CHANGELOG}\n}- ${line}"
+            done <<< "$FIXES"
+          fi
+
+          # Check for perf (patch bump)
+          PERFS=$(echo "$COMMITS" | grep -E '^perf(\(.+\))?:|^FAT-[0-9]+ perf(\(.+\))?:' || true)
+          if [ -n "$PERFS" ]; then
+            [ "$BUMP" = "none" ] && BUMP="patch"
+            while IFS= read -r line; do
+              [ -n "$line" ] && CHANGELOG="${CHANGELOG:+${CHANGELOG}\n}- ${line}"
+            done <<< "$PERFS"
+          fi
+
+          # Squash merge fallback: "FAT-XX: description" without conventional prefix
+          SQUASH_FATS=$(echo "$COMMITS" | grep -E '^FAT-[0-9]+:' || true)
+          if [ -n "$SQUASH_FATS" ]; then
+            [ "$BUMP" = "none" ] && BUMP="patch"
+            while IFS= read -r line; do
+              [ -n "$line" ] && CHANGELOG="${CHANGELOG:+${CHANGELOG}\n}- ${line}"
+            done <<< "$SQUASH_FATS"
+          fi
+
+          # Other conventional commits (docs, refactor, chore, ci, test) — no version bump
+          OTHERS=$(echo "$COMMITS" | grep -E '^(docs|refactor|chore|ci|test|style)(\(.+\))?:|^FAT-[0-9]+ (docs|refactor|chore|ci|test|style)(\(.+\))?:' || true)
+          if [ -n "$OTHERS" ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] && CHANGELOG="${CHANGELOG:+${CHANGELOG}\n}- ${line}"
+            done <<< "$OTHERS"
+          fi
+
+          if [ "$BUMP" = "none" ]; then
+            echo "No version-bumping commits found"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT="${LATEST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          TAG="v${NEW_VERSION}"
+
+          echo "Bump: $BUMP ($CURRENT -> $NEW_VERSION)"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+          printf '%b\n' "$CHANGELOG" > /tmp/changelog.md
+          {
+            echo 'changelog<<CHANGELOG_EOF'
+            cat /tmp/changelog.md
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        if: steps.bump.outputs.skipped != 'true'
+        run: rustup show
+
+      - name: Bump Cargo.toml, tag & push
+        if: steps.bump.outputs.skipped != 'true'
+        run: |
+          NEW_VERSION="${{ steps.bump.outputs.new_version }}"
+          TAG="${{ steps.bump.outputs.tag }}"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          sed -i "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+
+          cargo generate-lockfile
+
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to v${NEW_VERSION}"
+
+          git tag "$TAG"
+
+          git push origin main "$TAG"
+          echo "Bumped to ${NEW_VERSION}, tagged ${TAG}, pushed"
+
+      - name: Extract Linear issue references
+        if: steps.bump.outputs.skipped != 'true'
+        id: linear_issues
+        run: |
+          LATEST_TAG="${{ steps.latest_tag.outputs.tag }}"
+
+          ISSUES=$(git log "$LATEST_TAG"..HEAD --pretty=format:"%s %b" | grep -oE 'FAT-[0-9]+' | sort -u | tr '\n' ',' | sed 's/,$//')
+          echo "issues=$ISSUES" >> "$GITHUB_OUTPUT"
+          echo "Linear issues in this release: $ISSUES"
+
+      - name: Label Linear issues with release version
+        if: steps.bump.outputs.skipped != 'true' && steps.linear_issues.outputs.issues != ''
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          TAG="${{ steps.bump.outputs.tag }}"
+          ISSUES="${{ steps.linear_issues.outputs.issues }}"
+          TEAM_ID="${{ vars.LINEAR_TEAM_ID }}"
+          if [ -z "$TEAM_ID" ]; then
+            echo "LINEAR_TEAM_ID repository variable not set, skipping Linear labeling"
+            exit 0
+          fi
+
+          if [ -z "$LINEAR_API_KEY" ]; then
+            echo "LINEAR_API_KEY not set, skipping Linear labeling"
+            exit 0
+          fi
+
+          LABEL_NAME="released:${TAG}"
+
+          LABEL_RESULT=$(curl -s -X POST https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"query\": \"mutation { issueLabelCreate(input: { name: \\\"${LABEL_NAME}\\\", teamId: \\\"${TEAM_ID}\\\", color: \\\"#10B981\\\" }) { success issueLabel { id } } }\"}")
+
+          LABEL_ID=$(echo "$LABEL_RESULT" | jq -r '.data.issueLabelCreate.issueLabel.id // empty')
+
+          if [ -z "$LABEL_ID" ]; then
+            LABEL_ID=$(curl -s -X POST https://api.linear.app/graphql \
+              -H "Authorization: $LINEAR_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"query\": \"{ issueLabels(filter: { name: { eq: \\\"${LABEL_NAME}\\\" }, team: { id: { eq: \\\"${TEAM_ID}\\\" } } }) { nodes { id } } }\"}" \
+              | jq -r '.data.issueLabels.nodes[0].id // empty')
+          fi
+
+          if [ -z "$LABEL_ID" ]; then
+            echo "Could not create or find label ${LABEL_NAME}, skipping"
+            exit 0
+          fi
+
+          echo "Label: ${LABEL_NAME} (${LABEL_ID})"
+
+          IFS=',' read -ra ISSUE_ARRAY <<< "$ISSUES"
+          for ISSUE_ID in "${ISSUE_ARRAY[@]}"; do
+            ISSUE_UUID=$(curl -s -X POST https://api.linear.app/graphql \
+              -H "Authorization: $LINEAR_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"query\": \"{ issues(filter: { team: { id: { eq: \\\"${TEAM_ID}\\\" } }, number: { eq: ${ISSUE_ID#FAT-} } }) { nodes { id } } }\"}" \
+              | jq -r '.data.issues.nodes[0].id // empty')
+
+            if [ -n "$ISSUE_UUID" ]; then
+              curl -s -X POST https://api.linear.app/graphql \
+                -H "Authorization: $LINEAR_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "{\"query\": \"mutation { issueAddLabel(id: \\\"${ISSUE_UUID}\\\", labelId: \\\"${LABEL_ID}\\\") { success } }\"}" > /dev/null
+              echo "  Labeled ${ISSUE_ID} with ${LABEL_NAME}"
+            else
+              echo "  Issue ${ISSUE_ID} not found, skipping"
+            fi
+          done
+
+  release:
+    name: Create GitHub Release
+    needs: [version]
+    if: needs.version.outputs.skipped != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log "$PREV_TAG".."$TAG" --pretty=format:"- %s" | grep -E '^- (feat|fix|perf|refactor|docs|chore|ci|test|FAT-)' || true)
+          else
+            COMMITS=$(git log --pretty=format:"- %s" | grep -E '^- (feat|fix|perf|refactor|docs|chore|ci|test|FAT-)' || true)
+          fi
+
+          {
+            echo 'notes<<NOTES_EOF'
+            echo "## What's Changed"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+            echo 'NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          body: ${{ steps.notes.outputs.notes }}
+          draft: false
+          prerelease: false
