@@ -60,6 +60,21 @@ struct BinanceError {
     msg: String,
 }
 
+/// Parse a Binance combined-stream WebSocket message into its component parts.
+///
+/// Returns `(stream_name, depth_update, bids, asks)` or `None` if parsing fails.
+/// Exposed for benchmarks.
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub fn parse_combined_message(
+    text: &str,
+) -> Option<(String, DepthUpdate, Vec<(f64, f64)>, Vec<(f64, f64)>)> {
+    let combined: WsCombined = serde_json::from_str(text).ok()?;
+    let depth: DepthUpdate = serde_json::from_value(combined.data).ok()?;
+    let (bids, asks, _errs) = parse_depth_levels(&depth);
+    Some((combined.stream, depth, bids, asks))
+}
+
 pub fn parse_level(v: &[serde_json::Value; 2]) -> Option<(f64, f64)> {
     let px = v[0].as_str()?.parse::<f64>().ok()?;
     let qty = v[1].as_str()?.parse::<f64>().ok()?;
