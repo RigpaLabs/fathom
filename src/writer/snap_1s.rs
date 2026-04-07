@@ -22,6 +22,155 @@ fn date_from_ts_us(ts_us: i64) -> String {
         .to_string()
 }
 
+/// Build an Arrow RecordBatch from a slice of Snapshot1s rows.
+fn build_snap_record_batch(buffer: &[Snapshot1s]) -> Result<arrow_array::RecordBatch> {
+    let schema = SchemaRef::new(snap_1s_schema().clone());
+
+    let ts_us: Vec<i64> = buffer.iter().map(|s| s.ts_us).collect();
+    let exchanges: Vec<&str> = buffer.iter().map(|s| s.exchange.as_str()).collect();
+    let symbols: Vec<&str> = buffer.iter().map(|s| s.symbol.as_str()).collect();
+
+    // Helper: extract top-N price or size from bids/asks
+    let bid_px: Vec<[Option<f64>; 10]> = buffer
+        .iter()
+        .map(|s| {
+            let mut arr = [None; 10];
+            for (i, (px, _)) in s.bids.iter().enumerate().take(10) {
+                arr[i] = Some(*px);
+            }
+            arr
+        })
+        .collect();
+    let bid_sz: Vec<[Option<f64>; 10]> = buffer
+        .iter()
+        .map(|s| {
+            let mut arr = [None; 10];
+            for (i, (_, sz)) in s.bids.iter().enumerate().take(10) {
+                arr[i] = Some(*sz);
+            }
+            arr
+        })
+        .collect();
+    let ask_px: Vec<[Option<f64>; 10]> = buffer
+        .iter()
+        .map(|s| {
+            let mut arr = [None; 10];
+            for (i, (px, _)) in s.asks.iter().enumerate().take(10) {
+                arr[i] = Some(*px);
+            }
+            arr
+        })
+        .collect();
+    let ask_sz: Vec<[Option<f64>; 10]> = buffer
+        .iter()
+        .map(|s| {
+            let mut arr = [None; 10];
+            for (i, (_, sz)) in s.asks.iter().enumerate().take(10) {
+                arr[i] = Some(*sz);
+            }
+            arr
+        })
+        .collect();
+
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(ts_us)) as ArrayRef,
+        Arc::new(StringArray::from(exchanges)) as ArrayRef,
+        Arc::new(StringArray::from(symbols)) as ArrayRef,
+    ];
+
+    // bid_px_0..9
+    for i in 0..10 {
+        let col: Vec<Option<f64>> = bid_px.iter().map(|r| r[i]).collect();
+        columns.push(Arc::new(Float64Array::from(col)) as ArrayRef);
+    }
+    // ask_px_0..9
+    for i in 0..10 {
+        let col: Vec<Option<f64>> = ask_px.iter().map(|r| r[i]).collect();
+        columns.push(Arc::new(Float64Array::from(col)) as ArrayRef);
+    }
+    // bid_sz_0..9
+    for i in 0..10 {
+        let col: Vec<Option<f64>> = bid_sz.iter().map(|r| r[i]).collect();
+        columns.push(Arc::new(Float64Array::from(col)) as ArrayRef);
+    }
+    // ask_sz_0..9
+    for i in 0..10 {
+        let col: Vec<Option<f64>> = ask_sz.iter().map(|r| r[i]).collect();
+        columns.push(Arc::new(Float64Array::from(col)) as ArrayRef);
+    }
+
+    let mid_px: Vec<Option<f64>> = buffer.iter().map(|s| s.mid_px).collect();
+    let microprice: Vec<Option<f64>> = buffer.iter().map(|s| s.microprice).collect();
+    let spread_bps: Vec<Option<f32>> = buffer.iter().map(|s| s.spread_bps).collect();
+    let imb_l1: Vec<Option<f32>> = buffer.iter().map(|s| s.imbalance_l1).collect();
+    let imb_l5: Vec<Option<f32>> = buffer.iter().map(|s| s.imbalance_l5).collect();
+    let imb_l10: Vec<Option<f32>> = buffer.iter().map(|s| s.imbalance_l10).collect();
+    let bid_d5: Vec<f64> = buffer.iter().map(|s| s.bid_depth_l5).collect();
+    let bid_d10: Vec<f64> = buffer.iter().map(|s| s.bid_depth_l10).collect();
+    let ask_d5: Vec<f64> = buffer.iter().map(|s| s.ask_depth_l5).collect();
+    let ask_d10: Vec<f64> = buffer.iter().map(|s| s.ask_depth_l10).collect();
+    let ofi: Vec<f64> = buffer.iter().map(|s| s.ofi_l1).collect();
+    let churn_bid: Vec<f64> = buffer.iter().map(|s| s.churn_bid).collect();
+    let churn_ask: Vec<f64> = buffer.iter().map(|s| s.churn_ask).collect();
+    let sigma: Vec<f32> = buffer.iter().map(|s| s.intra_sigma).collect();
+    let open_px: Vec<Option<f64>> = buffer.iter().map(|s| s.open_px).collect();
+    let close_px: Vec<Option<f64>> = buffer.iter().map(|s| s.close_px).collect();
+    let n_events: Vec<u32> = buffer.iter().map(|s| s.n_events).collect();
+    let volume_delta: Vec<f64> = buffer.iter().map(|s| s.volume_delta).collect();
+    let buy_vol: Vec<f64> = buffer.iter().map(|s| s.buy_vol).collect();
+    let sell_vol: Vec<f64> = buffer.iter().map(|s| s.sell_vol).collect();
+    let trade_count: Vec<u32> = buffer.iter().map(|s| s.trade_count).collect();
+
+    columns.extend([
+        Arc::new(Float64Array::from(mid_px)) as ArrayRef,
+        Arc::new(Float64Array::from(microprice)) as ArrayRef,
+        Arc::new(Float32Array::from(spread_bps)) as ArrayRef,
+        Arc::new(Float32Array::from(imb_l1)) as ArrayRef,
+        Arc::new(Float32Array::from(imb_l5)) as ArrayRef,
+        Arc::new(Float32Array::from(imb_l10)) as ArrayRef,
+        Arc::new(Float64Array::from(bid_d5)) as ArrayRef,
+        Arc::new(Float64Array::from(bid_d10)) as ArrayRef,
+        Arc::new(Float64Array::from(ask_d5)) as ArrayRef,
+        Arc::new(Float64Array::from(ask_d10)) as ArrayRef,
+        Arc::new(Float64Array::from(ofi)) as ArrayRef,
+        Arc::new(Float64Array::from(churn_bid)) as ArrayRef,
+        Arc::new(Float64Array::from(churn_ask)) as ArrayRef,
+        Arc::new(Float32Array::from(sigma)) as ArrayRef,
+        Arc::new(Float64Array::from(open_px)) as ArrayRef,
+        Arc::new(Float64Array::from(close_px)) as ArrayRef,
+        Arc::new(UInt32Array::from(n_events)) as ArrayRef,
+        Arc::new(Float64Array::from(volume_delta)) as ArrayRef,
+        Arc::new(Float64Array::from(buy_vol)) as ArrayRef,
+        Arc::new(Float64Array::from(sell_vol)) as ArrayRef,
+        Arc::new(UInt32Array::from(trade_count)) as ArrayRef,
+    ]);
+
+    Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
+}
+
+/// Encode a buffer of snapshots into an in-memory Parquet blob (Snappy-compressed).
+///
+/// Used by benchmarks to measure the full Arrow→Parquet encode path without disk I/O
+/// variance. Returns the raw Parquet bytes.
+#[doc(hidden)]
+pub fn write_snap_to_memory(buffer: &[Snapshot1s]) -> Result<Vec<u8>> {
+    use std::io::Cursor;
+    let cursor = Cursor::new(Vec::new());
+    let schema = SchemaRef::new(snap_1s_schema().clone());
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_size(4096)
+        .build();
+    let mut writer = ArrowWriter::try_new(cursor, schema, Some(props))?;
+    if !buffer.is_empty() {
+        let batch = build_snap_record_batch(buffer)?;
+        writer.write(&batch)?;
+        writer.flush()?;
+    }
+    let cursor = writer.into_inner()?;
+    Ok(cursor.into_inner())
+}
+
 /// Flush the Parquet row group to disk every this many rows.
 /// At 1 row/sec per symbol this equals 5 minutes.
 /// Keeps memory bounded and limits data loss on crash to ~5 min.
@@ -70,133 +219,7 @@ impl DayWriter {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let schema = SchemaRef::new(snap_1s_schema().clone());
-        let _n = self.buffer.len();
-
-        let ts_us: Vec<i64> = self.buffer.iter().map(|s| s.ts_us).collect();
-        let exchanges: Vec<&str> = self.buffer.iter().map(|s| s.exchange.as_str()).collect();
-        let symbols: Vec<&str> = self.buffer.iter().map(|s| s.symbol.as_str()).collect();
-
-        // Helper: extract top-N price or size from bids/asks
-        let bid_px: Vec<[Option<f64>; 10]> = self
-            .buffer
-            .iter()
-            .map(|s| {
-                let mut arr = [None; 10];
-                for (i, (px, _)) in s.bids.iter().enumerate().take(10) {
-                    arr[i] = Some(*px);
-                }
-                arr
-            })
-            .collect();
-        let bid_sz: Vec<[Option<f64>; 10]> = self
-            .buffer
-            .iter()
-            .map(|s| {
-                let mut arr = [None; 10];
-                for (i, (_, sz)) in s.bids.iter().enumerate().take(10) {
-                    arr[i] = Some(*sz);
-                }
-                arr
-            })
-            .collect();
-        let ask_px: Vec<[Option<f64>; 10]> = self
-            .buffer
-            .iter()
-            .map(|s| {
-                let mut arr = [None; 10];
-                for (i, (px, _)) in s.asks.iter().enumerate().take(10) {
-                    arr[i] = Some(*px);
-                }
-                arr
-            })
-            .collect();
-        let ask_sz: Vec<[Option<f64>; 10]> = self
-            .buffer
-            .iter()
-            .map(|s| {
-                let mut arr = [None; 10];
-                for (i, (_, sz)) in s.asks.iter().enumerate().take(10) {
-                    arr[i] = Some(*sz);
-                }
-                arr
-            })
-            .collect();
-
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from(ts_us)) as ArrayRef,
-            Arc::new(StringArray::from(exchanges)) as ArrayRef,
-            Arc::new(StringArray::from(symbols)) as ArrayRef,
-        ];
-
-        // bid_px_0..9
-        for i in 0..10 {
-            let col: Vec<Option<f64>> = bid_px.iter().map(|r| r[i]).collect();
-            columns.push(Arc::new(Float64Array::from(col)) as ArrayRef);
-        }
-        // ask_px_0..9
-        for i in 0..10 {
-            let col: Vec<Option<f64>> = ask_px.iter().map(|r| r[i]).collect();
-            columns.push(Arc::new(Float64Array::from(col)) as ArrayRef);
-        }
-        // bid_sz_0..9
-        for i in 0..10 {
-            let col: Vec<Option<f64>> = bid_sz.iter().map(|r| r[i]).collect();
-            columns.push(Arc::new(Float64Array::from(col)) as ArrayRef);
-        }
-        // ask_sz_0..9
-        for i in 0..10 {
-            let col: Vec<Option<f64>> = ask_sz.iter().map(|r| r[i]).collect();
-            columns.push(Arc::new(Float64Array::from(col)) as ArrayRef);
-        }
-
-        let mid_px: Vec<Option<f64>> = self.buffer.iter().map(|s| s.mid_px).collect();
-        let microprice: Vec<Option<f64>> = self.buffer.iter().map(|s| s.microprice).collect();
-        let spread_bps: Vec<Option<f32>> = self.buffer.iter().map(|s| s.spread_bps).collect();
-        let imb_l1: Vec<Option<f32>> = self.buffer.iter().map(|s| s.imbalance_l1).collect();
-        let imb_l5: Vec<Option<f32>> = self.buffer.iter().map(|s| s.imbalance_l5).collect();
-        let imb_l10: Vec<Option<f32>> = self.buffer.iter().map(|s| s.imbalance_l10).collect();
-        let bid_d5: Vec<f64> = self.buffer.iter().map(|s| s.bid_depth_l5).collect();
-        let bid_d10: Vec<f64> = self.buffer.iter().map(|s| s.bid_depth_l10).collect();
-        let ask_d5: Vec<f64> = self.buffer.iter().map(|s| s.ask_depth_l5).collect();
-        let ask_d10: Vec<f64> = self.buffer.iter().map(|s| s.ask_depth_l10).collect();
-        let ofi: Vec<f64> = self.buffer.iter().map(|s| s.ofi_l1).collect();
-        let churn_bid: Vec<f64> = self.buffer.iter().map(|s| s.churn_bid).collect();
-        let churn_ask: Vec<f64> = self.buffer.iter().map(|s| s.churn_ask).collect();
-        let sigma: Vec<f32> = self.buffer.iter().map(|s| s.intra_sigma).collect();
-        let open_px: Vec<Option<f64>> = self.buffer.iter().map(|s| s.open_px).collect();
-        let close_px: Vec<Option<f64>> = self.buffer.iter().map(|s| s.close_px).collect();
-        let n_events: Vec<u32> = self.buffer.iter().map(|s| s.n_events).collect();
-        let volume_delta: Vec<f64> = self.buffer.iter().map(|s| s.volume_delta).collect();
-        let buy_vol: Vec<f64> = self.buffer.iter().map(|s| s.buy_vol).collect();
-        let sell_vol: Vec<f64> = self.buffer.iter().map(|s| s.sell_vol).collect();
-        let trade_count: Vec<u32> = self.buffer.iter().map(|s| s.trade_count).collect();
-
-        columns.extend([
-            Arc::new(Float64Array::from(mid_px)) as ArrayRef,
-            Arc::new(Float64Array::from(microprice)) as ArrayRef,
-            Arc::new(Float32Array::from(spread_bps)) as ArrayRef,
-            Arc::new(Float32Array::from(imb_l1)) as ArrayRef,
-            Arc::new(Float32Array::from(imb_l5)) as ArrayRef,
-            Arc::new(Float32Array::from(imb_l10)) as ArrayRef,
-            Arc::new(Float64Array::from(bid_d5)) as ArrayRef,
-            Arc::new(Float64Array::from(bid_d10)) as ArrayRef,
-            Arc::new(Float64Array::from(ask_d5)) as ArrayRef,
-            Arc::new(Float64Array::from(ask_d10)) as ArrayRef,
-            Arc::new(Float64Array::from(ofi)) as ArrayRef,
-            Arc::new(Float64Array::from(churn_bid)) as ArrayRef,
-            Arc::new(Float64Array::from(churn_ask)) as ArrayRef,
-            Arc::new(Float32Array::from(sigma)) as ArrayRef,
-            Arc::new(Float64Array::from(open_px)) as ArrayRef,
-            Arc::new(Float64Array::from(close_px)) as ArrayRef,
-            Arc::new(UInt32Array::from(n_events)) as ArrayRef,
-            Arc::new(Float64Array::from(volume_delta)) as ArrayRef,
-            Arc::new(Float64Array::from(buy_vol)) as ArrayRef,
-            Arc::new(Float64Array::from(sell_vol)) as ArrayRef,
-            Arc::new(UInt32Array::from(trade_count)) as ArrayRef,
-        ]);
-
-        let batch = arrow_array::RecordBatch::try_new(schema, columns)?;
+        let batch = build_snap_record_batch(&self.buffer)?;
         let n = batch.num_rows();
         self.writer.write(&batch)?;
         self.buffer.clear();
