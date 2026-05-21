@@ -58,6 +58,7 @@ type WsSink = futures_util::stream::SplitSink<
 /// Spawn a unidirectional forwarder: reads WS frames, answers Ping/Pong,
 /// forwards Text/Binary as String to `fwd_tx`. Dropping `fwd_tx` on exit
 /// signals the caller that the stream is done.
+#[allow(clippy::collapsible_match)]
 pub fn spawn_forwarder(
     name: String,
     sink: WsSink,
@@ -109,6 +110,7 @@ pub fn spawn_forwarder(
 
 /// Spawn a bidirectional forwarder: in addition to the unidirectional behavior,
 /// also reads outgoing messages from `send_rx` and sends them over the WS sink.
+#[allow(clippy::collapsible_match)]
 pub fn spawn_bidi_forwarder(
     name: String,
     sink: WsSink,
@@ -270,11 +272,7 @@ impl StatsTracker {
 
     pub fn log(&self, name: &str, symbol_count: usize) {
         let elapsed = self.start.elapsed().as_secs();
-        let rate = if elapsed > 0 {
-            self.event_count / elapsed
-        } else {
-            0
-        };
+        let rate = self.event_count.checked_div(elapsed).unwrap_or(0);
         info!(
             conn = %name,
             events = self.event_count,
