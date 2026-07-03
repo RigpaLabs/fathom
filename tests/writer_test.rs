@@ -11,6 +11,7 @@ use fathom::{
         raw::RawDiff,
         raw::{bucket_open, run_raw_writer},
         snap_1s::{run_snap_writer, run_snap_writer_with_flush_interval},
+        trades::{RawTrade, run_trades_writer},
     },
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -140,6 +141,180 @@ async fn test_raw_writer_empty_channel() {
     // No files should be created
     let files = find_parquets(&dir.path().to_path_buf());
     assert!(files.is_empty(), "empty channel → no parquet files");
+}
+
+// ── Trades writer ─────────────────────────────────────────────────────────────
+
+fn make_trade(exchange: &str, symbol: &str, ts_us: i64, id: i64, buyer_maker: bool) -> RawTrade {
+    RawTrade {
+        timestamp_us: ts_us,
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
+        trade_id: id,
+        price: 3000.5,
+        qty: 1.25,
+        is_buyer_maker: buyer_maker,
+    }
+}
+
+#[tokio::test]
+async fn test_trades_writer_creates_file_and_roundtrips_values() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<RawTrade>(64);
+    let writer = tokio::spawn(run_trades_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    for i in 0..5i64 {
+        tx.send(make_trade(
+            "binance_spot",
+            "ETHUSDT",
+            now_us + i * 1_000,
+            100 + i,
+            i % 2 == 0,
+        ))
+        .unwrap();
+    }
+
+    drop(tx);
+    writer.await.unwrap();
+
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(files.len(), 1, "one trades parquet file for ETHUSDT");
+    assert!(
+        files[0]
+            .to_string_lossy()
+            .contains("/trades/binance_spot/ETHUSDT/"),
+        "path layout must be trades/{{exchange}}/{{symbol}}/{{date}}: {:?}",
+        files[0]
+    );
+
+    let file = std::fs::File::open(&files[0]).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let schema = reader.schema().clone();
+    for col in [
+        "timestamp_us",
+        "exchange",
+        "symbol",
+        "trade_id",
+        "price",
+        "qty",
+        "is_buyer_maker",
+    ] {
+        schema.field_with_name(col).expect(col);
+    }
+
+    use arrow_array::{BooleanArray, Float64Array, Int64Array};
+    let mut rows = 0;
+    for batch in reader.build().unwrap() {
+        let batch = batch.unwrap();
+        if rows == 0 {
+            let ts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(ts.value(0), now_us);
+            let id = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(id.value(0), 100);
+            let px = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            assert_eq!(px.value(0), 3000.5);
+            let qty = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            assert_eq!(qty.value(0), 1.25);
+            let bm = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            assert!(bm.value(0));
+            assert!(!bm.value(1));
+        }
+        rows += batch.num_rows();
+    }
+    assert_eq!(rows, 5, "should have written exactly 5 rows");
+}
+
+#[tokio::test]
+async fn test_trades_writer_rotation_file_naming() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<RawTrade>(64);
+    let writer = tokio::spawn(run_trades_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    let now = chrono::Utc::now();
+    tx.send(make_trade(
+        "binance_perp",
+        "BTCUSDT",
+        now.timestamp_micros(),
+        7,
+        false,
+    ))
+    .unwrap();
+
+    drop(tx);
+    writer.await.unwrap();
+
+    // With rotate_hours=1 the file opens at the current hour bucket and is
+    // renamed trades_{open}_{end}.parquet on close.
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(files.len(), 1);
+    let filename = files[0].file_name().unwrap().to_str().unwrap();
+    let expected_prefix = format!("trades_{:02}00_", now.hour());
+    assert!(
+        filename.starts_with(&expected_prefix),
+        "expected file starting with {expected_prefix}, got {filename}"
+    );
+    assert!(
+        !filename.ends_with("_open.parquet"),
+        "graceful shutdown must rename the open file: {filename}"
+    );
+}
+
+#[tokio::test]
+async fn test_trades_writer_multiple_symbols() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<RawTrade>(64);
+    let writer = tokio::spawn(run_trades_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    for (i, sym) in ["ETHUSDT", "BTCUSDT"].iter().enumerate() {
+        tx.send(make_trade("binance_spot", sym, now_us, i as i64, false))
+            .unwrap();
+    }
+
+    drop(tx);
+    writer.await.unwrap();
+
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(files.len(), 2, "separate file per symbol");
 }
 
 // ── Snap 1s writer ────────────────────────────────────────────────────────────

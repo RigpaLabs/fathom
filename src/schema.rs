@@ -3,6 +3,21 @@ use std::sync::OnceLock;
 
 static RAW_SCHEMA: OnceLock<Schema> = OnceLock::new();
 static SNAP_1S_SCHEMA: OnceLock<Schema> = OnceLock::new();
+static TRADES_SCHEMA: OnceLock<Schema> = OnceLock::new();
+
+pub fn trades_schema() -> &'static Schema {
+    TRADES_SCHEMA.get_or_init(|| {
+        Schema::new(vec![
+            Field::new("timestamp_us", DataType::Int64, false),
+            Field::new("exchange", DataType::Utf8, false),
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("trade_id", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("qty", DataType::Float64, false),
+            Field::new("is_buyer_maker", DataType::Boolean, false),
+        ])
+    })
+}
 
 pub fn raw_schema() -> &'static Schema {
     RAW_SCHEMA.get_or_init(|| {
