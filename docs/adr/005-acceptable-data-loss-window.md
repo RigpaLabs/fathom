@@ -36,6 +36,16 @@ The snap writer accumulates rows in memory and calls `writer.flush()` every 300 
 
 The 300-row interval limits crash loss to ~5 minutes while keeping disk writes infrequent (once every 5 minutes per symbol, not once per second).
 
+### Trade tape writer
+
+| Parameter | Value |
+|-----------|-------|
+| Flush interval | **5 seconds** (shares `RAW_FLUSH_INTERVAL_S`) |
+| File rotation | Every `raw_rotate_hours` (default 1 hour) |
+| Crash loss window | **≤5 seconds** of trade data |
+
+The trades writer mirrors the raw diff writer (same buffer/flush/rotation pattern, same rationale): trade volume is far below depth volume, so the 5-second batch is comfortably efficient while keeping crash loss negligible.
+
 ### Graceful shutdown
 
 On SIGTERM/SIGINT (Docker `stop_grace_period: 30s`):

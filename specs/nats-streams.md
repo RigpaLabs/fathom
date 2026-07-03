@@ -14,6 +14,8 @@ Optional: enabled via `[nats]` config section; fathom runs fine without it (Parq
 
 Payloads: wire-encoded `Snapshot1s` / `RawDiff` / `RawTrade` (see [data-schema.md](data-schema.md)). Same data as Parquet — no truncation.
 
+**Consumer rule:** the wire format carries a version byte but no type discriminant — the subject is the only thing identifying the payload type. Bind your decoder to the subject you subscribed to; never decode a `.depth` payload as `Snapshot1s` etc. (wrong-type decodes fail loudly in practice, but don't rely on it).
+
 ## Operational gotchas
 
 - Stream creation is `get_or_create`: it does **not** update the storage type (or limits) of an existing stream. Changing stream config requires delete + recreate.
