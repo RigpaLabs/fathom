@@ -34,14 +34,13 @@ What each exchange offers vs what fathom persists. "dropped" = arrives over the 
 | binance spot+perp | `aggTrade` (price, qty, side, trade id) | **not subscribed → planned** ([trades-feed.md](trades-feed.md)). Until then 1s `buy_vol`/`sell_vol`/`volume_delta`/`trade_count` are **always 0** for Binance |
 | binance spot+perp | `bookTicker` (event-rate L1) | not subscribed — L1 available at 100ms from depth; revisit only with a use case |
 | binance perp | `markPrice` (mark + funding), `forceOrder` (liquidations), open interest | **not subscribed → planned** ([derivatives-feeds.md](derivatives-feeds.md)) |
-| hyperliquid | `l2Book` full snapshot depth | book: full; **raw writer: truncated to top-10** (`src/connection/hyperliquid.rs` `.take(10)`) → **planned: persist full depth** |
-| hyperliquid | `l2Book` per-level order count `n` | **dropped** → planned: persist ([data-schema.md](data-schema.md) v2) |
+| hyperliquid | `l2Book` full snapshot depth | **collected** in full (raw + book) — raw writer persists all (price, size) levels (`src/connection/hyperliquid.rs::build_raw_diff`); 1s snapshot columns remain top-10 by design |
+| hyperliquid | `l2Book` per-level order count `n` | **dropped** → planned: persist ([data-schema.md](data-schema.md) v2) — the raw row's bid/ask lists carry (price, size) pairs only; adding `n` changes the Parquet/NATS schema, unlike depth which was variable-length already |
 | hyperliquid | `trades` — `px` (price) | **dropped** (only size+side consumed) → planned ([trades-feed.md](trades-feed.md)) |
 | hyperliquid | `bbo`, `candle` | not subscribed — derivable from l2Book/trades |
 | hyperliquid | `activeAssetCtx` (funding, oracle px, OI) | **not subscribed → planned** ([derivatives-feeds.md](derivatives-feeds.md)) |
 
 ## Known gaps / quirks
 
-- HL raw truncation to top-10 is silent and asymmetric vs Binance full-diff rows — fix planned (schema v2).
 - Reliability backlog (from TODO): per-symbol REST re-snapshot on gap instead of whole-WS reconnect; per-symbol WS connections.
 - `depth_ms` config field is only honored by Binance adapters; the HL adapter ignores it (hardcoded subscription params).

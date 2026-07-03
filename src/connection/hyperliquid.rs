@@ -28,6 +28,39 @@ fn top10(full: &(Levels, Levels)) -> (Levels, Levels) {
     (b10, a10)
 }
 
+/// Parse one side of an l2Book snapshot into (price, size) levels.
+/// Levels with unparseable numbers are skipped.
+fn parse_levels(levels: &[HlLevel]) -> Levels {
+    levels
+        .iter()
+        .filter_map(|l| {
+            let px = l.px.parse::<f64>().ok()?;
+            let sz = l.sz.parse::<f64>().ok()?;
+            Some((px, sz))
+        })
+        .collect()
+}
+
+/// Build the RawDiff persisted by the raw writer from a parsed l2Book snapshot.
+/// Carries the full snapshot depth — the 1s path applies its own top-10 cut.
+fn build_raw_diff(
+    exchange: &str,
+    symbol: &str,
+    time_ms: i64,
+    bids: &[(f64, f64)],
+    asks: &[(f64, f64)],
+) -> RawDiff {
+    RawDiff {
+        timestamp_us: time_ms * 1_000,
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
+        seq_id: time_ms,
+        prev_seq_id: 0,
+        bids: bids.to_vec(),
+        asks: asks.to_vec(),
+    }
+}
+
 // ── Hyperliquid WS message types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -189,39 +222,19 @@ pub async fn connection_task_hl(
                             if !symbols.contains(&symbol) { continue; }
                             if book.levels.len() < 2 { continue; }
 
-                            let all_bids: Vec<(f64, f64)> = book.levels[0]
-                                .iter()
-                                .filter_map(|l| {
-                                    let px = l.px.parse::<f64>().ok()?;
-                                    let sz = l.sz.parse::<f64>().ok()?;
-                                    Some((px, sz))
-                                })
-                                .collect();
-
-                            let all_asks: Vec<(f64, f64)> = book.levels[1]
-                                .iter()
-                                .filter_map(|l| {
-                                    let px = l.px.parse::<f64>().ok()?;
-                                    let sz = l.sz.parse::<f64>().ok()?;
-                                    Some((px, sz))
-                                })
-                                .collect();
-
-                            let bids: Vec<(f64, f64)> = all_bids.iter().take(10).copied().collect();
-                            let asks: Vec<(f64, f64)> = all_asks.iter().take(10).copied().collect();
+                            let all_bids = parse_levels(&book.levels[0]);
+                            let all_asks = parse_levels(&book.levels[1]);
 
                             let timestamp_us = book.time * 1_000;
 
                             if raw_tx
-                                .send(RawDiff {
-                                    timestamp_us,
-                                    exchange: exchange_name.clone(),
-                                    symbol: symbol.clone(),
-                                    seq_id: book.time,
-                                    prev_seq_id: 0,
-                                    bids: bids.clone(),
-                                    asks: asks.clone(),
-                                })
+                                .send(build_raw_diff(
+                                    &exchange_name,
+                                    &symbol,
+                                    book.time,
+                                    &all_bids,
+                                    &all_asks,
+                                ))
                                 .is_err()
                             {
                                 warn!(conn = %name, symbol = %symbol, "raw: no receivers");
@@ -261,6 +274,8 @@ pub async fn connection_task_hl(
                                 best_ask_qty: curr_best_ask_qty,
                             });
 
+                            let best_bid_px = all_bids.first().map(|(p, _)| *p);
+                            let best_ask_px = all_asks.first().map(|(p, _)| *p);
                             last_levels.insert(symbol.clone(), (all_bids, all_asks));
 
                             let acc = accumulators.entry(symbol.clone()).or_insert_with(|| {
@@ -272,11 +287,7 @@ pub async fn connection_task_hl(
                                 bid_abs_change: churn_bid,
                                 ask_abs_change: churn_ask,
                             };
-                            acc.on_diff_from_levels(
-                                bids.first().map(|(p, _)| *p),
-                                asks.first().map(|(p, _)| *p),
-                                &applied,
-                            );
+                            acc.on_diff_from_levels(best_bid_px, best_ask_px, &applied);
                             stats.inc();
                             runtime::inc_event_metrics(&metrics, &name, &symbol);
 
@@ -431,6 +442,54 @@ mod tests {
         assert_eq!(trade.side, "B");
         assert_eq!(trade.sz, "1.5");
         assert_eq!(trade.time, 1709654400000);
+    }
+
+    /// Build an l2Book message with `depth` levels per side.
+    fn l2book_with_depth(depth: usize) -> HlL2Book {
+        let bids: Vec<serde_json::Value> = (0..depth)
+            .map(|i| serde_json::json!({"px": format!("{}", 2500 - i as i64), "sz": "1.0", "n": 1}))
+            .collect();
+        let asks: Vec<serde_json::Value> = (0..depth)
+            .map(|i| serde_json::json!({"px": format!("{}", 2501 + i as i64), "sz": "2.0", "n": 1}))
+            .collect();
+        let json = serde_json::json!({
+            "coin": "ETH",
+            "time": 1709654400000_i64,
+            "levels": [bids, asks]
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_raw_diff_carries_full_snapshot_depth() {
+        let book = l2book_with_depth(25);
+        let all_bids = parse_levels(&book.levels[0]);
+        let all_asks = parse_levels(&book.levels[1]);
+        assert_eq!(all_bids.len(), 25);
+        assert_eq!(all_asks.len(), 25);
+
+        let diff = build_raw_diff("hyperliquid", &book.coin, book.time, &all_bids, &all_asks);
+
+        assert_eq!(diff.bids.len(), 25, "raw path must persist full depth");
+        assert_eq!(diff.asks.len(), 25, "raw path must persist full depth");
+        assert_eq!(diff.bids[0], (2500.0, 1.0));
+        assert_eq!(diff.bids[24], (2476.0, 1.0));
+        assert_eq!(diff.asks[24], (2525.0, 2.0));
+        assert_eq!(diff.timestamp_us, 1709654400000_i64 * 1_000);
+        assert_eq!(diff.seq_id, 1709654400000_i64);
+        assert_eq!(diff.exchange, "hyperliquid");
+        assert_eq!(diff.symbol, "ETH");
+    }
+
+    #[test]
+    fn test_1s_path_stays_top10() {
+        let book = l2book_with_depth(25);
+        let full = (parse_levels(&book.levels[0]), parse_levels(&book.levels[1]));
+        let (b10, a10) = top10(&full);
+        assert_eq!(b10.len(), 10, "1s snapshot path must stay top-10");
+        assert_eq!(a10.len(), 10, "1s snapshot path must stay top-10");
+        assert_eq!(b10[9], (2491.0, 1.0));
+        assert_eq!(a10[9], (2510.0, 2.0));
     }
 
     #[test]
