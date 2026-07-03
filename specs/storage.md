@@ -11,10 +11,11 @@ Root: `{data_dir}` from `config.toml`; `DATA_DIR` env overrides (blue-green depl
 ├── raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet   # hourly-rotated raw diffs
 ├── 1s/{exchange}/{symbol}/{date}.parquet                    # one file per day
 ├── trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet  # hourly-rotated trade tape
+├── deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}.parquet   # daily derivatives feeds
 └── metadata/status.json                                     # health snapshot, rewritten every 30s
 ```
 
-Writers: `src/writer/raw.rs` (hourly rotation), `src/writer/snap_1s.rs` (daily file, periodic flush), `src/writer/trades.rs` (hourly rotation, same pattern as raw).
+Writers: `src/writer/raw.rs` (hourly rotation), `src/writer/snap_1s.rs` (daily file, periodic flush), `src/writer/trades.rs` (hourly rotation, same pattern as raw), `src/writer/deriv.rs` (daily file per feed, 5s flush — [derivatives-feeds.md](derivatives-feeds.md)).
 
 ## Volumes (order of magnitude, current symbol set)
 
