@@ -188,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ttx,
+                    dtx,
                     ct,
                     m,
                 )));
