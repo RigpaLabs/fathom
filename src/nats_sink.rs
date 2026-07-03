@@ -3,10 +3,22 @@ use fathom_types::{RawDiff, RawTrade, Snapshot1s, wire_encode};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use crate::config::NatsConfig;
+use crate::{config::NatsConfig, writer::deriv::DerivEvent};
 
 fn snapshot_subject(exchange: &str, symbol: &str) -> String {
     format!("fathom.v1.{exchange}.{symbol}.snapshot")
+}
+
+/// Subject for a derivatives event. The wire payload carries no type
+/// discriminant, so the feed suffix (`funding` / `oi` / `liq`) is the only
+/// thing telling consumers which struct to decode.
+fn deriv_subject(event: &DerivEvent) -> String {
+    format!(
+        "fathom.v1.{}.{}.{}",
+        event.exchange(),
+        event.symbol(),
+        event.feed()
+    )
 }
 
 fn depth_subject(exchange: &str, symbol: &str) -> String {
@@ -22,6 +34,7 @@ pub async fn run(
     snap_rx: broadcast::Receiver<Snapshot1s>,
     raw_rx: broadcast::Receiver<RawDiff>,
     trade_rx: broadcast::Receiver<RawTrade>,
+    deriv_rx: broadcast::Receiver<DerivEvent>,
 ) {
     let client = match async_nats::connect(&config.url).await {
         Ok(c) => c,
@@ -42,9 +55,10 @@ pub async fn run(
 
     let snap_handle = tokio::spawn(publish_snapshots(js.clone(), snap_rx));
     let trade_handle = tokio::spawn(publish_trades(js.clone(), trade_rx));
+    let deriv_handle = tokio::spawn(publish_deriv(js.clone(), deriv_rx));
     let raw_handle = tokio::spawn(publish_depth(js, raw_rx));
 
-    let _ = tokio::join!(snap_handle, raw_handle, trade_handle);
+    let _ = tokio::join!(snap_handle, raw_handle, trade_handle, deriv_handle);
     info!("NATS sink stopped");
 }
 
@@ -85,7 +99,56 @@ async fn ensure_streams(js: &jetstream::Context) -> Result<(), async_nats::Error
     })
     .await?;
 
+    // Derivatives feeds (funding / open interest / liquidations): file storage,
+    // 24h retention, 200 MB limit — tiny volume, sized like FATHOM_TRADES
+    js.get_or_create_stream(stream::Config {
+        name: "FATHOM_DERIV".into(),
+        subjects: vec![
+            "fathom.v1.*.*.funding".into(),
+            "fathom.v1.*.*.oi".into(),
+            "fathom.v1.*.*.liq".into(),
+        ],
+        storage: stream::StorageType::File,
+        max_age: std::time::Duration::from_secs(24 * 3600),
+        max_bytes: 200 * 1024 * 1024,
+        ..Default::default()
+    })
+    .await?;
+
     Ok(())
+}
+
+/// Publish derivatives events. One channel carries all three structs; each
+/// variant is wire-encoded as its *inner* struct on its own subject —
+/// `DerivEvent` never crosses the wire (no type discriminant in the format).
+async fn publish_deriv(js: jetstream::Context, mut rx: broadcast::Receiver<DerivEvent>) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let subject = deriv_subject(&event);
+                let encoded = match &event {
+                    DerivEvent::MarkFunding(m) => wire_encode(m),
+                    DerivEvent::OpenInterest(o) => wire_encode(o),
+                    DerivEvent::Liquidation(l) => wire_encode(l),
+                };
+                match encoded {
+                    Ok(payload) => match js.publish(subject, payload.into()).await {
+                        Ok(ack_future) => {
+                            if let Err(e) = ack_future.await {
+                                warn!("NATS deriv ACK error: {e}");
+                            }
+                        }
+                        Err(e) => warn!("NATS deriv publish error: {e}"),
+                    },
+                    Err(e) => warn!("deriv encode error: {e}"),
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("NATS deriv sink lagged by {n} messages");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 async fn publish_trades(js: jetstream::Context, mut rx: broadcast::Receiver<RawTrade>) {
@@ -193,6 +256,41 @@ mod tests {
             trade_subject("hyperliquid", "ETH"),
             "fathom.v1.hyperliquid.ETH.trade"
         );
+    }
+
+    #[test]
+    fn deriv_subject_routes_each_variant_to_its_own_feed_suffix() {
+        // The wire format has no type discriminant — the subject suffix is the
+        // only thing identifying the payload type, so the mapping is pinned.
+        let mf = DerivEvent::MarkFunding(fathom_types::MarkFunding {
+            timestamp_us: 0,
+            exchange: "binance_perp".into(),
+            symbol: "ETHUSDT".into(),
+            mark_px: 3000.0,
+            index_px: None,
+            funding_rate: 0.0001,
+            next_funding_ts: None,
+        });
+        assert_eq!(deriv_subject(&mf), "fathom.v1.binance_perp.ETHUSDT.funding");
+
+        let oi = DerivEvent::OpenInterest(fathom_types::OpenInterest {
+            timestamp_us: 0,
+            exchange: "hyperliquid".into(),
+            symbol: "ETH".into(),
+            oi_base: 1.0,
+            oi_quote: None,
+        });
+        assert_eq!(deriv_subject(&oi), "fathom.v1.hyperliquid.ETH.oi");
+
+        let liq = DerivEvent::Liquidation(fathom_types::Liquidation {
+            timestamp_us: 0,
+            exchange: "binance_perp".into(),
+            symbol: "BTCUSDT".into(),
+            side: "SELL".into(),
+            price: 1.0,
+            qty: 1.0,
+        });
+        assert_eq!(deriv_subject(&liq), "fathom.v1.binance_perp.BTCUSDT.liq");
     }
 
     #[test]
