@@ -20,11 +20,10 @@ One row per WS depth event. Same schema for all exchanges (`src/schema.rs`):
 
 Semantics per exchange:
 - **Binance**: a row is a *diff* — levels with qty 0 mean deletion. Reconstructing the book requires replaying diffs onto a snapshot.
-- **Hyperliquid**: a row is a *full snapshot* (currently top-10; full depth planned) — each row stands alone.
+- **Hyperliquid**: a row is a *full snapshot* (full depth as sent by the exchange) — each row stands alone.
 
 ### Planned (schema v2)
 
-- HL: full snapshot depth (not top-10) — see [collection.md](collection.md)
 - HL: per-level order count `n` (`num_orders` List<i64>, null for Binance)
 
 ## 1s snapshot (`Snapshot1s`)
