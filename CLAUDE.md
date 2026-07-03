@@ -24,10 +24,11 @@ cargo test --test smoke_dydx_test -- --include-ignored --test-threads 1 --nocapt
 
 ```
 Binance (spot/perp):
-  WebSocket combined stream
+  WebSocket combined stream ({sym}@depth@100ms + {sym}@aggTrade)
     → gap detection (per-symbol sequence validation)
     → apply diff to BTreeMap L2 book (src/orderbook/mod.rs)
     → OFI / churn / microprice accumulation (src/accumulator.rs)
+    → aggTrade → trade tape + 1s buy/sell volume accumulation
 
 Hyperliquid:
   WebSocket (single endpoint, subscribe after connect)
@@ -41,13 +42,15 @@ dYdX v4:
     → local BTreeMap book (DydxBook in src/connection/dydx.rs)
     → accumulation via WindowAccumulator::on_diff_from_levels
 
-All paths → two parallel writers + optional NATS sink:
+All paths → three parallel writers + optional NATS sink:
   raw diff  → {data_dir}/raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet
   1s snap   → {data_dir}/1s/{exchange}/{symbol}/{date}.parquet  (64 columns, 1 row/sec)
+  trades    → {data_dir}/trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet  (Binance aggTrade + HL trades)
 
 Optional NATS streaming (src/nats_sink.rs):
   1s snap   → fathom.v1.{exchange}.{symbol}.snapshot  (FATHOM_SNAPSHOTS, file storage, critical)
   raw diff  → fathom.v1.{exchange}.{symbol}.depth     (FATHOM_DEPTH, file storage, 1h retention)
+  trade     → fathom.v1.{exchange}.{symbol}.trade     (FATHOM_TRADES, file storage, 24h retention)
 ```
 
 **1s snapshot columns:** `ts_us`, `exchange`, `symbol`, `bid_px_0..9`, `ask_px_0..9`, `bid_sz_0..9`, `ask_sz_0..9`,
@@ -55,6 +58,10 @@ Optional NATS streaming (src/nats_sink.rs):
 `bid_depth_l5`, `bid_depth_l10`, `ask_depth_l5`, `ask_depth_l10`,
 `ofi_l1`, `churn_bid`, `churn_ask`, `intra_sigma`, `open_px`, `close_px`, `n_events`,
 `volume_delta`, `buy_vol`, `sell_vol`, `trade_count`.
+
+The trade columns (`volume_delta`, `buy_vol`, `sell_vol`, `trade_count`) are populated for all
+exchanges: HL from the `trades` channel, Binance from `aggTrade` (attribution by taker side,
+`is_buy = !is_buyer_maker`). See `specs/trades-feed.md`.
 
 ## Key source files
 
@@ -69,7 +76,8 @@ Optional NATS streaming (src/nats_sink.rs):
 | `src/exchange/` | BinanceSpot / BinancePerp / Hyperliquid adapters, dYdX constants |
 | `src/writer/raw.rs` | Raw diff Parquet writer |
 | `src/writer/snap_1s.rs` | 1s snapshot Parquet writer |
-| `src/nats_sink.rs` | NATS JetStream publisher (snapshots + depth diffs) |
+| `src/writer/trades.rs` | Trade tape Parquet writer |
+| `src/nats_sink.rs` | NATS JetStream publisher (snapshots + depth diffs + trades) |
 | `src/monitor.rs` | Reconnect/gap/liveness tracking |
 
 ## Important gotcha: perp vs spot gap check
@@ -101,6 +109,7 @@ Data is written to `{data_dir}/` (configured in `config.toml`). When `DATA_DIR` 
 {data_dir}/
 ├── 1s/{exchange}/{symbol}/{date}.parquet    # 1-second snapshots (1 row/sec)
 ├── raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet  # raw diffs
+├── trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet  # raw trade tape
 └── metadata/status.json                     # health, updated every 30s
 ```
 

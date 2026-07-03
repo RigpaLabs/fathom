@@ -17,7 +17,7 @@ use crate::{
     metrics::Metrics,
     monitor::MonitorState,
     orderbook::{DepthDiff, OrderBook, SnapshotMsg},
-    writer::raw::RawDiff,
+    writer::{raw::RawDiff, trades::RawTrade},
 };
 
 use super::runtime::{self, BACKOFF_START_MS, DEFAULT_HEARTBEAT_TIMEOUT_S, RATE_LIMIT_BACKOFF_S};
@@ -109,6 +109,68 @@ fn parse_depth_levels(depth: &DepthUpdate) -> (Vec<(f64, f64)>, Vec<(f64, f64)>,
     (bids, asks, errs)
 }
 
+// ── aggTrade parsing ──────────────────────────────────────────────────────────
+
+/// Binance aggTrade event payload (combined stream `{sym}@aggTrade`).
+#[derive(Debug, Deserialize)]
+pub struct AggTradeUpdate {
+    #[serde(rename = "a")]
+    pub agg_trade_id: i64,
+    #[serde(rename = "p")]
+    pub price: String,
+    #[serde(rename = "q")]
+    pub qty: String,
+    #[serde(rename = "T")]
+    pub trade_time_ms: i64,
+    /// `m` — true when the buyer was the maker (the taker sold).
+    #[serde(rename = "m")]
+    pub is_buyer_maker: bool,
+}
+
+/// Build a RawTrade from a parsed aggTrade event.
+/// Returns `None` if price/qty strings don't parse.
+pub fn agg_trade_to_raw(exchange: &str, symbol: &str, ev: &AggTradeUpdate) -> Option<RawTrade> {
+    let price = ev.price.parse::<f64>().ok()?;
+    let qty = ev.qty.parse::<f64>().ok()?;
+    Some(RawTrade {
+        timestamp_us: ev.trade_time_ms * 1_000,
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
+        trade_id: ev.agg_trade_id,
+        price,
+        qty,
+        is_buyer_maker: ev.is_buyer_maker,
+    })
+}
+
+/// Handle one aggTrade event: feed the 1s accumulator (taker side) and publish
+/// the trade to the tape channel. `m` (is_buyer_maker) = true means the taker sold.
+fn handle_agg_trade(
+    conn_name: &str,
+    exchange_name: &str,
+    symbol: &str,
+    data: serde_json::Value,
+    accumulators: &mut HashMap<String, WindowAccumulator>,
+    trade_tx: &broadcast::Sender<RawTrade>,
+) {
+    let ev: AggTradeUpdate = match serde_json::from_value(data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(trade) = agg_trade_to_raw(exchange_name, symbol, &ev) else {
+        warn!(conn = %conn_name, symbol = %symbol, "aggTrade price/qty parse failed");
+        return;
+    };
+    let acc = accumulators
+        .entry(symbol.to_string())
+        .or_insert_with(|| WindowAccumulator::new(exchange_name, symbol, trade.timestamp_us));
+    acc.accumulate_trade(trade.qty, !trade.is_buyer_maker);
+
+    if trade_tx.send(trade).is_err() {
+        warn!(conn = %conn_name, symbol = %symbol, "trade: no receivers");
+    }
+}
+
 // ── Connection task ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -119,6 +181,7 @@ pub async fn connection_task(
     monitor: MonitorState,
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
+    trade_tx: broadcast::Sender<RawTrade>,
     cancel: CancellationToken,
     metrics: std::sync::Arc<Metrics>,
 ) {
@@ -295,6 +358,18 @@ pub async fn connection_task(
                 let sym_lower = combined.stream.split('@').next().unwrap_or("").to_string();
                 let symbol = sym_lower.to_uppercase();
                 if !symbols_set.contains(&symbol) {
+                    continue;
+                }
+
+                if combined.stream.ends_with("@aggTrade") {
+                    handle_agg_trade(
+                        &name,
+                        &exchange_name,
+                        &symbol,
+                        combined.data,
+                        &mut accumulators,
+                        &trade_tx,
+                    );
                     continue;
                 }
 
@@ -494,6 +569,18 @@ pub async fn connection_task(
                     let symbol = sym_lower.to_uppercase();
                     if !symbols_set.contains(&symbol) { continue; }
 
+                    if combined.stream.ends_with("@aggTrade") {
+                        handle_agg_trade(
+                            &name,
+                            &exchange_name,
+                            &symbol,
+                            combined.data,
+                            &mut accumulators,
+                            &trade_tx,
+                        );
+                        continue;
+                    }
+
                     let depth: DepthUpdate = match serde_json::from_value(combined.data) {
                         Ok(v) => v,
                         Err(_) => continue,
@@ -596,5 +683,107 @@ pub async fn connection_task(
         }
         accumulators.clear();
         runtime::sleep_backoff(&mut backoff_ms).await;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::accumulator::WindowAccumulator;
+
+    /// Real-shaped Binance combined-stream aggTrade message.
+    fn agg_trade_json() -> String {
+        serde_json::json!({
+            "stream": "ethusdt@aggTrade",
+            "data": {
+                "e": "aggTrade",
+                "E": 1_700_000_001_000_i64,
+                "s": "ETHUSDT",
+                "a": 26129,
+                "p": "3000.50",
+                "q": "4.70443515",
+                "f": 27781,
+                "l": 27781,
+                "T": 1_700_000_000_999_i64,
+                "m": true,
+                "M": true
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_agg_trade_parse_to_raw_trade() {
+        let combined: WsCombined = serde_json::from_str(&agg_trade_json()).unwrap();
+        assert!(combined.stream.ends_with("@aggTrade"));
+
+        let ev: AggTradeUpdate = serde_json::from_value(combined.data).unwrap();
+        let trade = agg_trade_to_raw("binance_spot", "ETHUSDT", &ev).unwrap();
+
+        assert_eq!(
+            trade.timestamp_us, 1_700_000_000_999_000,
+            "T (trade time) in µs"
+        );
+        assert_eq!(trade.exchange, "binance_spot");
+        assert_eq!(trade.symbol, "ETHUSDT");
+        assert_eq!(trade.trade_id, 26129);
+        assert_eq!(trade.price, 3000.50);
+        assert_eq!(trade.qty, 4.70443515);
+        assert!(trade.is_buyer_maker);
+    }
+
+    #[test]
+    fn test_agg_trade_unparseable_price_returns_none() {
+        let ev = AggTradeUpdate {
+            agg_trade_id: 1,
+            price: "not_a_number".into(),
+            qty: "1.0".into(),
+            trade_time_ms: 1_700_000_000_000,
+            is_buyer_maker: false,
+        };
+        assert!(agg_trade_to_raw("binance_spot", "ETHUSDT", &ev).is_none());
+    }
+
+    /// m=true → buyer is maker → the taker SOLD → sell_vol, negative delta.
+    #[test]
+    fn test_agg_trade_buyer_maker_accumulates_as_sell() {
+        let mut acc = WindowAccumulator::new("binance_spot", "ETHUSDT", 0);
+        let ev = AggTradeUpdate {
+            agg_trade_id: 1,
+            price: "3000.0".into(),
+            qty: "2.0".into(),
+            trade_time_ms: 1_700_000_000_000,
+            is_buyer_maker: true,
+        };
+        let trade = agg_trade_to_raw("binance_spot", "ETHUSDT", &ev).unwrap();
+        acc.accumulate_trade(trade.qty, !trade.is_buyer_maker);
+
+        let snap = acc.flush_with_levels(None, 1_000_000);
+        assert_eq!(snap.sell_vol, 2.0);
+        assert_eq!(snap.buy_vol, 0.0);
+        assert_eq!(snap.volume_delta, -2.0);
+        assert_eq!(snap.trade_count, 1);
+    }
+
+    /// m=false → seller is maker → the taker BOUGHT → buy_vol, positive delta.
+    #[test]
+    fn test_agg_trade_seller_maker_accumulates_as_buy() {
+        let mut acc = WindowAccumulator::new("binance_spot", "ETHUSDT", 0);
+        let ev = AggTradeUpdate {
+            agg_trade_id: 2,
+            price: "3000.0".into(),
+            qty: "1.5".into(),
+            trade_time_ms: 1_700_000_000_000,
+            is_buyer_maker: false,
+        };
+        let trade = agg_trade_to_raw("binance_spot", "ETHUSDT", &ev).unwrap();
+        acc.accumulate_trade(trade.qty, !trade.is_buyer_maker);
+
+        let snap = acc.flush_with_levels(None, 1_000_000);
+        assert_eq!(snap.buy_vol, 1.5);
+        assert_eq!(snap.sell_vol, 0.0);
+        assert_eq!(snap.volume_delta, 1.5);
+        assert_eq!(snap.trade_count, 1);
     }
 }

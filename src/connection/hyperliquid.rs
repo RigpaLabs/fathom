@@ -16,7 +16,7 @@ use crate::{
     metrics::Metrics,
     monitor::MonitorState,
     orderbook::DiffApplied,
-    writer::raw::RawDiff,
+    writer::{raw::RawDiff, trades::RawTrade},
 };
 
 use super::runtime::{self, BACKOFF_START_MS, DEFAULT_HEARTBEAT_TIMEOUT_S};
@@ -88,10 +88,50 @@ struct HlLevel {
 struct HlTrade {
     coin: String,
     side: String,
-    #[allow(dead_code)]
     px: String,
     sz: String,
     time: i64,
+    /// Optional so one tid-less trade can't fail the whole batch decode —
+    /// the accumulator path must survive; only tape persistence needs tid.
+    #[serde(default)]
+    tid: Option<i64>,
+}
+
+/// Taker side for the 1s accumulator: `"B"` = taker bought, `"A"` = taker sold.
+/// Must stay the exact inverse of `build_raw_trade`'s `is_buyer_maker` — the
+/// consistency test below pins the two mappings together.
+fn hl_side_is_buy(side: &str) -> Option<bool> {
+    match side {
+        "B" => Some(true),
+        "A" => Some(false),
+        _ => None,
+    }
+}
+
+/// Build a RawTrade from a Hyperliquid trade message.
+///
+/// HL `side` is the aggressing (taker) side: `"B"` = taker bought → the buyer
+/// is the taker → `is_buyer_maker = false`; `"A"` = taker sold → the buyer is
+/// the resting maker → `is_buyer_maker = true`. This matches Binance aggTrade
+/// `m` semantics (m=true ⇔ taker sold), so the flag is comparable across
+/// exchanges. Returns `None` on unknown side or unparseable px/sz.
+fn build_raw_trade(exchange: &str, trade: &HlTrade) -> Option<RawTrade> {
+    let is_buyer_maker = match trade.side.as_str() {
+        "B" => false,
+        "A" => true,
+        _ => return None,
+    };
+    let price = trade.px.parse::<f64>().ok()?;
+    let qty = trade.sz.parse::<f64>().ok()?;
+    Some(RawTrade {
+        timestamp_us: trade.time * 1_000,
+        exchange: exchange.to_string(),
+        symbol: trade.coin.clone(),
+        trade_id: trade.tid?,
+        price,
+        qty,
+        is_buyer_maker,
+    })
 }
 
 struct PrevSnapshot {
@@ -111,6 +151,7 @@ pub async fn connection_task_hl(
     monitor: MonitorState,
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
+    trade_tx: broadcast::Sender<RawTrade>,
     cancel: CancellationToken,
     metrics: std::sync::Arc<Metrics>,
 ) {
@@ -300,10 +341,9 @@ pub async fn connection_task_hl(
                             };
                             for trade in &trades {
                                 if !symbols.contains(&trade.coin) { continue; }
-                                let is_buy = match trade.side.as_str() {
-                                    "B" => true,
-                                    "A" => false,
-                                    _ => continue,
+                                let is_buy = match hl_side_is_buy(&trade.side) {
+                                    Some(b) => b,
+                                    None => continue,
                                 };
                                 let size = match trade.sz.parse::<f64>() {
                                     Ok(s) => s,
@@ -314,6 +354,19 @@ pub async fn connection_task_hl(
                                     WindowAccumulator::new(adapter.name(), &trade.coin, ts_us)
                                 });
                                 acc.accumulate_trade(size, is_buy);
+
+                                // Persist the tape (px included). Side mapping documented
+                                // on build_raw_trade.
+                                match build_raw_trade(&exchange_name, trade) {
+                                    Some(raw) => {
+                                        if trade_tx.send(raw).is_err() {
+                                            warn!(conn = %name, symbol = %trade.coin, "trade: no receivers");
+                                        }
+                                    }
+                                    None => {
+                                        warn!(conn = %name, symbol = %trade.coin, "trade px parse failed — not persisted");
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -435,13 +488,100 @@ mod tests {
             "side": "B",
             "px": "2500.0",
             "sz": "1.5",
-            "time": 1709654400000_i64
+            "time": 1709654400000_i64,
+            "tid": 118906668,
+            "hash": "0xabc",
+            "users": ["0x1", "0x2"]
         });
         let trade: HlTrade = serde_json::from_value(json).unwrap();
         assert_eq!(trade.coin, "ETH");
         assert_eq!(trade.side, "B");
+        assert_eq!(trade.px, "2500.0");
         assert_eq!(trade.sz, "1.5");
         assert_eq!(trade.time, 1709654400000);
+        assert_eq!(trade.tid, Some(118906668));
+    }
+
+    /// A tid-less trade must still deserialize (tid is Option so one such
+    /// trade can't fail the whole batch decode and starve the accumulator);
+    /// only tape persistence is skipped.
+    #[test]
+    fn test_hl_trade_missing_tid_decodes_but_skips_tape() {
+        let json = serde_json::json!({
+            "coin": "ETH", "side": "B", "px": "2500.0", "sz": "1.5",
+            "time": 1709654400000_i64
+        });
+        let trade: HlTrade = serde_json::from_value(json).unwrap();
+        assert_eq!(trade.tid, None);
+        assert!(build_raw_trade("hyperliquid", &trade).is_none());
+        // accumulator path doesn't touch tid — side mapping still resolves
+        assert_eq!(hl_side_is_buy(&trade.side), Some(true));
+    }
+
+    /// Pins the accumulator's side mapping AND its consistency with the tape:
+    /// is_buy must equal !is_buyer_maker for every valid side.
+    #[test]
+    fn test_hl_accumulator_side_mapping_consistent_with_tape() {
+        for side in ["B", "A"] {
+            let is_buy = hl_side_is_buy(side).unwrap();
+            let raw = build_raw_trade("hyperliquid", &hl_trade(side)).unwrap();
+            assert_eq!(
+                is_buy, !raw.is_buyer_maker,
+                "accumulator and tape side mappings drifted for side {side}"
+            );
+        }
+        assert_eq!(
+            hl_side_is_buy("B"),
+            Some(true),
+            "B = taker bought → buy_vol"
+        );
+        assert_eq!(
+            hl_side_is_buy("A"),
+            Some(false),
+            "A = taker sold → sell_vol"
+        );
+        assert_eq!(hl_side_is_buy("X"), None);
+    }
+
+    fn hl_trade(side: &str) -> HlTrade {
+        HlTrade {
+            coin: "ETH".into(),
+            side: side.into(),
+            px: "2500.5".into(),
+            sz: "1.5".into(),
+            time: 1_709_654_400_000,
+            tid: Some(42),
+        }
+    }
+
+    /// HL side "B" = taker bought → buyer is taker → is_buyer_maker=false
+    /// (same semantics as Binance m=false).
+    #[test]
+    fn test_hl_trade_to_raw_trade_taker_buy() {
+        let raw = build_raw_trade("hyperliquid", &hl_trade("B")).unwrap();
+        assert_eq!(raw.timestamp_us, 1_709_654_400_000_000);
+        assert_eq!(raw.exchange, "hyperliquid");
+        assert_eq!(raw.symbol, "ETH");
+        assert_eq!(raw.trade_id, 42);
+        assert_eq!(raw.price, 2500.5);
+        assert_eq!(raw.qty, 1.5);
+        assert!(!raw.is_buyer_maker, "taker buy → buyer is NOT the maker");
+    }
+
+    /// HL side "A" = taker sold → buyer is maker → is_buyer_maker=true
+    /// (same semantics as Binance m=true).
+    #[test]
+    fn test_hl_trade_to_raw_trade_taker_sell() {
+        let raw = build_raw_trade("hyperliquid", &hl_trade("A")).unwrap();
+        assert!(raw.is_buyer_maker, "taker sell → buyer IS the maker");
+    }
+
+    #[test]
+    fn test_hl_trade_to_raw_trade_unknown_side_or_bad_number() {
+        assert!(build_raw_trade("hyperliquid", &hl_trade("X")).is_none());
+        let mut bad_px = hl_trade("B");
+        bad_px.px = "oops".into();
+        assert!(build_raw_trade("hyperliquid", &bad_px).is_none());
     }
 
     /// Build an l2Book message with `depth` levels per side.

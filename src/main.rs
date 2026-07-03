@@ -10,7 +10,7 @@ use fathom::{
     connection::{connection_task, connection_task_dydx, connection_task_hl},
     exchange::{BinancePerp, BinanceSpot, Hyperliquid},
     metrics, monitor, nats_sink,
-    writer::{raw::RawDiff, snap_1s::run_snap_writer},
+    writer::{raw::RawDiff, snap_1s::run_snap_writer, trades::RawTrade},
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +27,7 @@ const RAW_FLUSH_INTERVAL_S: u64 = 5;
 /// | Connection tasks    | Restart with backoff (handled inside connection_task)|
 /// | Raw Parquet writer  | **Fatal** — process exit                             |
 /// | Snap Parquet writer | **Fatal** — process exit                             |
+/// | Trades Parquet writer | **Fatal** — process exit                           |
 /// | NATS sink           | Warn + continue                                      |
 /// | Metrics server      | Warn + continue                                      |
 /// | Monitor             | Warn + continue                                      |
@@ -66,9 +67,11 @@ async fn main() -> anyhow::Result<()> {
 
     let (raw_tx, _) = broadcast::channel::<RawDiff>(CHANNEL_BUFFER);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(CHANNEL_BUFFER);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(CHANNEL_BUFFER);
 
     let raw_rx_parquet = raw_tx.subscribe();
     let snap_rx_parquet = snap_tx.subscribe();
+    let trade_rx_parquet = trade_tx.subscribe();
 
     // Metrics: Prometheus /metrics + /health HTTP server
     // Failure policy: Warn + continue (ancillary, does not affect data integrity)
@@ -96,6 +99,13 @@ async fn main() -> anyhow::Result<()> {
         cancel.clone(),
         metrics_handle_data.metrics.clone(),
     ));
+    let mut trades_handle = tokio::spawn(fathom::writer::trades::run_trades_writer(
+        data_dir.clone(),
+        trade_rx_parquet,
+        RAW_FLUSH_INTERVAL_S,
+        cfg.raw_rotate_hours,
+        metrics_handle_data.metrics.clone(),
+    ));
 
     // Monitor: Warn + continue (health tracking only, not on the write path)
     let mon_handle = tokio::spawn(monitor::run_monitor(
@@ -108,10 +118,12 @@ async fn main() -> anyhow::Result<()> {
     let nats_handle = if let Some(nats_cfg) = cfg.nats.as_ref().filter(|c| c.enabled) {
         let raw_rx_nats = raw_tx.subscribe();
         let snap_rx_nats = snap_tx.subscribe();
+        let trade_rx_nats = trade_tx.subscribe();
         Some(tokio::spawn(nats_sink::run(
             nats_cfg.clone(),
             snap_rx_nats,
             raw_rx_nats,
+            trade_rx_nats,
         )))
     } else {
         None
@@ -123,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         let mon = monitor_state.clone();
         let rtx = raw_tx.clone();
         let stx = snap_tx.clone();
+        let ttx = trade_tx.clone();
         let ct = cancel.clone();
         let m = metrics_handle_data.metrics.clone();
         match conn.exchange {
@@ -134,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
                     mon,
                     rtx,
                     stx,
+                    ttx,
                     ct,
                     m,
                 )));
@@ -146,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
                     mon,
                     rtx,
                     stx,
+                    ttx,
                     ct,
                     m,
                 )));
@@ -158,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
                     mon,
                     rtx,
                     stx,
+                    ttx,
                     ct,
                     m,
                 )));
@@ -180,7 +196,13 @@ async fn main() -> anyhow::Result<()> {
     //
     // NATS, metrics, and monitor are intentionally NOT supervised here;
     // their failure is non-fatal. Connection tasks manage their own restart loop.
-    wait_for_shutdown_or_writer_exit(&mut raw_handle, &mut snap_handle, &cancel).await?;
+    wait_for_shutdown_or_writer_exit(
+        &mut raw_handle,
+        &mut snap_handle,
+        &mut trades_handle,
+        &cancel,
+    )
+    .await?;
 
     info!("shutting down fathom...");
 
@@ -195,10 +217,12 @@ async fn main() -> anyhow::Result<()> {
     // Dropping senders closes the broadcast channel, signaling writers to finish.
     drop(raw_tx);
     drop(snap_tx);
+    drop(trade_tx);
 
     // Await writers so all buffered data is flushed before exit.
     let _ = raw_handle.await;
     let _ = snap_handle.await;
+    let _ = trades_handle.await;
     // Await NATS sink so in-flight JetStream publishes complete.
     if let Some(h) = nats_handle {
         let _ = h.await;
@@ -226,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
 async fn wait_for_shutdown_or_writer_exit(
     raw_handle: &mut tokio::task::JoinHandle<()>,
     snap_handle: &mut tokio::task::JoinHandle<()>,
+    trades_handle: &mut tokio::task::JoinHandle<()>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -239,6 +264,10 @@ async fn wait_for_shutdown_or_writer_exit(
             }
             result = &mut *snap_handle => {
                 tracing::error!("FATAL: snap parquet writer exited unexpectedly: {:?}", result);
+                std::process::exit(1);
+            }
+            result = &mut *trades_handle => {
+                tracing::error!("FATAL: trades parquet writer exited unexpectedly: {:?}", result);
                 std::process::exit(1);
             }
             _ = cancel.cancelled() => {}
@@ -256,6 +285,10 @@ async fn wait_for_shutdown_or_writer_exit(
             }
             result = &mut *snap_handle => {
                 tracing::error!("FATAL: snap parquet writer exited unexpectedly: {:?}", result);
+                std::process::exit(1);
+            }
+            result = &mut *trades_handle => {
+                tracing::error!("FATAL: trades parquet writer exited unexpectedly: {:?}", result);
                 std::process::exit(1);
             }
             _ = cancel.cancelled() => {}

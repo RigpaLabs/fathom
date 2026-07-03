@@ -58,6 +58,26 @@ pub struct RawDiff {
     pub asks: Vec<(f64, f64)>,
 }
 
+/// A single trade from an exchange's trade tape.
+///
+/// Published to NATS subject `fathom.v1.{exchange}.{symbol}.trade`.
+/// Wire format: `[WIRE_VERSION: u8][bincode payload]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawTrade {
+    /// Exchange trade time (µs).
+    pub timestamp_us: i64,
+    pub exchange: String,
+    pub symbol: String,
+    /// Binance aggTrade id / Hyperliquid tid.
+    pub trade_id: i64,
+    pub price: f64,
+    /// Base units.
+    pub qty: f64,
+    /// True when the buyer was the maker (i.e. the taker sold).
+    /// Binance `m` flag; Hyperliquid side mapped to the same semantics.
+    pub is_buyer_maker: bool,
+}
+
 /// Envelope wrapping any payload with metadata for cross-service traceability.
 /// Opt-in — existing consumers can still decode raw payloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +193,30 @@ mod tests {
         let decoded: RawDiff = wire_decode(&bytes).expect("decode");
         assert_eq!(decoded.seq_id, diff.seq_id);
         assert_eq!(decoded.exchange, diff.exchange);
+    }
+
+    #[test]
+    fn roundtrip_raw_trade() {
+        let trade = RawTrade {
+            timestamp_us: 1_700_000_000_123_000,
+            exchange: "binance_perp".into(),
+            symbol: "ETHUSDT".into(),
+            trade_id: 987_654_321,
+            price: 3000.25,
+            qty: 1.5,
+            is_buyer_maker: true,
+        };
+
+        let bytes = wire_encode(&trade).expect("encode");
+        assert_eq!(bytes[0], WIRE_VERSION);
+        let decoded: RawTrade = wire_decode(&bytes).expect("decode");
+        assert_eq!(decoded.timestamp_us, trade.timestamp_us);
+        assert_eq!(decoded.exchange, trade.exchange);
+        assert_eq!(decoded.symbol, trade.symbol);
+        assert_eq!(decoded.trade_id, trade.trade_id);
+        assert_eq!(decoded.price, trade.price);
+        assert_eq!(decoded.qty, trade.qty);
+        assert!(decoded.is_buyer_maker);
     }
 
     #[test]

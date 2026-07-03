@@ -1,6 +1,6 @@
 # NATS Streams — JetStream Contract
 
-Status: **stable** (trades/derivatives streams planned)
+Status: **stable** (derivatives streams planned)
 
 Optional: enabled via `[nats]` config section; fathom runs fine without it (Parquet writers are independent). Publisher: `src/nats_sink.rs`. Backpressure policy: drop, never block collection (ADR-002).
 
@@ -10,8 +10,11 @@ Optional: enabled via `[nats]` config section; fathom runs fine without it (Parq
 |---|---|---|---|---|
 | `FATHOM_SNAPSHOTS` | `fathom.v1.{exchange}.{symbol}.snapshot` | File | 24 h / 200 MB | 1s snapshots — the "critical" feed downstream signal engines consume |
 | `FATHOM_DEPTH` | `fathom.v1.{exchange}.{symbol}.depth` | File | 1 h / 500 MB | Raw depth diffs — short replay window for warmup (e.g. consumer replays 30 min on start) |
+| `FATHOM_TRADES` | `fathom.v1.{exchange}.{symbol}.trade` | File | 24 h / 200 MB | Raw trade tape ([trades-feed.md](trades-feed.md)) — low volume relative to depth |
 
-Payloads: wire-encoded `Snapshot1s` / `RawDiff` (see [data-schema.md](data-schema.md)). Same data as Parquet — no truncation.
+Payloads: wire-encoded `Snapshot1s` / `RawDiff` / `RawTrade` (see [data-schema.md](data-schema.md)). Same data as Parquet — no truncation.
+
+**Consumer rule:** the wire format carries a version byte but no type discriminant — the subject is the only thing identifying the payload type. Bind your decoder to the subject you subscribed to; never decode a `.depth` payload as `Snapshot1s` etc. (wrong-type decodes fail loudly in practice, but don't rely on it).
 
 ## Operational gotchas
 
@@ -22,5 +25,4 @@ Payloads: wire-encoded `Snapshot1s` / `RawDiff` (see [data-schema.md](data-schem
 
 | Stream | Subjects | Notes |
 |---|---|---|
-| `FATHOM_TRADES` | `fathom.v1.{exchange}.{symbol}.trade` | Raw trade tape ([trades-feed.md](trades-feed.md)) |
 | `FATHOM_DERIV` | `fathom.v1.{exchange}.{symbol}.{funding\|mark\|oi\|liq}` | Derivatives feeds ([derivatives-feeds.md](derivatives-feeds.md)); low volume, one stream for all four |

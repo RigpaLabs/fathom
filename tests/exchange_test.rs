@@ -12,8 +12,22 @@ fn test_spot_ws_url_single_symbol() {
     let url = BinanceSpot.ws_url(&["ETHUSDT".to_string()], 100);
     assert_eq!(
         url,
-        "wss://stream.binance.com/stream?streams=ethusdt@depth@100ms"
+        "wss://stream.binance.com/stream?streams=ethusdt@depth@100ms/ethusdt@aggTrade"
     );
+}
+
+#[test]
+fn test_spot_ws_url_includes_agg_trade_per_symbol() {
+    let symbols = vec!["ETHUSDT".to_string(), "BTCUSDT".to_string()];
+    let url = BinanceSpot.ws_url(&symbols, 100);
+    assert!(url.contains("ethusdt@aggTrade"));
+    assert!(url.contains("btcusdt@aggTrade"));
+}
+
+#[test]
+fn test_perp_ws_url_includes_agg_trade() {
+    let url = BinancePerp.ws_url(&["ETHUSDT".to_string()], 100);
+    assert!(url.contains("ethusdt@aggTrade"));
 }
 
 #[test]

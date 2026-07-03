@@ -18,7 +18,7 @@ Behavior contracts for fathom. A **spec** describes what fathom does (or will do
 | [data-schema.md](data-schema.md) | Raw diff + 1s snapshot Parquet schemas, wire format | stable |
 | [nats-streams.md](nats-streams.md) | JetStream streams, subjects, retention | stable |
 | [storage.md](storage.md) | Local layout, rotation, retention, object-storage upload | stable / planned |
-| [trades-feed.md](trades-feed.md) | Raw trade tape with price | planned |
+| [trades-feed.md](trades-feed.md) | Raw trade tape with price | stable |
 | [derivatives-feeds.md](derivatives-feeds.md) | Funding, mark/oracle price, open interest, liquidations | planned |
 | [observability.md](observability.md) | Prometheus metrics, status.json, health semantics | stable / planned |
 

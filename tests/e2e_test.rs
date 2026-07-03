@@ -24,6 +24,7 @@ use fathom::{
     monitor,
     writer::raw::{RawDiff, run_raw_writer},
     writer::snap_1s::run_snap_writer,
+    writer::trades::RawTrade,
 };
 use helpers::MockBinanceServer;
 
@@ -191,6 +192,7 @@ async fn test_e2e_reconnect_after_ws_close() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -214,6 +216,7 @@ async fn test_e2e_reconnect_after_ws_close() {
         state,
         raw_tx,
         snap_tx,
+        trade_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -300,6 +303,7 @@ async fn test_e2e_multi_symbol_single_connection() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -323,6 +327,7 @@ async fn test_e2e_multi_symbol_single_connection() {
         state,
         raw_tx,
         snap_tx,
+        trade_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -391,6 +396,7 @@ async fn test_e2e_snapshot_http_error_then_retry() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -414,6 +420,7 @@ async fn test_e2e_snapshot_http_error_then_retry() {
         state,
         raw_tx,
         snap_tx,
+        trade_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -497,6 +504,7 @@ async fn test_e2e_gap_triggers_reconnect() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -521,6 +529,7 @@ async fn test_e2e_gap_triggers_reconnect() {
         state,
         raw_tx,
         snap_tx,
+        trade_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -631,6 +640,7 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -655,6 +665,7 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
         state,
         raw_tx,
         snap_tx,
+        trade_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -734,6 +745,7 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -757,6 +769,7 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
         state,
         raw_tx,
         snap_tx,
+        trade_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -840,6 +853,7 @@ async fn test_e2e_snap_parquet_created() {
     let dir = TempDir::new().unwrap();
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -863,6 +877,7 @@ async fn test_e2e_snap_parquet_created() {
         state,
         raw_tx,
         snap_tx,
+        trade_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -909,4 +924,181 @@ async fn test_e2e_snap_parquet_created() {
         .map(|b| b.unwrap().num_rows())
         .sum();
     assert!(rows > 0, "snap parquet should have at least 1 row");
+}
+
+// ── Test 8: aggTrade → trades parquet + 1s trade columns ─────────────────────
+
+/// Build a Binance combined-stream aggTrade JSON string.
+fn ws_agg_trade_msg(sym: &str, time_ms: i64, id: i64, price: &str, qty: &str, m: bool) -> String {
+    serde_json::json!({
+        "stream": format!("{}@aggTrade", sym.to_lowercase()),
+        "data": {
+            "e": "aggTrade",
+            "E": time_ms,
+            "s": sym.to_uppercase(),
+            "a": id,
+            "p": price,
+            "q": qty,
+            "f": id,
+            "l": id,
+            "T": time_ms,
+            "m": m,
+            "M": true
+        }
+    })
+    .to_string()
+}
+
+fn trades_parquets(dir: &Path) -> Vec<PathBuf> {
+    find_parquets(dir)
+        .into_iter()
+        .filter(|p| p.components().any(|c| c.as_os_str() == "trades"))
+        .collect()
+}
+
+/// aggTrade events on the combined stream must land in the trades parquet
+/// (with price) AND populate the 1s trade aggregates for Binance.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_agg_trade_tape_and_1s_volumes() {
+    use arrow_array::{BooleanArray, Float64Array, UInt32Array};
+    use fathom::writer::trades::run_trades_writer;
+
+    let server = MockBinanceServer::new().await;
+
+    server.push_snapshot(
+        "ETHUSDT",
+        100,
+        vec![("3000.00", "5.00")],
+        vec![("3001.00", "4.00")],
+    );
+
+    // One depth sync event + two trades: taker buy 2.0 (m=false), taker sell 0.5 (m=true).
+    server.push_ws_round(vec![
+        ws_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_agg_trade_msg("ethusdt", 1_700_000_001_500, 42, "3000.50", "2.0", false),
+        ws_agg_trade_msg("ethusdt", 1_700_000_001_600, 43, "3000.25", "0.5", true),
+    ]);
+
+    let dir = TempDir::new().unwrap();
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+        CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
+    ));
+    let trades_w = tokio::spawn(run_trades_writer(
+        dir.path().to_path_buf(),
+        trade_tx.subscribe(),
+        60,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    let state = monitor::new_state();
+    let conn = make_conn("agg_trade_test", vec!["ETHUSDT"], &server);
+    let task = tokio::spawn(connection_task(
+        conn,
+        Box::new(BinanceSpot),
+        dir.path().to_path_buf(),
+        state,
+        raw_tx,
+        snap_tx,
+        trade_tx,
+        CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    // Round (~50 ms) + on-disconnect snap flush when the WS closes + slack.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    task.abort();
+    let _ = task.await;
+    snap_w.await.unwrap();
+    trades_w.await.unwrap();
+
+    // ── Trade tape ──
+    let tapes = trades_parquets(dir.path());
+    assert_eq!(tapes.len(), 1, "one trades parquet for ETHUSDT: {tapes:?}");
+    assert!(
+        tapes[0]
+            .to_string_lossy()
+            .contains("/trades/binance_spot/ETHUSDT/"),
+        "tape path layout: {:?}",
+        tapes[0]
+    );
+
+    let file = std::fs::File::open(&tapes[0]).unwrap();
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 2, "both trades persisted");
+
+    let px = batch
+        .column_by_name("price")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(px.value(0), 3000.50);
+    assert_eq!(px.value(1), 3000.25);
+    let bm = batch
+        .column_by_name("is_buyer_maker")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(!bm.value(0));
+    assert!(bm.value(1));
+
+    // ── 1s aggregates now populated for Binance ──
+    let snaps = snap_parquets(dir.path());
+    assert!(!snaps.is_empty(), "snap 1s parquet should exist");
+    let (mut buy, mut sell, mut count) = (0.0_f64, 0.0_f64, 0_u64);
+    for path in &snaps {
+        let file = std::fs::File::open(path).unwrap();
+        for batch in ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+        {
+            let batch = batch.unwrap();
+            let b = batch
+                .column_by_name("buy_vol")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let s = batch
+                .column_by_name("sell_vol")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let c = batch
+                .column_by_name("trade_count")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                buy += b.value(i);
+                sell += s.value(i);
+                count += c.value(i) as u64;
+            }
+        }
+    }
+    assert_eq!(buy, 2.0, "taker buy volume (m=false)");
+    assert_eq!(sell, 0.5, "taker sell volume (m=true)");
+    assert_eq!(count, 2, "trade_count populated for Binance");
 }
