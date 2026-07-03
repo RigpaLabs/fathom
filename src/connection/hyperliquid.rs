@@ -91,7 +91,21 @@ struct HlTrade {
     px: String,
     sz: String,
     time: i64,
-    tid: i64,
+    /// Optional so one tid-less trade can't fail the whole batch decode —
+    /// the accumulator path must survive; only tape persistence needs tid.
+    #[serde(default)]
+    tid: Option<i64>,
+}
+
+/// Taker side for the 1s accumulator: `"B"` = taker bought, `"A"` = taker sold.
+/// Must stay the exact inverse of `build_raw_trade`'s `is_buyer_maker` — the
+/// consistency test below pins the two mappings together.
+fn hl_side_is_buy(side: &str) -> Option<bool> {
+    match side {
+        "B" => Some(true),
+        "A" => Some(false),
+        _ => None,
+    }
 }
 
 /// Build a RawTrade from a Hyperliquid trade message.
@@ -113,7 +127,7 @@ fn build_raw_trade(exchange: &str, trade: &HlTrade) -> Option<RawTrade> {
         timestamp_us: trade.time * 1_000,
         exchange: exchange.to_string(),
         symbol: trade.coin.clone(),
-        trade_id: trade.tid,
+        trade_id: trade.tid?,
         price,
         qty,
         is_buyer_maker,
@@ -327,10 +341,9 @@ pub async fn connection_task_hl(
                             };
                             for trade in &trades {
                                 if !symbols.contains(&trade.coin) { continue; }
-                                let is_buy = match trade.side.as_str() {
-                                    "B" => true,
-                                    "A" => false,
-                                    _ => continue,
+                                let is_buy = match hl_side_is_buy(&trade.side) {
+                                    Some(b) => b,
+                                    None => continue,
                                 };
                                 let size = match trade.sz.parse::<f64>() {
                                     Ok(s) => s,
@@ -486,7 +499,48 @@ mod tests {
         assert_eq!(trade.px, "2500.0");
         assert_eq!(trade.sz, "1.5");
         assert_eq!(trade.time, 1709654400000);
-        assert_eq!(trade.tid, 118906668);
+        assert_eq!(trade.tid, Some(118906668));
+    }
+
+    /// A tid-less trade must still deserialize (tid is Option so one such
+    /// trade can't fail the whole batch decode and starve the accumulator);
+    /// only tape persistence is skipped.
+    #[test]
+    fn test_hl_trade_missing_tid_decodes_but_skips_tape() {
+        let json = serde_json::json!({
+            "coin": "ETH", "side": "B", "px": "2500.0", "sz": "1.5",
+            "time": 1709654400000_i64
+        });
+        let trade: HlTrade = serde_json::from_value(json).unwrap();
+        assert_eq!(trade.tid, None);
+        assert!(build_raw_trade("hyperliquid", &trade).is_none());
+        // accumulator path doesn't touch tid — side mapping still resolves
+        assert_eq!(hl_side_is_buy(&trade.side), Some(true));
+    }
+
+    /// Pins the accumulator's side mapping AND its consistency with the tape:
+    /// is_buy must equal !is_buyer_maker for every valid side.
+    #[test]
+    fn test_hl_accumulator_side_mapping_consistent_with_tape() {
+        for side in ["B", "A"] {
+            let is_buy = hl_side_is_buy(side).unwrap();
+            let raw = build_raw_trade("hyperliquid", &hl_trade(side)).unwrap();
+            assert_eq!(
+                is_buy, !raw.is_buyer_maker,
+                "accumulator and tape side mappings drifted for side {side}"
+            );
+        }
+        assert_eq!(
+            hl_side_is_buy("B"),
+            Some(true),
+            "B = taker bought → buy_vol"
+        );
+        assert_eq!(
+            hl_side_is_buy("A"),
+            Some(false),
+            "A = taker sold → sell_vol"
+        );
+        assert_eq!(hl_side_is_buy("X"), None);
     }
 
     fn hl_trade(side: &str) -> HlTrade {
@@ -496,7 +550,7 @@ mod tests {
             px: "2500.5".into(),
             sz: "1.5".into(),
             time: 1_709_654_400_000,
-            tid: 42,
+            tid: Some(42),
         }
     }
 
