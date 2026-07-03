@@ -13,7 +13,10 @@ impl ExchangeAdapter for BinanceSpot {
     fn ws_url(&self, symbols: &[String], depth_ms: u64) -> String {
         let streams = symbols
             .iter()
-            .map(|s| format!("{}@depth@{}ms", s.to_lowercase(), depth_ms))
+            .map(|s| {
+                let sym = s.to_lowercase();
+                format!("{sym}@depth@{depth_ms}ms/{sym}@aggTrade")
+            })
             .collect::<Vec<_>>()
             .join("/");
         format!("{WS_BASE}?streams={streams}")

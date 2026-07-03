@@ -1,5 +1,5 @@
 use async_nats::jetstream::{self, stream};
-use fathom_types::{RawDiff, Snapshot1s, wire_encode};
+use fathom_types::{RawDiff, RawTrade, Snapshot1s, wire_encode};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -13,10 +13,15 @@ fn depth_subject(exchange: &str, symbol: &str) -> String {
     format!("fathom.v1.{exchange}.{symbol}.depth")
 }
 
+fn trade_subject(exchange: &str, symbol: &str) -> String {
+    format!("fathom.v1.{exchange}.{symbol}.trade")
+}
+
 pub async fn run(
     config: NatsConfig,
     snap_rx: broadcast::Receiver<Snapshot1s>,
     raw_rx: broadcast::Receiver<RawDiff>,
+    trade_rx: broadcast::Receiver<RawTrade>,
 ) {
     let client = match async_nats::connect(&config.url).await {
         Ok(c) => c,
@@ -36,9 +41,10 @@ pub async fn run(
     info!("NATS sink connected to {}", config.url);
 
     let snap_handle = tokio::spawn(publish_snapshots(js.clone(), snap_rx));
+    let trade_handle = tokio::spawn(publish_trades(js.clone(), trade_rx));
     let raw_handle = tokio::spawn(publish_depth(js, raw_rx));
 
-    let _ = tokio::join!(snap_handle, raw_handle);
+    let _ = tokio::join!(snap_handle, raw_handle, trade_handle);
     info!("NATS sink stopped");
 }
 
@@ -67,7 +73,44 @@ async fn ensure_streams(js: &jetstream::Context) -> Result<(), async_nats::Error
     })
     .await?;
 
+    // Raw trade tape: file storage, 24h retention, 200 MB limit
+    // (low volume relative to depth — sized like FATHOM_SNAPSHOTS)
+    js.get_or_create_stream(stream::Config {
+        name: "FATHOM_TRADES".into(),
+        subjects: vec!["fathom.v1.*.*.trade".into()],
+        storage: stream::StorageType::File,
+        max_age: std::time::Duration::from_secs(24 * 3600),
+        max_bytes: 200 * 1024 * 1024,
+        ..Default::default()
+    })
+    .await?;
+
     Ok(())
+}
+
+async fn publish_trades(js: jetstream::Context, mut rx: broadcast::Receiver<RawTrade>) {
+    loop {
+        match rx.recv().await {
+            Ok(trade) => {
+                let subject = trade_subject(&trade.exchange, &trade.symbol);
+                match wire_encode(&trade) {
+                    Ok(payload) => match js.publish(subject, payload.into()).await {
+                        Ok(ack_future) => {
+                            if let Err(e) = ack_future.await {
+                                warn!("NATS trade ACK error: {e}");
+                            }
+                        }
+                        Err(e) => warn!("NATS trade publish error: {e}"),
+                    },
+                    Err(e) => warn!("trade encode error: {e}"),
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("NATS trade sink lagged by {n} messages");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 async fn publish_snapshots(js: jetstream::Context, mut rx: broadcast::Receiver<Snapshot1s>) {
@@ -137,6 +180,18 @@ mod tests {
         assert_eq!(
             snapshot_subject("hyperliquid", "ETH"),
             "fathom.v1.hyperliquid.ETH.snapshot"
+        );
+    }
+
+    #[test]
+    fn trade_subject_format() {
+        assert_eq!(
+            trade_subject("binance_perp", "ETHUSDT"),
+            "fathom.v1.binance_perp.ETHUSDT.trade"
+        );
+        assert_eq!(
+            trade_subject("hyperliquid", "ETH"),
+            "fathom.v1.hyperliquid.ETH.trade"
         );
     }
 

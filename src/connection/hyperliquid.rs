@@ -16,7 +16,7 @@ use crate::{
     metrics::Metrics,
     monitor::MonitorState,
     orderbook::DiffApplied,
-    writer::raw::RawDiff,
+    writer::{raw::RawDiff, trades::RawTrade},
 };
 
 use super::runtime::{self, BACKOFF_START_MS, DEFAULT_HEARTBEAT_TIMEOUT_S};
@@ -88,10 +88,36 @@ struct HlLevel {
 struct HlTrade {
     coin: String,
     side: String,
-    #[allow(dead_code)]
     px: String,
     sz: String,
     time: i64,
+    tid: i64,
+}
+
+/// Build a RawTrade from a Hyperliquid trade message.
+///
+/// HL `side` is the aggressing (taker) side: `"B"` = taker bought → the buyer
+/// is the taker → `is_buyer_maker = false`; `"A"` = taker sold → the buyer is
+/// the resting maker → `is_buyer_maker = true`. This matches Binance aggTrade
+/// `m` semantics (m=true ⇔ taker sold), so the flag is comparable across
+/// exchanges. Returns `None` on unknown side or unparseable px/sz.
+fn build_raw_trade(exchange: &str, trade: &HlTrade) -> Option<RawTrade> {
+    let is_buyer_maker = match trade.side.as_str() {
+        "B" => false,
+        "A" => true,
+        _ => return None,
+    };
+    let price = trade.px.parse::<f64>().ok()?;
+    let qty = trade.sz.parse::<f64>().ok()?;
+    Some(RawTrade {
+        timestamp_us: trade.time * 1_000,
+        exchange: exchange.to_string(),
+        symbol: trade.coin.clone(),
+        trade_id: trade.tid,
+        price,
+        qty,
+        is_buyer_maker,
+    })
 }
 
 struct PrevSnapshot {
@@ -111,6 +137,7 @@ pub async fn connection_task_hl(
     monitor: MonitorState,
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
+    trade_tx: broadcast::Sender<RawTrade>,
     cancel: CancellationToken,
     metrics: std::sync::Arc<Metrics>,
 ) {
@@ -314,6 +341,19 @@ pub async fn connection_task_hl(
                                     WindowAccumulator::new(adapter.name(), &trade.coin, ts_us)
                                 });
                                 acc.accumulate_trade(size, is_buy);
+
+                                // Persist the tape (px included). Side mapping documented
+                                // on build_raw_trade.
+                                match build_raw_trade(&exchange_name, trade) {
+                                    Some(raw) => {
+                                        if trade_tx.send(raw).is_err() {
+                                            warn!(conn = %name, symbol = %trade.coin, "trade: no receivers");
+                                        }
+                                    }
+                                    None => {
+                                        warn!(conn = %name, symbol = %trade.coin, "trade px parse failed — not persisted");
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -435,13 +475,59 @@ mod tests {
             "side": "B",
             "px": "2500.0",
             "sz": "1.5",
-            "time": 1709654400000_i64
+            "time": 1709654400000_i64,
+            "tid": 118906668,
+            "hash": "0xabc",
+            "users": ["0x1", "0x2"]
         });
         let trade: HlTrade = serde_json::from_value(json).unwrap();
         assert_eq!(trade.coin, "ETH");
         assert_eq!(trade.side, "B");
+        assert_eq!(trade.px, "2500.0");
         assert_eq!(trade.sz, "1.5");
         assert_eq!(trade.time, 1709654400000);
+        assert_eq!(trade.tid, 118906668);
+    }
+
+    fn hl_trade(side: &str) -> HlTrade {
+        HlTrade {
+            coin: "ETH".into(),
+            side: side.into(),
+            px: "2500.5".into(),
+            sz: "1.5".into(),
+            time: 1_709_654_400_000,
+            tid: 42,
+        }
+    }
+
+    /// HL side "B" = taker bought → buyer is taker → is_buyer_maker=false
+    /// (same semantics as Binance m=false).
+    #[test]
+    fn test_hl_trade_to_raw_trade_taker_buy() {
+        let raw = build_raw_trade("hyperliquid", &hl_trade("B")).unwrap();
+        assert_eq!(raw.timestamp_us, 1_709_654_400_000_000);
+        assert_eq!(raw.exchange, "hyperliquid");
+        assert_eq!(raw.symbol, "ETH");
+        assert_eq!(raw.trade_id, 42);
+        assert_eq!(raw.price, 2500.5);
+        assert_eq!(raw.qty, 1.5);
+        assert!(!raw.is_buyer_maker, "taker buy → buyer is NOT the maker");
+    }
+
+    /// HL side "A" = taker sold → buyer is maker → is_buyer_maker=true
+    /// (same semantics as Binance m=true).
+    #[test]
+    fn test_hl_trade_to_raw_trade_taker_sell() {
+        let raw = build_raw_trade("hyperliquid", &hl_trade("A")).unwrap();
+        assert!(raw.is_buyer_maker, "taker sell → buyer IS the maker");
+    }
+
+    #[test]
+    fn test_hl_trade_to_raw_trade_unknown_side_or_bad_number() {
+        assert!(build_raw_trade("hyperliquid", &hl_trade("X")).is_none());
+        let mut bad_px = hl_trade("B");
+        bad_px.px = "oops".into();
+        assert!(build_raw_trade("hyperliquid", &bad_px).is_none());
     }
 
     /// Build an l2Book message with `depth` levels per side.
