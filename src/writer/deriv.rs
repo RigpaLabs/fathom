@@ -28,8 +28,9 @@ use tracing::{info, warn};
 
 use crate::{
     error::Result,
-    metrics::Metrics,
+    metrics::{Feed, Metrics},
     schema::{liquidation_schema, mark_funding_schema, open_interest_schema},
+    writer::batch_bytes,
 };
 
 // Re-export from fathom-types crate.
@@ -134,23 +135,26 @@ impl FeedWriter {
         })
     }
 
-    fn flush_buffer(&mut self) -> Result<()> {
+    /// Write buffered rows to the Parquet writer. Returns the batch byte estimate
+    /// (0 when the buffer is empty).
+    fn flush_buffer(&mut self) -> Result<u64> {
         if self.buffer.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let batch = build_batch(&self.buffer)?;
+        let bytes = batch_bytes(&batch);
         self.writer.write(&batch)?;
         // Force the row group to disk — see module doc for why.
         self.writer.flush()?;
         self.buffer.clear();
-        Ok(())
+        Ok(bytes)
     }
 
-    fn close(mut self) -> Result<()> {
-        self.flush_buffer()?;
+    fn close(mut self) -> Result<u64> {
+        let bytes = self.flush_buffer()?;
         self.writer.finish()?;
         info!(path = %self.path.display(), "closed deriv writer");
-        Ok(())
+        Ok(bytes)
     }
 }
 
@@ -260,12 +264,16 @@ pub async fn run_deriv_writer(
                     && let Some(old) = writers.remove(&key)
                 {
                     match old.close() {
-                        Ok(()) => {
+                        Ok(bytes) => {
                             metrics.parquet_writes_total.inc();
+                            if bytes > 0 {
+                                metrics.record_flush(Feed::Deriv, bytes);
+                            }
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to close deriv writer on rollover");
                             metrics.parquet_write_errors_total.inc();
+                            metrics.record_write_error(Feed::Deriv);
                         }
                     }
                 }
@@ -277,6 +285,8 @@ pub async fn run_deriv_writer(
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to open deriv writer");
+                            metrics.parquet_write_errors_total.inc();
+                            metrics.record_write_error(Feed::Deriv);
                             continue;
                         }
                     }
@@ -293,12 +303,16 @@ pub async fn run_deriv_writer(
         if last_flush.elapsed() >= flush_dur {
             for fw in writers.values_mut() {
                 match fw.flush_buffer() {
-                    Ok(()) => {
+                    Ok(bytes) => {
                         metrics.parquet_writes_total.inc();
+                        if bytes > 0 {
+                            metrics.record_flush(Feed::Deriv, bytes);
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "deriv flush error");
                         metrics.parquet_write_errors_total.inc();
+                        metrics.record_write_error(Feed::Deriv);
                     }
                 }
             }
@@ -309,12 +323,16 @@ pub async fn run_deriv_writer(
     // Graceful shutdown: flush all and finalize footers
     for (_, fw) in writers {
         match fw.close() {
-            Ok(()) => {
+            Ok(bytes) => {
                 metrics.parquet_writes_total.inc();
+                if bytes > 0 {
+                    metrics.record_flush(Feed::Deriv, bytes);
+                }
             }
             Err(e) => {
                 warn!(error = %e, "shutdown: failed to close deriv writer");
                 metrics.parquet_write_errors_total.inc();
+                metrics.record_write_error(Feed::Deriv);
             }
         }
     }

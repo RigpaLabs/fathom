@@ -12,7 +12,13 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::{accumulator::Snapshot1s, error::Result, metrics::Metrics, schema::snap_1s_schema};
+use crate::{
+    accumulator::Snapshot1s,
+    error::Result,
+    metrics::{Feed, Metrics},
+    schema::snap_1s_schema,
+    writer::batch_bytes,
+};
 
 /// Derive UTC date string from event timestamp in microseconds.
 fn date_from_ts_us(ts_us: i64) -> String {
@@ -176,8 +182,13 @@ pub fn write_snap_to_memory(buffer: &[Snapshot1s]) -> Result<Vec<u8>> {
 /// Keeps memory bounded and limits data loss on crash to ~5 min.
 const DEFAULT_DISK_FLUSH_INTERVAL: usize = 300;
 
-struct DayWriter {
-    writer: ArrowWriter<std::fs::File>,
+/// Generic over the underlying sink so tests can inject a failing writer to
+/// exercise the `close()` error path (an already-open `std::fs::File` fd cannot
+/// be made to fail its writes via filesystem tricks). Production always uses
+/// `std::fs::File` (the default type parameter), so the run loop is unchanged
+/// and there is no runtime dispatch cost.
+struct DayWriter<W: std::io::Write + Send = std::fs::File> {
+    writer: ArrowWriter<W>,
     date_str: String,
     path: PathBuf,
     buffer: Vec<Snapshot1s>,
@@ -185,7 +196,7 @@ struct DayWriter {
     disk_flush_interval: usize,
 }
 
-impl DayWriter {
+impl DayWriter<std::fs::File> {
     fn open(
         dir: &Path,
         exchange: &str,
@@ -214,13 +225,18 @@ impl DayWriter {
             disk_flush_interval,
         })
     }
+}
 
-    fn flush(&mut self) -> Result<()> {
+impl<W: std::io::Write + Send> DayWriter<W> {
+    /// Write buffered rows to the Parquet writer. Returns the batch byte estimate
+    /// (0 when the buffer is empty).
+    fn flush(&mut self) -> Result<u64> {
         if self.buffer.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let batch = build_snap_record_batch(&self.buffer)?;
         let n = batch.num_rows();
+        let bytes = batch_bytes(&batch);
         self.writer.write(&batch)?;
         self.buffer.clear();
 
@@ -230,14 +246,33 @@ impl DayWriter {
             self.rows_since_disk_flush = 0;
             info!(path = %self.path.display(), rows = self.disk_flush_interval, "flushed 1s row group");
         }
-        Ok(())
+        Ok(bytes)
     }
 
-    fn close(mut self) -> Result<()> {
-        self.flush()?;
+    fn close(mut self) -> Result<u64> {
+        let bytes = self.flush()?;
         self.writer.finish()?;
         info!(path = %self.path.display(), "closed 1s writer");
-        Ok(())
+        Ok(bytes)
+    }
+}
+
+/// Close a day writer (rollover or shutdown) and record write-health metrics:
+/// success → `parquet_writes_total` + `record_flush`; failure → both error
+/// counters. Shared by both close sites so the metric wiring has one home.
+fn close_and_record<W: std::io::Write + Send>(dw: DayWriter<W>, metrics: &Metrics) {
+    match dw.close() {
+        Ok(bytes) => {
+            metrics.parquet_writes_total.inc();
+            if bytes > 0 {
+                metrics.record_flush(Feed::Snap1s, bytes);
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to close snap writer");
+            metrics.parquet_write_errors_total.inc();
+            metrics.record_write_error(Feed::Snap1s);
+        }
     }
 }
 
@@ -298,9 +333,7 @@ async fn run_snap_writer_inner(
                 if let Some(dw) = writers.get(&key) {
                     if dw.date_str != date_str {
                         if let Some(old) = writers.remove(&key) {
-                            if let Err(e) = old.close() {
-                                warn!(error = %e, "failed to close old snap writer");
-                            }
+                            close_and_record(old, &metrics);
                         }
                     }
                 }
@@ -319,6 +352,8 @@ async fn run_snap_writer_inner(
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to open snap writer");
+                            metrics.parquet_write_errors_total.inc();
+                            metrics.record_write_error(Feed::Snap1s);
                             continue;
                         }
                     }
@@ -328,12 +363,16 @@ async fn run_snap_writer_inner(
                     dw.buffer.push(snap);
                     // Flush immediately — 1 row/sec per symbol, no buffering needed
                     match dw.flush() {
-                        Ok(()) => {
+                        Ok(bytes) => {
                             metrics.parquet_writes_total.inc();
+                            if bytes > 0 {
+                                metrics.record_flush(Feed::Snap1s, bytes);
+                            }
                         }
                         Err(e) => {
                             warn!(error = %e, "snap flush error");
                             metrics.parquet_write_errors_total.inc();
+                            metrics.record_write_error(Feed::Snap1s);
                         }
                     }
                 }
@@ -361,6 +400,8 @@ async fn run_snap_writer_inner(
                 }
                 Err(e) => {
                     warn!(error = %e, "drain: failed to open snap writer");
+                    metrics.parquet_write_errors_total.inc();
+                    metrics.record_write_error(Feed::Snap1s);
                     continue;
                 }
             }
@@ -369,12 +410,16 @@ async fn run_snap_writer_inner(
         if let Some(dw) = writers.get_mut(&key) {
             dw.buffer.push(snap);
             match dw.flush() {
-                Ok(()) => {
+                Ok(bytes) => {
                     metrics.parquet_writes_total.inc();
+                    if bytes > 0 {
+                        metrics.record_flush(Feed::Snap1s, bytes);
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "drain: snap flush error");
                     metrics.parquet_write_errors_total.inc();
+                    metrics.record_write_error(Feed::Snap1s);
                 }
             }
         }
@@ -382,15 +427,103 @@ async fn run_snap_writer_inner(
 
     // Graceful shutdown — close all writers (writes Parquet footers)
     for (_, dw) in writers {
-        match dw.close() {
-            Ok(()) => {
-                metrics.parquet_writes_total.inc();
+        close_and_record(dw, &metrics);
+    }
+    info!("snap_writer shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::metrics::{Feed, FeedLabel, new_metrics};
+
+    use super::*;
+
+    /// A sink that writes fine until `armed`, then fails every write/flush.
+    /// Lets a test drive `DayWriter::close()` into its error path — the footer
+    /// write in `ArrowWriter::finish()` fails — which no filesystem trick can do
+    /// to an already-open `std::fs::File` fd.
+    #[derive(Clone)]
+    struct ArmedFailWriter {
+        armed: Arc<AtomicBool>,
+    }
+
+    impl Write for ArmedFailWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.armed.load(Ordering::Relaxed) {
+                Err(std::io::Error::other("injected write failure"))
+            } else {
+                Ok(buf.len())
             }
-            Err(e) => {
-                warn!(error = %e, "shutdown: failed to close snap writer");
-                metrics.parquet_write_errors_total.inc();
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.armed.load(Ordering::Relaxed) {
+                Err(std::io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
             }
         }
     }
-    info!("snap_writer shutdown complete");
+
+    /// Regression test for the day-rollover close path: when closing the old
+    /// day's writer fails, `close_and_record` (used by the rollover and shutdown
+    /// sites) must bump both error counters for the 1s feed. Previously the
+    /// rollover close only logged a warning, so a persistent close failure was
+    /// invisible to alerting.
+    #[test]
+    fn close_failure_records_write_error() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let sink = ArmedFailWriter {
+            armed: armed.clone(),
+        };
+        let schema = SchemaRef::new(snap_1s_schema().clone());
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        // try_new writes the file magic — must succeed, so arm only afterward.
+        let writer = ArrowWriter::try_new(sink, schema, Some(props)).unwrap();
+        let dw = DayWriter {
+            writer,
+            date_str: "2025-01-15".to_string(),
+            path: PathBuf::from("<injected>"),
+            buffer: Vec::new(),
+            rows_since_disk_flush: 0,
+            disk_flush_interval: 300,
+        };
+
+        let handle = new_metrics();
+        armed.store(true, Ordering::Relaxed); // now finish()'s footer write fails
+        close_and_record(dw, &handle.metrics);
+
+        let label = FeedLabel {
+            feed: Feed::Snap1s.as_str().to_string(),
+        };
+        assert_eq!(
+            handle
+                .metrics
+                .write_errors_total
+                .get_or_create(&label)
+                .get(),
+            1,
+            "close failure must increment write_errors_total{{1s}}"
+        );
+        assert_eq!(
+            handle.metrics.parquet_write_errors_total.get(),
+            1,
+            "close failure must also increment the legacy error counter"
+        );
+        assert_eq!(
+            handle
+                .metrics
+                .parquet_bytes_written_total
+                .get_or_create(&label)
+                .get(),
+            0,
+            "a failed close records no bytes"
+        );
+    }
 }
