@@ -4,6 +4,48 @@ use std::sync::OnceLock;
 static RAW_SCHEMA: OnceLock<Schema> = OnceLock::new();
 static SNAP_1S_SCHEMA: OnceLock<Schema> = OnceLock::new();
 static TRADES_SCHEMA: OnceLock<Schema> = OnceLock::new();
+static MARK_FUNDING_SCHEMA: OnceLock<Schema> = OnceLock::new();
+static OPEN_INTEREST_SCHEMA: OnceLock<Schema> = OnceLock::new();
+static LIQUIDATION_SCHEMA: OnceLock<Schema> = OnceLock::new();
+
+pub fn mark_funding_schema() -> &'static Schema {
+    MARK_FUNDING_SCHEMA.get_or_init(|| {
+        Schema::new(vec![
+            Field::new("timestamp_us", DataType::Int64, false),
+            Field::new("exchange", DataType::Utf8, false),
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("mark_px", DataType::Float64, false),
+            Field::new("index_px", DataType::Float64, true),
+            Field::new("funding_rate", DataType::Float64, false),
+            Field::new("next_funding_ts", DataType::Int64, true),
+        ])
+    })
+}
+
+pub fn open_interest_schema() -> &'static Schema {
+    OPEN_INTEREST_SCHEMA.get_or_init(|| {
+        Schema::new(vec![
+            Field::new("timestamp_us", DataType::Int64, false),
+            Field::new("exchange", DataType::Utf8, false),
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("oi_base", DataType::Float64, false),
+            Field::new("oi_quote", DataType::Float64, true),
+        ])
+    })
+}
+
+pub fn liquidation_schema() -> &'static Schema {
+    LIQUIDATION_SCHEMA.get_or_init(|| {
+        Schema::new(vec![
+            Field::new("timestamp_us", DataType::Int64, false),
+            Field::new("exchange", DataType::Utf8, false),
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("side", DataType::Utf8, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("qty", DataType::Float64, false),
+        ])
+    })
+}
 
 pub fn trades_schema() -> &'static Schema {
     TRADES_SCHEMA.get_or_init(|| {

@@ -8,6 +8,7 @@ use chrono::Timelike;
 use fathom::{
     accumulator::Snapshot1s,
     writer::{
+        deriv::{DerivEvent, Liquidation, MarkFunding, OpenInterest, run_deriv_writer},
         raw::RawDiff,
         raw::{bucket_open, run_raw_writer},
         snap_1s::{run_snap_writer, run_snap_writer_with_flush_interval},
@@ -903,4 +904,218 @@ fn collect_parquets(dir: &PathBuf, acc: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+// ── Deriv writer ──────────────────────────────────────────────────────────────
+
+fn mk_funding(ts_us: i64) -> DerivEvent {
+    DerivEvent::MarkFunding(MarkFunding {
+        timestamp_us: ts_us,
+        exchange: "binance_perp".to_string(),
+        symbol: "ETHUSDT".to_string(),
+        mark_px: 3000.12,
+        index_px: Some(3000.05),
+        funding_rate: 0.0001,
+        next_funding_ts: Some(ts_us + 8 * 3600 * 1_000_000),
+    })
+}
+
+#[tokio::test]
+async fn test_deriv_writer_daily_file_per_feed_and_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<DerivEvent>(64);
+    let writer = tokio::spawn(run_deriv_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    // Fixed event time → deterministic daily file name (2023-11-14 UTC).
+    let ts_us = 1_700_000_000_000_000_i64;
+    tx.send(mk_funding(ts_us)).unwrap();
+    tx.send(mk_funding(ts_us + 1_000_000)).unwrap();
+    tx.send(DerivEvent::OpenInterest(OpenInterest {
+        timestamp_us: ts_us,
+        exchange: "binance_perp".to_string(),
+        symbol: "ETHUSDT".to_string(),
+        oi_base: 10_659.509,
+        oi_quote: None,
+    }))
+    .unwrap();
+    tx.send(DerivEvent::Liquidation(Liquidation {
+        timestamp_us: ts_us,
+        exchange: "binance_perp".to_string(),
+        symbol: "ETHUSDT".to_string(),
+        side: "SELL".to_string(),
+        price: 2998.4,
+        qty: 0.014,
+    }))
+    .unwrap();
+
+    drop(tx);
+    writer.await.unwrap();
+
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(files.len(), 3, "one daily file per feed: {files:?}");
+    let by_name = |name: &str| -> PathBuf {
+        files
+            .iter()
+            .find(|f| f.file_name().unwrap().to_str().unwrap() == name)
+            .unwrap_or_else(|| panic!("missing {name} in {files:?}"))
+            .clone()
+    };
+
+    // Layout: deriv/{exchange}/{symbol}/{date}/{feed}.parquet, date from event ts.
+    let funding = by_name("funding.parquet");
+    assert!(
+        funding
+            .to_string_lossy()
+            .contains("/deriv/binance_perp/ETHUSDT/2023-11-14/"),
+        "layout must be deriv/{{exchange}}/{{symbol}}/{{date}}: {funding:?}"
+    );
+    assert_eq!(count_parquet_rows(&funding), 2);
+    assert_eq!(count_parquet_rows(&by_name("oi.parquet")), 1);
+    assert_eq!(count_parquet_rows(&by_name("liq.parquet")), 1);
+
+    use arrow_array::{Array, Float64Array, Int64Array, StringArray};
+
+    // funding.parquet values
+    let file = std::fs::File::open(&funding).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let schema = reader.schema().clone();
+    for col in [
+        "timestamp_us",
+        "exchange",
+        "symbol",
+        "mark_px",
+        "index_px",
+        "funding_rate",
+        "next_funding_ts",
+    ] {
+        schema.field_with_name(col).expect(col);
+    }
+    let batch = reader.build().unwrap().next().unwrap().unwrap();
+    let ts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ts.value(0), ts_us);
+    let mark = batch
+        .column_by_name("mark_px")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(mark.value(0), 3000.12);
+    let index = batch
+        .column_by_name("index_px")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(index.value(0), 3000.05);
+    let rate = batch
+        .column_by_name("funding_rate")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(rate.value(0), 0.0001);
+    let nft = batch
+        .column_by_name("next_funding_ts")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(nft.value(0), ts_us + 8 * 3600 * 1_000_000);
+
+    // oi.parquet: oi_quote must be null (None)
+    let file = std::fs::File::open(&by_name("oi.parquet")).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let batch = reader.build().unwrap().next().unwrap().unwrap();
+    let oi_base = batch
+        .column_by_name("oi_base")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(oi_base.value(0), 10_659.509);
+    let oi_quote = batch
+        .column_by_name("oi_quote")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert!(oi_quote.is_null(0), "oi_quote None must round-trip as null");
+
+    // liq.parquet values
+    let file = std::fs::File::open(&by_name("liq.parquet")).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let batch = reader.build().unwrap().next().unwrap().unwrap();
+    let side = batch
+        .column_by_name("side")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(side.value(0), "SELL");
+    let price = batch
+        .column_by_name("price")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(price.value(0), 2998.4);
+    let qty = batch
+        .column_by_name("qty")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(qty.value(0), 0.014);
+}
+
+#[tokio::test]
+async fn test_deriv_writer_day_rollover_by_event_time() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<DerivEvent>(64);
+    let writer = tokio::spawn(run_deriv_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    // 2023-11-14 22:13 then +27.8h → 2023-11-16: two daily funding files.
+    tx.send(mk_funding(1_700_000_000_000_000)).unwrap();
+    tx.send(mk_funding(1_700_100_000_000_000)).unwrap();
+
+    drop(tx);
+    writer.await.unwrap();
+
+    let files = find_parquets(&dir.path().to_path_buf());
+    assert_eq!(files.len(), 2, "day rollover → two files: {files:?}");
+    let paths: Vec<String> = files.iter().map(|f| f.to_string_lossy().into()).collect();
+    assert!(paths.iter().any(|p| p.contains("/2023-11-14/")));
+    assert!(paths.iter().any(|p| p.contains("/2023-11-16/")));
+    for f in &files {
+        assert_eq!(count_parquet_rows(f), 1);
+    }
+}
+
+#[tokio::test]
+async fn test_deriv_writer_empty_channel() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<DerivEvent>(64);
+    let writer = tokio::spawn(run_deriv_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+    drop(tx);
+    writer.await.unwrap();
+    assert!(find_parquets(&dir.path().to_path_buf()).is_empty());
 }
