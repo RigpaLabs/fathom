@@ -1367,6 +1367,65 @@ async fn test_snap_writer_records_bytes_and_last_flush() {
 }
 
 #[tokio::test]
+async fn test_snap_writer_day_rollover_records_metrics_no_errors() {
+    // Drives a real day rollover (two UTC days) through run_snap_writer so the
+    // rollover close path (close_and_record) executes in the live loop. The
+    // close must succeed: no write errors, and byte/last-flush metrics recorded.
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_snap_writer_with_flush_interval(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        CancellationToken::new(),
+        handle.metrics.clone(),
+    ));
+
+    let day1_ts = 1_736_942_400_000_000_i64; // 2025-01-15T12:00:00Z
+    tx.send(make_snap("binance_spot", "ETHUSDT", day1_ts))
+        .unwrap();
+    // +12h1s crosses midnight → triggers rollover close of the day-1 writer.
+    let day2_ts = day1_ts + 12 * 3600 * 1_000_000 + 1_000_000;
+    tx.send(make_snap("binance_spot", "ETHUSDT", day2_ts))
+        .unwrap();
+
+    drop(tx);
+    writer.await.unwrap();
+
+    // Two daily files → the rollover close ran.
+    assert_eq!(find_parquets(&dir.path().to_path_buf()).len(), 2);
+
+    let label = feed_label(Feed::Snap1s);
+    assert_eq!(
+        handle
+            .metrics
+            .write_errors_total
+            .get_or_create(&label)
+            .get(),
+        0,
+        "healthy rollover must not record write errors"
+    );
+    assert!(
+        handle
+            .metrics
+            .parquet_bytes_written_total
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "rollover run should record bytes written"
+    );
+    assert!(
+        handle
+            .metrics
+            .last_flush_timestamp
+            .get_or_create(&label)
+            .get()
+            > 0
+    );
+}
+
+#[tokio::test]
 async fn test_snap_writer_records_write_error_on_failure() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("1s"), b"not a dir").unwrap();
