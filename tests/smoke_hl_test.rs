@@ -24,6 +24,7 @@ use fathom::{
     exchange::Hyperliquid,
     monitor,
     writer::{
+        deriv::DerivEvent,
         raw::{RawDiff, run_raw_writer},
         snap_1s::run_snap_writer,
         trades::RawTrade,
@@ -59,6 +60,7 @@ async fn live_hl_eth_pipeline() {
     let (raw_tx, raw_rx) = broadcast::channel::<RawDiff>(1_024);
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
     let (trade_tx, _trade_rx) = broadcast::channel::<RawTrade>(1_024);
+    let (deriv_tx, _deriv_rx) = broadcast::channel::<DerivEvent>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
@@ -83,6 +85,7 @@ async fn live_hl_eth_pipeline() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -177,6 +180,7 @@ async fn live_hl_multi_symbol() {
     let (raw_tx, raw_rx) = broadcast::channel::<RawDiff>(1_024);
     let (snap_tx, snap_rx) = broadcast::channel::<Snapshot1s>(1_024);
     let (trade_tx, _trade_rx) = broadcast::channel::<RawTrade>(1_024);
+    let (deriv_tx, _deriv_rx) = broadcast::channel::<DerivEvent>(1_024);
 
     let raw_handle = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
@@ -201,6 +205,7 @@ async fn live_hl_multi_symbol() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));

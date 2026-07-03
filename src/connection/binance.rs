@@ -17,7 +17,11 @@ use crate::{
     metrics::Metrics,
     monitor::MonitorState,
     orderbook::{DepthDiff, OrderBook, SnapshotMsg},
-    writer::{raw::RawDiff, trades::RawTrade},
+    writer::{
+        deriv::{DerivEvent, Liquidation, MarkFunding, OpenInterest},
+        raw::RawDiff,
+        trades::RawTrade,
+    },
 };
 
 use super::runtime::{self, BACKOFF_START_MS, DEFAULT_HEARTBEAT_TIMEOUT_S, RATE_LIMIT_BACKOFF_S};
@@ -171,6 +175,216 @@ fn handle_agg_trade(
     }
 }
 
+// ── Derivatives: markPrice / forceOrder / openInterest (binance_perp only) ────
+//
+// These handlers publish to the deriv channel and deliberately do NOT call
+// `runtime::record_event` — depth-liveness stays meaningful (same decision as
+// trades): a connection receiving only mark prices while depth is stalled must
+// still look stale to the monitor.
+
+/// Binance markPrice event payload (combined stream `{sym}@markPrice@1s`).
+#[derive(Debug, Deserialize)]
+pub struct MarkPriceUpdate {
+    #[serde(rename = "E")]
+    pub event_time_ms: i64,
+    /// Mark price.
+    #[serde(rename = "p")]
+    pub mark_px: String,
+    /// Index price.
+    #[serde(rename = "i")]
+    pub index_px: String,
+    /// Funding rate.
+    #[serde(rename = "r")]
+    pub funding_rate: String,
+    /// Next funding time (ms).
+    #[serde(rename = "T")]
+    pub next_funding_time_ms: i64,
+}
+
+/// Build a MarkFunding from a parsed markPrice event (ms → µs).
+/// Returns `None` if any numeric string doesn't parse.
+pub fn mark_price_to_funding(
+    exchange: &str,
+    symbol: &str,
+    ev: &MarkPriceUpdate,
+) -> Option<MarkFunding> {
+    Some(MarkFunding {
+        timestamp_us: ev.event_time_ms * 1_000,
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
+        mark_px: ev.mark_px.parse::<f64>().ok()?,
+        index_px: Some(ev.index_px.parse::<f64>().ok()?),
+        funding_rate: ev.funding_rate.parse::<f64>().ok()?,
+        next_funding_ts: Some(ev.next_funding_time_ms * 1_000),
+    })
+}
+
+/// Binance forceOrder (liquidation) event payload — the order object `o`.
+#[derive(Debug, Deserialize)]
+pub struct ForceOrderUpdate {
+    #[serde(rename = "o")]
+    pub order: ForceOrder,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForceOrder {
+    /// Side of the forced order (`BUY` / `SELL`).
+    #[serde(rename = "S")]
+    pub side: String,
+    /// Original quantity.
+    #[serde(rename = "q")]
+    pub qty: String,
+    /// Average fill price.
+    #[serde(rename = "ap")]
+    pub avg_price: String,
+    /// Trade time (ms).
+    #[serde(rename = "T")]
+    pub trade_time_ms: i64,
+}
+
+/// Build a Liquidation from a parsed forceOrder event. Price is the average
+/// fill price (`ap`), not the order price. Returns `None` on unparseable numbers.
+pub fn force_order_to_liquidation(
+    exchange: &str,
+    symbol: &str,
+    ev: &ForceOrderUpdate,
+) -> Option<Liquidation> {
+    Some(Liquidation {
+        timestamp_us: ev.order.trade_time_ms * 1_000,
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
+        side: ev.order.side.clone(),
+        price: ev.order.avg_price.parse::<f64>().ok()?,
+        qty: ev.order.qty.parse::<f64>().ok()?,
+    })
+}
+
+/// GET /fapi/v1/openInterest response.
+#[derive(Debug, Deserialize)]
+pub struct OpenInterestRest {
+    #[serde(rename = "openInterest")]
+    pub open_interest: String,
+    pub symbol: String,
+    #[serde(rename = "time")]
+    pub time_ms: i64,
+}
+
+/// Build an OpenInterest from the REST response (base units only — the
+/// endpoint has no quote-denominated figure).
+pub fn oi_rest_to_open_interest(exchange: &str, resp: &OpenInterestRest) -> Option<OpenInterest> {
+    Some(OpenInterest {
+        timestamp_us: resp.time_ms * 1_000,
+        exchange: exchange.to_string(),
+        symbol: resp.symbol.clone(),
+        oi_base: resp.open_interest.parse::<f64>().ok()?,
+        oi_quote: None,
+    })
+}
+
+/// Handle one markPrice event: parse and publish MarkFunding to the deriv channel.
+fn handle_mark_price(
+    conn_name: &str,
+    exchange_name: &str,
+    symbol: &str,
+    data: serde_json::Value,
+    deriv_tx: &broadcast::Sender<DerivEvent>,
+) {
+    let ev: MarkPriceUpdate = match serde_json::from_value(data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(mf) = mark_price_to_funding(exchange_name, symbol, &ev) else {
+        warn!(conn = %conn_name, symbol = %symbol, "markPrice numeric parse failed");
+        return;
+    };
+    if deriv_tx.send(DerivEvent::MarkFunding(mf)).is_err() {
+        warn!(conn = %conn_name, symbol = %symbol, "deriv: no receivers");
+    }
+}
+
+/// Handle one forceOrder event: parse and publish Liquidation to the deriv channel.
+fn handle_force_order(
+    conn_name: &str,
+    exchange_name: &str,
+    symbol: &str,
+    data: serde_json::Value,
+    deriv_tx: &broadcast::Sender<DerivEvent>,
+) {
+    let ev: ForceOrderUpdate = match serde_json::from_value(data) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(liq) = force_order_to_liquidation(exchange_name, symbol, &ev) else {
+        warn!(conn = %conn_name, symbol = %symbol, "forceOrder numeric parse failed");
+        return;
+    };
+    if deriv_tx.send(DerivEvent::Liquidation(liq)).is_err() {
+        warn!(conn = %conn_name, symbol = %symbol, "deriv: no receivers");
+    }
+}
+
+/// Poll interval for the open-interest REST endpoint (per symbol batch).
+const OI_POLL_INTERVAL_S: u64 = 60;
+
+/// Background open-interest REST poll (binance_perp only — spot and HL return
+/// no URLs). Fully independent from the WS path: any error is warn + continue,
+/// never triggers reconnects (specs/derivatives-feeds.md acceptance).
+async fn poll_open_interest(
+    conn_name: String,
+    exchange_name: String,
+    urls: Vec<(String, String)>, // (symbol, url)
+    http_client: reqwest::Client,
+    deriv_tx: broadcast::Sender<DerivEvent>,
+    cancel: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(OI_POLL_INTERVAL_S));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!(conn = %conn_name, "OI poll: shutdown");
+                return;
+            }
+            _ = interval.tick() => {}
+        }
+        for (symbol, url) in &urls {
+            let body = match http_client.get(url).send().await {
+                Ok(resp) => match resp.error_for_status() {
+                    Ok(resp) => match resp.text().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(conn = %conn_name, symbol = %symbol, error = %e, "OI poll body read failed");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        warn!(conn = %conn_name, symbol = %symbol, error = %e, "OI poll HTTP error");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    warn!(conn = %conn_name, symbol = %symbol, error = %e, "OI poll request failed");
+                    continue;
+                }
+            };
+            let resp: OpenInterestRest = match serde_json::from_str(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(conn = %conn_name, symbol = %symbol, error = %e, "OI poll parse failed");
+                    continue;
+                }
+            };
+            let Some(oi) = oi_rest_to_open_interest(&exchange_name, &resp) else {
+                warn!(conn = %conn_name, symbol = %symbol, "OI numeric parse failed");
+                continue;
+            };
+            if deriv_tx.send(DerivEvent::OpenInterest(oi)).is_err() {
+                warn!(conn = %conn_name, symbol = %symbol, "deriv: no receivers (OI)");
+            }
+        }
+    }
+}
+
 // ── Connection task ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -182,6 +396,7 @@ pub async fn connection_task(
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
     trade_tx: broadcast::Sender<RawTrade>,
+    deriv_tx: broadcast::Sender<DerivEvent>,
     cancel: CancellationToken,
     metrics: std::sync::Arc<Metrics>,
 ) {
@@ -204,6 +419,23 @@ pub async fn connection_task(
         .timeout(Duration::from_secs(30))
         .build()
         .expect("reqwest client");
+
+    // Open-interest REST poll (perp only): spawned once, outside the reconnect
+    // loop — it must survive WS reconnects and never affect them. Exits on cancel.
+    let oi_urls: Vec<(String, String)> = symbols
+        .iter()
+        .filter_map(|s| adapter.open_interest_url(s).map(|u| (s.clone(), u)))
+        .collect();
+    let _oi_poll = (!oi_urls.is_empty()).then(|| {
+        tokio::spawn(poll_open_interest(
+            name.clone(),
+            exchange_name.clone(),
+            oi_urls,
+            http_client.clone(),
+            deriv_tx.clone(),
+            cancel.clone(),
+        ))
+    });
 
     loop {
         if cancel.is_cancelled() {
@@ -370,6 +602,14 @@ pub async fn connection_task(
                         &mut accumulators,
                         &trade_tx,
                     );
+                    continue;
+                }
+                if combined.stream.ends_with("@markPrice@1s") {
+                    handle_mark_price(&name, &exchange_name, &symbol, combined.data, &deriv_tx);
+                    continue;
+                }
+                if combined.stream.ends_with("@forceOrder") {
+                    handle_force_order(&name, &exchange_name, &symbol, combined.data, &deriv_tx);
                     continue;
                 }
 
@@ -580,6 +820,14 @@ pub async fn connection_task(
                         );
                         continue;
                     }
+                    if combined.stream.ends_with("@markPrice@1s") {
+                        handle_mark_price(&name, &exchange_name, &symbol, combined.data, &deriv_tx);
+                        continue;
+                    }
+                    if combined.stream.ends_with("@forceOrder") {
+                        handle_force_order(&name, &exchange_name, &symbol, combined.data, &deriv_tx);
+                        continue;
+                    }
 
                     let depth: DepthUpdate = match serde_json::from_value(combined.data) {
                         Ok(v) => v,
@@ -743,6 +991,137 @@ mod tests {
             is_buyer_maker: false,
         };
         assert!(agg_trade_to_raw("binance_spot", "ETHUSDT", &ev).is_none());
+    }
+
+    /// Real-shaped Binance combined-stream markPrice@1s message.
+    fn mark_price_json() -> String {
+        serde_json::json!({
+            "stream": "ethusdt@markPrice@1s",
+            "data": {
+                "e": "markPriceUpdate",
+                "E": 1_700_000_001_000_i64,
+                "s": "ETHUSDT",
+                "p": "3000.12345678",
+                "i": "3000.05000000",
+                "P": "3001.00000000",
+                "r": "0.00010000",
+                "T": 1_700_028_800_000_i64
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_mark_price_parse_to_mark_funding() {
+        let combined: WsCombined = serde_json::from_str(&mark_price_json()).unwrap();
+        assert!(combined.stream.ends_with("@markPrice@1s"));
+
+        let ev: MarkPriceUpdate = serde_json::from_value(combined.data).unwrap();
+        let mf = mark_price_to_funding("binance_perp", "ETHUSDT", &ev).unwrap();
+
+        assert_eq!(
+            mf.timestamp_us, 1_700_000_001_000_000,
+            "E (event time) in µs"
+        );
+        assert_eq!(mf.exchange, "binance_perp");
+        assert_eq!(mf.symbol, "ETHUSDT");
+        assert_eq!(mf.mark_px, 3000.12345678);
+        assert_eq!(mf.index_px, Some(3000.05));
+        assert_eq!(mf.funding_rate, 0.0001, "r string → f64");
+        assert_eq!(
+            mf.next_funding_ts,
+            Some(1_700_028_800_000_000),
+            "T (next funding time) in µs"
+        );
+    }
+
+    #[test]
+    fn test_mark_price_unparseable_rate_returns_none() {
+        let ev = MarkPriceUpdate {
+            event_time_ms: 1_700_000_000_000,
+            mark_px: "3000.0".into(),
+            index_px: "3000.0".into(),
+            funding_rate: "not_a_number".into(),
+            next_funding_time_ms: 1_700_028_800_000,
+        };
+        assert!(mark_price_to_funding("binance_perp", "ETHUSDT", &ev).is_none());
+    }
+
+    /// Real-shaped Binance combined-stream forceOrder message.
+    fn force_order_json() -> String {
+        serde_json::json!({
+            "stream": "ethusdt@forceOrder",
+            "data": {
+                "e": "forceOrder",
+                "E": 1_700_000_001_100_i64,
+                "o": {
+                    "s": "ETHUSDT",
+                    "S": "SELL",
+                    "o": "LIMIT",
+                    "f": "IOC",
+                    "q": "0.014",
+                    "p": "9910",
+                    "ap": "9910.5",
+                    "X": "FILLED",
+                    "l": "0.014",
+                    "z": "0.014",
+                    "T": 1_700_000_001_099_i64
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_force_order_parse_to_liquidation() {
+        let combined: WsCombined = serde_json::from_str(&force_order_json()).unwrap();
+        assert!(combined.stream.ends_with("@forceOrder"));
+
+        let ev: ForceOrderUpdate = serde_json::from_value(combined.data).unwrap();
+        let liq = force_order_to_liquidation("binance_perp", "ETHUSDT", &ev).unwrap();
+
+        assert_eq!(
+            liq.timestamp_us, 1_700_000_001_099_000,
+            "o.T (trade time) in µs"
+        );
+        assert_eq!(liq.exchange, "binance_perp");
+        assert_eq!(liq.symbol, "ETHUSDT");
+        assert_eq!(liq.side, "SELL");
+        assert_eq!(liq.price, 9910.5, "avg price o.ap, not order price o.p");
+        assert_eq!(liq.qty, 0.014);
+    }
+
+    #[test]
+    fn test_force_order_unparseable_price_returns_none() {
+        let json = serde_json::json!({
+            "o": {"S": "BUY", "q": "1.0", "ap": "oops", "T": 1_700_000_000_000_i64}
+        });
+        let ev: ForceOrderUpdate = serde_json::from_value(json).unwrap();
+        assert!(force_order_to_liquidation("binance_perp", "ETHUSDT", &ev).is_none());
+    }
+
+    /// GET /fapi/v1/openInterest response shape.
+    #[test]
+    fn test_open_interest_rest_parse() {
+        let body = r#"{"openInterest":"10659.509","symbol":"BTCUSDT","time":1583127900000}"#;
+        let resp: OpenInterestRest = serde_json::from_str(body).unwrap();
+        let oi = oi_rest_to_open_interest("binance_perp", &resp).unwrap();
+
+        assert_eq!(oi.timestamp_us, 1_583_127_900_000_000, "time (ms) in µs");
+        assert_eq!(oi.exchange, "binance_perp");
+        assert_eq!(oi.symbol, "BTCUSDT");
+        assert_eq!(oi.oi_base, 10_659.509);
+        assert_eq!(oi.oi_quote, None, "endpoint reports base units only");
+    }
+
+    #[test]
+    fn test_open_interest_rest_unparseable_returns_none() {
+        let resp = OpenInterestRest {
+            open_interest: "oops".into(),
+            symbol: "BTCUSDT".into(),
+            time_ms: 1_583_127_900_000,
+        };
+        assert!(oi_rest_to_open_interest("binance_perp", &resp).is_none());
     }
 
     /// m=true → buyer is maker → the taker SOLD → sell_vol, negative delta.

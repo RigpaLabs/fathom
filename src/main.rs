@@ -10,7 +10,7 @@ use fathom::{
     connection::{connection_task, connection_task_dydx, connection_task_hl},
     exchange::{BinancePerp, BinanceSpot, Hyperliquid},
     metrics, monitor, nats_sink,
-    writer::{raw::RawDiff, snap_1s::run_snap_writer, trades::RawTrade},
+    writer::{deriv::DerivEvent, raw::RawDiff, snap_1s::run_snap_writer, trades::RawTrade},
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +28,7 @@ const RAW_FLUSH_INTERVAL_S: u64 = 5;
 /// | Raw Parquet writer  | **Fatal** — process exit                             |
 /// | Snap Parquet writer | **Fatal** — process exit                             |
 /// | Trades Parquet writer | **Fatal** — process exit                           |
+/// | Deriv Parquet writer | **Fatal** — process exit                            |
 /// | NATS sink           | Warn + continue                                      |
 /// | Metrics server      | Warn + continue                                      |
 /// | Monitor             | Warn + continue                                      |
@@ -68,10 +69,12 @@ async fn main() -> anyhow::Result<()> {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(CHANNEL_BUFFER);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(CHANNEL_BUFFER);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(CHANNEL_BUFFER);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(CHANNEL_BUFFER);
 
     let raw_rx_parquet = raw_tx.subscribe();
     let snap_rx_parquet = snap_tx.subscribe();
     let trade_rx_parquet = trade_tx.subscribe();
+    let deriv_rx_parquet = deriv_tx.subscribe();
 
     // Metrics: Prometheus /metrics + /health HTTP server
     // Failure policy: Warn + continue (ancillary, does not affect data integrity)
@@ -106,6 +109,12 @@ async fn main() -> anyhow::Result<()> {
         cfg.raw_rotate_hours,
         metrics_handle_data.metrics.clone(),
     ));
+    let mut deriv_handle = tokio::spawn(fathom::writer::deriv::run_deriv_writer(
+        data_dir.clone(),
+        deriv_rx_parquet,
+        RAW_FLUSH_INTERVAL_S,
+        metrics_handle_data.metrics.clone(),
+    ));
 
     // Monitor: Warn + continue (health tracking only, not on the write path)
     let mon_handle = tokio::spawn(monitor::run_monitor(
@@ -119,11 +128,13 @@ async fn main() -> anyhow::Result<()> {
         let raw_rx_nats = raw_tx.subscribe();
         let snap_rx_nats = snap_tx.subscribe();
         let trade_rx_nats = trade_tx.subscribe();
+        let deriv_rx_nats = deriv_tx.subscribe();
         Some(tokio::spawn(nats_sink::run(
             nats_cfg.clone(),
             snap_rx_nats,
             raw_rx_nats,
             trade_rx_nats,
+            deriv_rx_nats,
         )))
     } else {
         None
@@ -136,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
         let rtx = raw_tx.clone();
         let stx = snap_tx.clone();
         let ttx = trade_tx.clone();
+        let dtx = deriv_tx.clone();
         let ct = cancel.clone();
         let m = metrics_handle_data.metrics.clone();
         match conn.exchange {
@@ -148,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ttx,
+                    dtx,
                     ct,
                     m,
                 )));
@@ -161,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ttx,
+                    dtx,
                     ct,
                     m,
                 )));
@@ -174,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ttx,
+                    dtx,
                     ct,
                     m,
                 )));
@@ -200,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         &mut raw_handle,
         &mut snap_handle,
         &mut trades_handle,
+        &mut deriv_handle,
         &cancel,
     )
     .await?;
@@ -218,11 +234,13 @@ async fn main() -> anyhow::Result<()> {
     drop(raw_tx);
     drop(snap_tx);
     drop(trade_tx);
+    drop(deriv_tx);
 
     // Await writers so all buffered data is flushed before exit.
     let _ = raw_handle.await;
     let _ = snap_handle.await;
     let _ = trades_handle.await;
+    let _ = deriv_handle.await;
     // Await NATS sink so in-flight JetStream publishes complete.
     if let Some(h) = nats_handle {
         let _ = h.await;
@@ -251,6 +269,7 @@ async fn wait_for_shutdown_or_writer_exit(
     raw_handle: &mut tokio::task::JoinHandle<()>,
     snap_handle: &mut tokio::task::JoinHandle<()>,
     trades_handle: &mut tokio::task::JoinHandle<()>,
+    deriv_handle: &mut tokio::task::JoinHandle<()>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -268,6 +287,10 @@ async fn wait_for_shutdown_or_writer_exit(
             }
             result = &mut *trades_handle => {
                 tracing::error!("FATAL: trades parquet writer exited unexpectedly: {:?}", result);
+                std::process::exit(1);
+            }
+            result = &mut *deriv_handle => {
+                tracing::error!("FATAL: deriv parquet writer exited unexpectedly: {:?}", result);
                 std::process::exit(1);
             }
             _ = cancel.cancelled() => {}
@@ -289,6 +312,10 @@ async fn wait_for_shutdown_or_writer_exit(
             }
             result = &mut *trades_handle => {
                 tracing::error!("FATAL: trades parquet writer exited unexpectedly: {:?}", result);
+                std::process::exit(1);
+            }
+            result = &mut *deriv_handle => {
+                tracing::error!("FATAL: deriv parquet writer exited unexpectedly: {:?}", result);
                 std::process::exit(1);
             }
             _ = cancel.cancelled() => {}

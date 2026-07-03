@@ -42,6 +42,42 @@ One row per trade — Binance aggTrade (spot + perp) and Hyperliquid `trades`. S
 
 Files: `{data_dir}/trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet` (hourly rotation, `src/writer/trades.rs`).
 
+## Derivatives feeds (`MarkFunding`, `OpenInterest`, `Liquidation`)
+
+Structs: `crates/fathom-types/src/lib.rs`; Arrow schemas: `src/schema.rs::{mark_funding_schema, open_interest_schema, liquidation_schema}`. Full contract: [derivatives-feeds.md](derivatives-feeds.md).
+
+**`MarkFunding`** — one row per markPrice event (Binance, 1/s) / activeAssetCtx message (HL, ~1/s). Mark+funding arrive together on both venues, so mark is folded in — there is no separate mark feed.
+
+| Column | Type | Notes |
+|---|---|---|
+| `timestamp_us` | i64 | Binance `E` (µs); HL: receipt time (message has no exchange ts) |
+| `exchange`, `symbol` | utf8 | |
+| `mark_px` | f64 | Binance `p` / HL `markPx` |
+| `index_px` | f64 (nullable) | Binance `i` (index) / HL `oraclePx` |
+| `funding_rate` | f64 | As sent by venue (per funding interval, not annualized) |
+| `next_funding_ts` | i64 (nullable, µs) | Binance `T`; null for HL (hourly funding, no discrete ts) |
+
+**`OpenInterest`** — Binance: REST poll 60 s; HL: from activeAssetCtx.
+
+| Column | Type | Notes |
+|---|---|---|
+| `timestamp_us` | i64 | Binance REST `time` (µs); HL: receipt time |
+| `exchange`, `symbol` | utf8 | |
+| `oi_base` | f64 | Base units |
+| `oi_quote` | f64 (nullable) | Null on both current venues (base-only sources) |
+
+**`Liquidation`** — Binance perp `forceOrder` only (HL has no public liquidation channel here). Note: Binance streams at most one forceOrder per symbol per second — a signal, not a complete tape.
+
+| Column | Type | Notes |
+|---|---|---|
+| `timestamp_us` | i64 | `o.T` (µs) |
+| `exchange`, `symbol` | utf8 | |
+| `side` | utf8 | `o.S` — `SELL` = long liquidated |
+| `price` | f64 | `o.ap` (average fill price) |
+| `qty` | f64 | `o.q`, base units |
+
+Files: `{data_dir}/deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}.parquet` (daily, `src/writer/deriv.rs`).
+
 ## 1s snapshot (`Snapshot1s`)
 
 1 row/sec/symbol, 64 columns (`src/schema.rs`):
@@ -59,4 +95,4 @@ Field caveats (read before using):
 
 ## Wire format (NATS payloads)
 
-`wire_encode` = `[WIRE_VERSION: 1 byte][bincode of the struct]` (`crates/fathom-types/src/lib.rs`). Consumers must check the version byte. Payloads carry the same structs as Parquet rows — no truncation relative to files.
+`wire_encode` = `[WIRE_VERSION: 1 byte][bincode of the struct]` (`crates/fathom-types/src/lib.rs`). Consumers must check the version byte. Payloads carry the same structs as Parquet rows — no truncation relative to files. The format has no type discriminant: the NATS subject suffix identifies the struct (see [nats-streams.md](nats-streams.md)).

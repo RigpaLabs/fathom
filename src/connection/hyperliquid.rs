@@ -16,7 +16,11 @@ use crate::{
     metrics::Metrics,
     monitor::MonitorState,
     orderbook::DiffApplied,
-    writer::{raw::RawDiff, trades::RawTrade},
+    writer::{
+        deriv::{DerivEvent, MarkFunding, OpenInterest},
+        raw::RawDiff,
+        trades::RawTrade,
+    },
 };
 
 use super::runtime::{self, BACKOFF_START_MS, DEFAULT_HEARTBEAT_TIMEOUT_S};
@@ -134,6 +138,66 @@ fn build_raw_trade(exchange: &str, trade: &HlTrade) -> Option<RawTrade> {
     })
 }
 
+// ── activeAssetCtx → derivatives feeds ──────────────────────────────────────
+
+/// `activeAssetCtx` message data: one channel carries funding, oracle px,
+/// mark px and open interest for a coin (specs/derivatives-feeds.md).
+#[derive(Debug, Deserialize)]
+struct HlActiveAssetCtx {
+    coin: String,
+    ctx: HlAssetCtx,
+}
+
+/// The perp asset context. HL sends numerics as strings; kept as
+/// `serde_json::Value` so a plain number is accepted too (see `json_f64`).
+/// Extra fields (prevDayPx, dayNtlVlm, premium, midPx, impactPxs, …) ignored.
+#[derive(Debug, Deserialize)]
+struct HlAssetCtx {
+    funding: serde_json::Value,
+    #[serde(rename = "openInterest")]
+    open_interest: serde_json::Value,
+    #[serde(rename = "oraclePx")]
+    oracle_px: serde_json::Value,
+    #[serde(rename = "markPx")]
+    mark_px: serde_json::Value,
+}
+
+/// Parse a JSON value that is either a numeric string ("3000.05", HL's usual
+/// encoding) or a plain number.
+fn json_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str()?.parse::<f64>().ok())
+}
+
+/// Map one activeAssetCtx message to its two derivative rows.
+///
+/// funding → funding_rate, markPx → mark_px, oraclePx → index_px,
+/// openInterest → oi_base. `ts_us` is the receipt time — the message carries
+/// no exchange timestamp. `next_funding_ts` is None (HL funds hourly, the feed
+/// has no discrete next-funding time). Returns `None` if any numeric fails.
+fn asset_ctx_to_events(
+    exchange: &str,
+    msg: &HlActiveAssetCtx,
+    ts_us: i64,
+) -> Option<(MarkFunding, OpenInterest)> {
+    let mark_funding = MarkFunding {
+        timestamp_us: ts_us,
+        exchange: exchange.to_string(),
+        symbol: msg.coin.clone(),
+        mark_px: json_f64(&msg.ctx.mark_px)?,
+        index_px: Some(json_f64(&msg.ctx.oracle_px)?),
+        funding_rate: json_f64(&msg.ctx.funding)?,
+        next_funding_ts: None,
+    };
+    let open_interest = OpenInterest {
+        timestamp_us: ts_us,
+        exchange: exchange.to_string(),
+        symbol: msg.coin.clone(),
+        oi_base: json_f64(&msg.ctx.open_interest)?,
+        oi_quote: None,
+    };
+    Some((mark_funding, open_interest))
+}
+
 struct PrevSnapshot {
     best_bid_px: f64,
     best_bid_qty: f64,
@@ -152,6 +216,7 @@ pub async fn connection_task_hl(
     raw_tx: broadcast::Sender<RawDiff>,
     snap_tx: broadcast::Sender<Snapshot1s>,
     trade_tx: broadcast::Sender<RawTrade>,
+    deriv_tx: broadcast::Sender<DerivEvent>,
     cancel: CancellationToken,
     metrics: std::sync::Arc<Metrics>,
 ) {
@@ -207,6 +272,19 @@ pub async fn connection_task_hl(
                 .await
             {
                 warn!(conn = %name, symbol = %sym, error = %e, "trades subscribe failed");
+                sub_ok = false;
+                break;
+            }
+            // Derivatives context: funding + oracle/mark px + OI in one channel.
+            let ctx_sub = serde_json::json!({
+                "method": "subscribe",
+                "subscription": {"type": "activeAssetCtx", "coin": sym}
+            });
+            if let Err(e) = ws_sink
+                .send(Message::Text(ctx_sub.to_string().into()))
+                .await
+            {
+                warn!(conn = %name, symbol = %sym, error = %e, "activeAssetCtx subscribe failed");
                 sub_ok = false;
                 break;
             }
@@ -369,6 +447,26 @@ pub async fn connection_task_hl(
                                 }
                             }
                         }
+                        "activeAssetCtx" => {
+                            let ctx: HlActiveAssetCtx = match serde_json::from_value(hl_msg.data) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            if !symbols.contains(&ctx.coin) { continue; }
+                            // Receipt time — the message has no exchange timestamp.
+                            let ts_us = Utc::now().timestamp_micros();
+                            let Some((mf, oi)) = asset_ctx_to_events(&exchange_name, &ctx, ts_us) else {
+                                warn!(conn = %name, symbol = %ctx.coin, "activeAssetCtx numeric parse failed");
+                                continue;
+                            };
+                            // Deriv events do NOT feed record_event — depth
+                            // liveness stays meaningful (same decision as trades).
+                            if deriv_tx.send(DerivEvent::MarkFunding(mf)).is_err()
+                                || deriv_tx.send(DerivEvent::OpenInterest(oi)).is_err()
+                            {
+                                warn!(conn = %name, symbol = %ctx.coin, "deriv: no receivers");
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -446,6 +544,91 @@ pub(crate) fn compute_churn(prev: &[(f64, f64)], curr: &[(f64, f64)]) -> f64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Real-shaped activeAssetCtx message data (perps variant). HL sends
+    /// numerics as strings; extra fields must be ignored.
+    fn active_asset_ctx_json() -> serde_json::Value {
+        serde_json::json!({
+            "coin": "ETH",
+            "ctx": {
+                "funding": "0.0000125",
+                "openInterest": "1234567.89",
+                "prevDayPx": "2900.0",
+                "dayNtlVlm": "111222333.0",
+                "premium": "0.00001",
+                "oraclePx": "3000.05",
+                "markPx": "3000.12",
+                "midPx": "3000.10",
+                "impactPxs": ["3000.08", "3000.14"],
+                "dayBaseVlm": "37000.5"
+            }
+        })
+    }
+
+    /// One activeAssetCtx message carries funding + mark + oracle + OI →
+    /// emits both a MarkFunding and an OpenInterest row.
+    #[test]
+    fn test_active_asset_ctx_to_mark_funding_and_open_interest() {
+        let msg: HlActiveAssetCtx = serde_json::from_value(active_asset_ctx_json()).unwrap();
+        assert_eq!(msg.coin, "ETH");
+
+        let ts_us = 1_709_654_400_000_000_i64;
+        let (mf, oi) = asset_ctx_to_events("hyperliquid", &msg, ts_us).unwrap();
+
+        assert_eq!(
+            mf.timestamp_us, ts_us,
+            "receipt time — HL sends no event ts"
+        );
+        assert_eq!(mf.exchange, "hyperliquid");
+        assert_eq!(mf.symbol, "ETH");
+        assert_eq!(mf.mark_px, 3000.12, "markPx → mark_px");
+        assert_eq!(mf.index_px, Some(3000.05), "oraclePx → index_px");
+        assert_eq!(mf.funding_rate, 0.0000125, "funding → funding_rate");
+        assert_eq!(
+            mf.next_funding_ts, None,
+            "HL funds hourly — no discrete next-funding ts in the feed"
+        );
+
+        assert_eq!(oi.timestamp_us, ts_us);
+        assert_eq!(oi.exchange, "hyperliquid");
+        assert_eq!(oi.symbol, "ETH");
+        assert_eq!(oi.oi_base, 1_234_567.89, "openInterest → oi_base");
+        assert_eq!(oi.oi_quote, None);
+    }
+
+    /// Defensive: accept plain JSON numbers too, not only HL's usual strings.
+    #[test]
+    fn test_active_asset_ctx_numeric_fields_as_numbers() {
+        let json = serde_json::json!({
+            "coin": "BTC",
+            "ctx": {
+                "funding": 0.0000125,
+                "openInterest": 100.5,
+                "oraclePx": 60000.0,
+                "markPx": 60001.5
+            }
+        });
+        let msg: HlActiveAssetCtx = serde_json::from_value(json).unwrap();
+        let (mf, oi) = asset_ctx_to_events("hyperliquid", &msg, 1).unwrap();
+        assert_eq!(mf.mark_px, 60001.5);
+        assert_eq!(mf.index_px, Some(60000.0));
+        assert_eq!(oi.oi_base, 100.5);
+    }
+
+    #[test]
+    fn test_active_asset_ctx_unparseable_returns_none() {
+        let json = serde_json::json!({
+            "coin": "ETH",
+            "ctx": {
+                "funding": "oops",
+                "openInterest": "100.0",
+                "oraclePx": "3000.0",
+                "markPx": "3000.0"
+            }
+        });
+        let msg: HlActiveAssetCtx = serde_json::from_value(json).unwrap();
+        assert!(asset_ctx_to_events("hyperliquid", &msg, 1).is_none());
+    }
 
     #[test]
     fn test_compute_churn_identical() {
