@@ -26,6 +26,22 @@ Semantics per exchange:
 
 - HL: per-level order count `n` (`num_orders` List<i64>, null for Binance)
 
+## Raw trade (`RawTrade`)
+
+One row per trade — Binance aggTrade (spot + perp) and Hyperliquid `trades`. Struct: `crates/fathom-types/src/lib.rs::RawTrade`; Arrow schema: `src/schema.rs::trades_schema`. Full contract: [trades-feed.md](trades-feed.md).
+
+| Column | Type | Notes |
+|---|---|---|
+| `timestamp_us` | i64 | Exchange trade time (µs); Binance `T`, HL `time` |
+| `exchange` | utf8 | `binance_spot` / `binance_perp` / `hyperliquid` |
+| `symbol` | utf8 | Exchange-native symbol |
+| `trade_id` | i64 | Binance aggTrade `a` / HL `tid` |
+| `price` | f64 | |
+| `qty` | f64 | Base units |
+| `is_buyer_maker` | bool | true ⇔ taker sold. Binance `m`; HL side `"A"` → true, `"B"` → false |
+
+Files: `{data_dir}/trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet` (hourly rotation, `src/writer/trades.rs`).
+
 ## 1s snapshot (`Snapshot1s`)
 
 1 row/sec/symbol, 64 columns (`src/schema.rs`):
@@ -38,7 +54,7 @@ Semantics per exchange:
 Field caveats (read before using):
 - `intra_sigma` — event-weighted population stddev of **mid price in quote units** within the second. It is not a return volatility and is not annualized (`src/accumulator.rs`).
 - `n_events` — Binance: diff events; HL: snapshots received. Not comparable across exchanges.
-- `buy_vol`/`sell_vol`/`volume_delta`/`trade_count` — populated for HL only until Binance trades land ([trades-feed.md](trades-feed.md)); **always 0 for Binance today**.
+- `buy_vol`/`sell_vol`/`volume_delta`/`trade_count` — populated for all exchanges: HL from `trades`, Binance from `aggTrade` ([trades-feed.md](trades-feed.md)). Buy/sell attribution is by taker side.
 - `ofi_l1`, `churn_*` — summed over the 1s window, reset at flush.
 
 ## Wire format (NATS payloads)
