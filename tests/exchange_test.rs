@@ -143,3 +143,37 @@ fn test_hl_snapshot_url_empty() {
         "HL sends snapshots over WS — no REST endpoint"
     );
 }
+
+// ── Derivatives feeds (specs/derivatives-feeds.md) ──────────────────────────
+
+#[test]
+fn test_perp_ws_url_includes_mark_price_and_force_order() {
+    let url = BinancePerp.ws_url(&["ETHUSDT".to_string()], 100);
+    assert!(url.contains("ethusdt@markPrice@1s"), "url: {url}");
+    assert!(url.contains("ethusdt@forceOrder"), "url: {url}");
+}
+
+#[test]
+fn test_spot_ws_url_has_no_derivatives_streams() {
+    let url = BinanceSpot.ws_url(&["ETHUSDT".to_string()], 100);
+    assert!(!url.contains("markPrice"), "spot has no mark price: {url}");
+    assert!(
+        !url.contains("forceOrder"),
+        "spot has no liquidations: {url}"
+    );
+}
+
+#[test]
+fn test_perp_open_interest_url() {
+    let url = BinancePerp.open_interest_url("ethusdt").unwrap();
+    assert_eq!(
+        url,
+        "https://fapi.binance.com/fapi/v1/openInterest?symbol=ETHUSDT"
+    );
+}
+
+#[test]
+fn test_open_interest_url_none_for_non_perp_venues() {
+    assert!(BinanceSpot.open_interest_url("ETHUSDT").is_none());
+    assert!(Hyperliquid.open_interest_url("ETH").is_none());
+}

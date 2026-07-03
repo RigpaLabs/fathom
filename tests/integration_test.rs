@@ -27,6 +27,7 @@ use fathom::{
     connection::connection_task,
     exchange::BinanceSpot,
     monitor,
+    writer::deriv::DerivEvent,
     writer::raw::{RawDiff, run_raw_writer},
     writer::snap_1s::run_snap_writer,
     writer::trades::RawTrade,
@@ -213,6 +214,7 @@ async fn test_integration_binance_spot_pipeline() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(64);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(64);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(64);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(64);
 
     // flush_interval_s=60: writers buffer in memory, flush on channel close
     let raw_writer = tokio::spawn(run_raw_writer(
@@ -257,6 +259,7 @@ async fn test_integration_binance_spot_pipeline() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         cancel.clone(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -345,6 +348,7 @@ async fn test_integration_monitor_state_updated() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(64);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(64);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(64);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(64);
     let _raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -387,6 +391,7 @@ async fn test_integration_monitor_state_updated() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         cancel.clone(),
         fathom::metrics::new_metrics().metrics,
     ));

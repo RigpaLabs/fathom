@@ -22,6 +22,7 @@ use fathom::{
     connection::connection_task,
     exchange::BinanceSpot,
     monitor,
+    writer::deriv::DerivEvent,
     writer::raw::{RawDiff, run_raw_writer},
     writer::snap_1s::run_snap_writer,
     writer::trades::RawTrade,
@@ -193,6 +194,7 @@ async fn test_e2e_reconnect_after_ws_close() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -217,6 +219,7 @@ async fn test_e2e_reconnect_after_ws_close() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -304,6 +307,7 @@ async fn test_e2e_multi_symbol_single_connection() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -328,6 +332,7 @@ async fn test_e2e_multi_symbol_single_connection() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -397,6 +402,7 @@ async fn test_e2e_snapshot_http_error_then_retry() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -421,6 +427,7 @@ async fn test_e2e_snapshot_http_error_then_retry() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -505,6 +512,7 @@ async fn test_e2e_gap_triggers_reconnect() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -530,6 +538,7 @@ async fn test_e2e_gap_triggers_reconnect() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -641,6 +650,7 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -666,6 +676,7 @@ async fn test_e2e_multi_symbol_partial_snapshot_failure() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -746,6 +757,7 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -770,6 +782,7 @@ async fn test_e2e_ws_buffered_during_slow_snapshot() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -854,6 +867,7 @@ async fn test_e2e_snap_parquet_created() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
     let raw_w = tokio::spawn(run_raw_writer(
         dir.path().to_path_buf(),
         raw_tx.subscribe(),
@@ -878,6 +892,7 @@ async fn test_e2e_snap_parquet_created() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -990,6 +1005,7 @@ async fn test_e2e_agg_trade_tape_and_1s_volumes() {
     let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
     let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
     let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
     let snap_w = tokio::spawn(run_snap_writer(
         dir.path().to_path_buf(),
         snap_tx.subscribe(),
@@ -1014,6 +1030,7 @@ async fn test_e2e_agg_trade_tape_and_1s_volumes() {
         raw_tx,
         snap_tx,
         trade_tx,
+        deriv_tx,
         CancellationToken::new(),
         fathom::metrics::new_metrics().metrics,
     ));
@@ -1101,4 +1118,208 @@ async fn test_e2e_agg_trade_tape_and_1s_volumes() {
     assert_eq!(buy, 2.0, "taker buy volume (m=false)");
     assert_eq!(sell, 0.5, "taker sell volume (m=true)");
     assert_eq!(count, 2, "trade_count populated for Binance");
+}
+
+// ── Test 9: markPrice + forceOrder → deriv parquet ────────────────────────────
+
+/// Build a Binance combined-stream markPrice@1s JSON string.
+fn ws_mark_price_msg(sym: &str, time_ms: i64, mark: &str, index: &str, rate: &str) -> String {
+    serde_json::json!({
+        "stream": format!("{}@markPrice@1s", sym.to_lowercase()),
+        "data": {
+            "e": "markPriceUpdate",
+            "E": time_ms,
+            "s": sym.to_uppercase(),
+            "p": mark,
+            "i": index,
+            "P": mark,
+            "r": rate,
+            "T": time_ms + 28_800_000
+        }
+    })
+    .to_string()
+}
+
+/// Build a Binance combined-stream forceOrder JSON string.
+fn ws_force_order_msg(sym: &str, time_ms: i64, side: &str, avg_px: &str, qty: &str) -> String {
+    serde_json::json!({
+        "stream": format!("{}@forceOrder", sym.to_lowercase()),
+        "data": {
+            "e": "forceOrder",
+            "E": time_ms,
+            "o": {
+                "s": sym.to_uppercase(),
+                "S": side,
+                "o": "LIMIT",
+                "f": "IOC",
+                "q": qty,
+                "p": avg_px,
+                "ap": avg_px,
+                "X": "FILLED",
+                "l": qty,
+                "z": qty,
+                "T": time_ms
+            }
+        }
+    })
+    .to_string()
+}
+
+fn deriv_parquets(dir: &Path) -> Vec<PathBuf> {
+    find_parquets(dir)
+        .into_iter()
+        .filter(|p| p.components().any(|c| c.as_os_str() == "deriv"))
+        .collect()
+}
+
+/// markPrice + forceOrder events on the combined stream must land in the
+/// deriv parquet family (funding.parquet / liq.parquet, daily files).
+///
+/// Uses the spot-shaped mock harness: stream dispatch is suffix-driven and
+/// venue-agnostic, and that routing is what's under test — a perp harness
+/// would only add `pu`-sequenced depth fixtures on top of the same path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_mark_price_and_force_order_to_deriv_parquet() {
+    use arrow_array::{Float64Array, Int64Array, StringArray};
+    use fathom::writer::deriv::run_deriv_writer;
+
+    let server = MockBinanceServer::new().await;
+
+    server.push_snapshot(
+        "ETHUSDT",
+        100,
+        vec![("3000.00", "5.00")],
+        vec![("3001.00", "4.00")],
+    );
+
+    server.push_ws_round(vec![
+        ws_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            100,
+            101,
+            vec![("3000.00", "5.00")],
+            vec![],
+        ),
+        ws_mark_price_msg(
+            "ethusdt",
+            1_700_000_001_000,
+            "3000.12",
+            "3000.05",
+            "0.00010000",
+        ),
+        ws_mark_price_msg(
+            "ethusdt",
+            1_700_000_002_000,
+            "3000.15",
+            "3000.06",
+            "0.00010000",
+        ),
+        ws_force_order_msg("ethusdt", 1_700_000_001_500, "SELL", "2998.40", "0.014"),
+    ]);
+
+    let dir = TempDir::new().unwrap();
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(128);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(128);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(128);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(128);
+    let deriv_w = tokio::spawn(run_deriv_writer(
+        dir.path().to_path_buf(),
+        deriv_tx.subscribe(),
+        60,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    let state = monitor::new_state();
+    let conn = make_conn("deriv_test", vec!["ETHUSDT"], &server);
+    let task = tokio::spawn(connection_task(
+        conn,
+        Box::new(BinanceSpot),
+        dir.path().to_path_buf(),
+        state,
+        raw_tx,
+        snap_tx,
+        trade_tx,
+        deriv_tx,
+        CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    task.abort();
+    let _ = task.await;
+    deriv_w.await.unwrap();
+
+    let derivs = deriv_parquets(dir.path());
+    assert_eq!(
+        derivs.len(),
+        2,
+        "funding.parquet + liq.parquet expected: {derivs:?}"
+    );
+
+    let funding = derivs
+        .iter()
+        .find(|p| p.file_name().unwrap() == "funding.parquet")
+        .expect("funding.parquet");
+    assert!(
+        funding
+            .to_string_lossy()
+            .contains("/deriv/binance_spot/ETHUSDT/2023-11-14/"),
+        "daily layout deriv/{{exchange}}/{{symbol}}/{{date}}: {funding:?}"
+    );
+    let file = std::fs::File::open(funding).unwrap();
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 2, "both markPrice events persisted");
+    let ts = batch
+        .column_by_name("timestamp_us")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ts.value(0), 1_700_000_001_000_000, "E ms → µs");
+    let mark = batch
+        .column_by_name("mark_px")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(mark.value(0), 3000.12);
+    assert_eq!(mark.value(1), 3000.15);
+    let rate = batch
+        .column_by_name("funding_rate")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(rate.value(0), 0.0001, "r string → f64");
+
+    let liq = derivs
+        .iter()
+        .find(|p| p.file_name().unwrap() == "liq.parquet")
+        .expect("liq.parquet");
+    let file = std::fs::File::open(liq).unwrap();
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let side = batch
+        .column_by_name("side")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(side.value(0), "SELL");
+    let px = batch
+        .column_by_name("price")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(px.value(0), 2998.40);
 }

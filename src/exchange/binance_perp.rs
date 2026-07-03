@@ -15,7 +15,9 @@ impl ExchangeAdapter for BinancePerp {
             .iter()
             .map(|s| {
                 let sym = s.to_lowercase();
-                format!("{sym}@depth@{depth_ms}ms/{sym}@aggTrade")
+                format!(
+                    "{sym}@depth@{depth_ms}ms/{sym}@aggTrade/{sym}@markPrice@1s/{sym}@forceOrder"
+                )
             })
             .collect::<Vec<_>>()
             .join("/");
@@ -28,5 +30,14 @@ impl ExchangeAdapter for BinancePerp {
             "{REST_BASE}/depth?symbol={}&limit=1000",
             symbol.to_uppercase()
         )
+    }
+
+    /// USDM Futures has no OI WebSocket channel — polled via REST instead
+    /// (specs/derivatives-feeds.md).
+    fn open_interest_url(&self, symbol: &str) -> Option<String> {
+        Some(format!(
+            "{REST_BASE}/openInterest?symbol={}",
+            symbol.to_uppercase()
+        ))
     }
 }

@@ -14,4 +14,9 @@ pub trait ExchangeAdapter: Send + Sync {
     fn ws_url(&self, symbols: &[String], depth_ms: u64) -> String;
     /// Build REST depth snapshot URL for a single symbol.
     fn snapshot_url(&self, symbol: &str) -> String;
+    /// REST open-interest URL for a single symbol. `None` when the venue has
+    /// no OI REST endpoint (spot has no OI; Hyperliquid delivers OI over WS).
+    fn open_interest_url(&self, _symbol: &str) -> Option<String> {
+        None
+    }
 }

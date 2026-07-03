@@ -147,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
         let rtx = raw_tx.clone();
         let stx = snap_tx.clone();
         let ttx = trade_tx.clone();
+        let dtx = deriv_tx.clone();
         let ct = cancel.clone();
         let m = metrics_handle_data.metrics.clone();
         match conn.exchange {
@@ -159,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ttx,
+                    dtx,
                     ct,
                     m,
                 )));
@@ -172,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
                     rtx,
                     stx,
                     ttx,
+                    dtx,
                     ct,
                     m,
                 )));
