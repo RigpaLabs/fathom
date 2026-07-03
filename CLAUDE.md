@@ -2,6 +2,8 @@
 
 Collects Level-2 order book data from Binance (Spot + USDM Futures), Hyperliquid, and dYdX v4 via WebSocket and writes Parquet files.
 
+**Behavior contracts live in `specs/`** (capture matrix, schemas, streams, planned feeds) — check them before changing collection behavior. Decisions: `docs/adr/`.
+
 ## Commands
 
 ```bash
@@ -30,13 +32,13 @@ Binance (spot/perp):
 Hyperliquid:
   WebSocket (single endpoint, subscribe after connect)
     → full L2 snapshots (~500ms) + trades
-    → snapshot-to-snapshot OFI / churn (src/connection_hl.rs)
+    → snapshot-to-snapshot OFI / churn (src/connection/hyperliquid.rs)
     → accumulation via WindowAccumulator::on_diff_from_levels
 
 dYdX v4:
   WebSocket Indexer API (subscribe after connect)
     → initial snapshot + batched diffs (~250ms) + trades
-    → local BTreeMap book (DydxBook in src/connection_dydx.rs)
+    → local BTreeMap book (DydxBook in src/connection/dydx.rs)
     → accumulation via WindowAccumulator::on_diff_from_levels
 
 All paths → two parallel writers + optional NATS sink:
@@ -59,9 +61,9 @@ Optional NATS streaming (src/nats_sink.rs):
 | File | Responsibility |
 |------|---------------|
 | `src/main.rs` | Load config, spawn connection tasks + writers + monitor |
-| `src/connection.rs` | Binance WS connect → REST snapshot → event loop |
-| `src/connection_hl.rs` | Hyperliquid WS: L2 snapshots + trades, OFI from snapshot diffs |
-| `src/connection_dydx.rs` | dYdX v4 WS: snapshot + batched diffs + trades, local DydxBook |
+| `src/connection/binance.rs` | Binance WS connect → REST snapshot → event loop |
+| `src/connection/hyperliquid.rs` | Hyperliquid WS: L2 snapshots + trades, OFI from snapshot diffs |
+| `src/connection/dydx.rs` | dYdX v4 WS: snapshot + batched diffs + trades, local DydxBook |
 | `src/orderbook/mod.rs` | BTreeMap L2 book, Binance sync protocol |
 | `src/accumulator.rs` | 1s window stats (shared by all exchanges) |
 | `src/exchange/` | BinanceSpot / BinancePerp / Hyperliquid adapters, dYdX constants |
