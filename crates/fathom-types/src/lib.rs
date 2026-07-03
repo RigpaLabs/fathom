@@ -78,6 +78,66 @@ pub struct RawTrade {
     pub is_buyer_maker: bool,
 }
 
+/// Mark price + funding snapshot for a perp symbol.
+///
+/// Mark and funding arrive in one exchange event on both venues (Binance
+/// `markPrice@1s`, Hyperliquid `activeAssetCtx`), so a single struct is
+/// published once on NATS subject `fathom.v1.{exchange}.{symbol}.funding`
+/// (stream `FATHOM_DERIV`) — there is no separate `.mark` subject.
+/// Wire format: `[WIRE_VERSION: u8][bincode payload]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarkFunding {
+    /// Exchange event time (µs); receipt time for venues without one (HL).
+    pub timestamp_us: i64,
+    pub exchange: String,
+    pub symbol: String,
+    pub mark_px: f64,
+    /// Index/oracle price (Binance `i`, HL `oraclePx`). None if unavailable.
+    pub index_px: Option<f64>,
+    /// Funding rate as sent by the venue (per funding interval, not annualized).
+    pub funding_rate: f64,
+    /// Next funding time (µs). None for venues without a discrete
+    /// next-funding timestamp in the feed (Hyperliquid).
+    pub next_funding_ts: Option<i64>,
+}
+
+/// Open interest snapshot for a perp symbol.
+///
+/// Published to NATS subject `fathom.v1.{exchange}.{symbol}.oi`
+/// (stream `FATHOM_DERIV`).
+/// Wire format: `[WIRE_VERSION: u8][bincode payload]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenInterest {
+    /// Exchange-provided time (µs); receipt time for venues without one (HL).
+    pub timestamp_us: i64,
+    pub exchange: String,
+    pub symbol: String,
+    /// Open interest in base units.
+    pub oi_base: f64,
+    /// Open interest in quote units, when the venue provides it directly.
+    pub oi_quote: Option<f64>,
+}
+
+/// A liquidation (forced) order.
+///
+/// Published to NATS subject `fathom.v1.{exchange}.{symbol}.liq`
+/// (stream `FATHOM_DERIV`).
+/// Wire format: `[WIRE_VERSION: u8][bincode payload]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Liquidation {
+    /// Exchange trade time (µs).
+    pub timestamp_us: i64,
+    pub exchange: String,
+    pub symbol: String,
+    /// Liquidation order side as sent by the venue (`BUY` / `SELL`).
+    /// SELL = a long position was liquidated.
+    pub side: String,
+    /// Average fill price (Binance forceOrder `ap`).
+    pub price: f64,
+    /// Base units.
+    pub qty: f64,
+}
+
 /// Envelope wrapping any payload with metadata for cross-service traceability.
 /// Opt-in — existing consumers can still decode raw payloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,11 +280,93 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_mark_funding() {
+        let mf = MarkFunding {
+            timestamp_us: 1_700_000_000_000_000,
+            exchange: "binance_perp".into(),
+            symbol: "ETHUSDT".into(),
+            mark_px: 3000.12,
+            index_px: Some(3000.05),
+            funding_rate: 0.0001,
+            next_funding_ts: Some(1_700_000_400_000_000),
+        };
+
+        let bytes = wire_encode(&mf).expect("encode");
+        assert_eq!(bytes[0], WIRE_VERSION);
+        let decoded: MarkFunding = wire_decode(&bytes).expect("decode");
+        assert_eq!(decoded.timestamp_us, mf.timestamp_us);
+        assert_eq!(decoded.exchange, mf.exchange);
+        assert_eq!(decoded.symbol, mf.symbol);
+        assert_eq!(decoded.mark_px, mf.mark_px);
+        assert_eq!(decoded.index_px, mf.index_px);
+        assert_eq!(decoded.funding_rate, mf.funding_rate);
+        assert_eq!(decoded.next_funding_ts, mf.next_funding_ts);
+    }
+
+    #[test]
+    fn roundtrip_mark_funding_nullable_fields_none() {
+        // HL shape: no discrete next funding timestamp; index may be absent.
+        let mf = MarkFunding {
+            timestamp_us: 1_700_000_000_000_000,
+            exchange: "hyperliquid".into(),
+            symbol: "ETH".into(),
+            mark_px: 3000.12,
+            index_px: None,
+            funding_rate: 0.0000125,
+            next_funding_ts: None,
+        };
+        let decoded: MarkFunding = wire_decode(&wire_encode(&mf).expect("encode")).expect("decode");
+        assert_eq!(decoded.index_px, None);
+        assert_eq!(decoded.next_funding_ts, None);
+    }
+
+    #[test]
+    fn roundtrip_open_interest() {
+        let oi = OpenInterest {
+            timestamp_us: 1_700_000_000_000_000,
+            exchange: "binance_perp".into(),
+            symbol: "BTCUSDT".into(),
+            oi_base: 10_659.509,
+            oi_quote: None,
+        };
+        let decoded: OpenInterest =
+            wire_decode(&wire_encode(&oi).expect("encode")).expect("decode");
+        assert_eq!(decoded.timestamp_us, oi.timestamp_us);
+        assert_eq!(decoded.exchange, oi.exchange);
+        assert_eq!(decoded.symbol, oi.symbol);
+        assert_eq!(decoded.oi_base, oi.oi_base);
+        assert_eq!(decoded.oi_quote, None);
+    }
+
+    #[test]
+    fn roundtrip_liquidation() {
+        let liq = Liquidation {
+            timestamp_us: 1_700_000_000_123_000,
+            exchange: "binance_perp".into(),
+            symbol: "ETHUSDT".into(),
+            side: "SELL".into(),
+            price: 2998.4,
+            qty: 0.014,
+        };
+        let decoded: Liquidation =
+            wire_decode(&wire_encode(&liq).expect("encode")).expect("decode");
+        assert_eq!(decoded.timestamp_us, liq.timestamp_us);
+        assert_eq!(decoded.exchange, liq.exchange);
+        assert_eq!(decoded.symbol, liq.symbol);
+        assert_eq!(decoded.side, "SELL");
+        assert_eq!(decoded.price, liq.price);
+        assert_eq!(decoded.qty, liq.qty);
+    }
+
+    #[test]
     fn version_mismatch() {
         let mut bytes = wire_encode(&42u32).expect("encode");
         bytes[0] = 99; // wrong version
         let result = wire_decode::<u32>(&bytes);
-        assert!(matches!(result, Err(WireDecodeError::VersionMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(WireDecodeError::VersionMismatch { .. })
+        ));
     }
 
     #[test]
