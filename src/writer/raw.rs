@@ -14,7 +14,12 @@ use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterPr
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use crate::{error::Result, metrics::Metrics, schema::raw_schema};
+use crate::{
+    error::Result,
+    metrics::{Feed, Metrics},
+    schema::raw_schema,
+    writer::batch_bytes,
+};
 
 // Re-export from fathom-types crate.
 pub use fathom_types::RawDiff;
@@ -75,11 +80,11 @@ impl SymbolWriter {
         bucket_open(now_utc.hour(), rotate_hours) != self.bucket_open_hour
     }
 
-    fn close_and_rename(&mut self, end_utc: chrono::DateTime<Utc>) -> Result<()> {
+    /// Flush any buffered rows, finalize the file, and rename it into place.
+    /// Returns the bytes recorded by the final buffer flush.
+    fn close_and_rename(&mut self, end_utc: chrono::DateTime<Utc>) -> Result<u64> {
         // Flush buffer first
-        if !self.buffer.is_empty() {
-            self.flush_buffer()?;
-        }
+        let bytes = self.flush_buffer()?;
         self.writer.finish()?;
 
         let end_hhmm = format!("{:02}{:02}", end_utc.hour(), end_utc.minute());
@@ -96,12 +101,14 @@ impl SymbolWriter {
             to = %new_path.display(),
             "rotated raw file"
         );
-        Ok(())
+        Ok(bytes)
     }
 
-    fn flush_buffer(&mut self) -> Result<()> {
+    /// Write buffered rows to the Parquet writer. Returns the batch byte estimate
+    /// (0 when the buffer is empty).
+    fn flush_buffer(&mut self) -> Result<u64> {
         if self.buffer.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let schema = SchemaRef::new(raw_schema().clone());
 
@@ -131,9 +138,10 @@ impl SymbolWriter {
             ],
         )?;
 
+        let bytes = batch_bytes(&batch);
         self.writer.write(&batch)?;
         self.buffer.clear();
-        Ok(())
+        Ok(bytes)
     }
 }
 
@@ -187,12 +195,16 @@ pub async fn run_raw_writer(
                     && sw.should_rotate(now_utc, rotate_hours)
                 {
                     match sw.close_and_rename(now_utc) {
-                        Ok(()) => {
+                        Ok(bytes) => {
                             metrics.parquet_writes_total.inc();
+                            if bytes > 0 {
+                                metrics.record_flush(Feed::Raw, bytes);
+                            }
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to rotate raw file");
                             metrics.parquet_write_errors_total.inc();
+                            metrics.record_write_error(Feed::Raw);
                         }
                     }
                     writers.remove(&key);
@@ -212,6 +224,8 @@ pub async fn run_raw_writer(
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to open raw writer");
+                            metrics.parquet_write_errors_total.inc();
+                            metrics.record_write_error(Feed::Raw);
                             continue;
                         }
                     }
@@ -228,12 +242,16 @@ pub async fn run_raw_writer(
         if last_flush.elapsed() >= flush_dur {
             for sw in writers.values_mut() {
                 match sw.flush_buffer() {
-                    Ok(()) => {
+                    Ok(bytes) => {
                         metrics.parquet_writes_total.inc();
+                        if bytes > 0 {
+                            metrics.record_flush(Feed::Raw, bytes);
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "raw flush error");
                         metrics.parquet_write_errors_total.inc();
+                        metrics.record_write_error(Feed::Raw);
                     }
                 }
             }
@@ -245,12 +263,16 @@ pub async fn run_raw_writer(
     let now_utc = Utc::now();
     for (_, mut sw) in writers {
         match sw.close_and_rename(now_utc) {
-            Ok(()) => {
+            Ok(bytes) => {
                 metrics.parquet_writes_total.inc();
+                if bytes > 0 {
+                    metrics.record_flush(Feed::Raw, bytes);
+                }
             }
             Err(e) => {
                 warn!(error = %e, "shutdown: failed to finalize raw file");
                 metrics.parquet_write_errors_total.inc();
+                metrics.record_write_error(Feed::Raw);
             }
         }
     }

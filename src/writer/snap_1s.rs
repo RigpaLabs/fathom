@@ -12,7 +12,13 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::{accumulator::Snapshot1s, error::Result, metrics::Metrics, schema::snap_1s_schema};
+use crate::{
+    accumulator::Snapshot1s,
+    error::Result,
+    metrics::{Feed, Metrics},
+    schema::snap_1s_schema,
+    writer::batch_bytes,
+};
 
 /// Derive UTC date string from event timestamp in microseconds.
 fn date_from_ts_us(ts_us: i64) -> String {
@@ -215,12 +221,15 @@ impl DayWriter {
         })
     }
 
-    fn flush(&mut self) -> Result<()> {
+    /// Write buffered rows to the Parquet writer. Returns the batch byte estimate
+    /// (0 when the buffer is empty).
+    fn flush(&mut self) -> Result<u64> {
         if self.buffer.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let batch = build_snap_record_batch(&self.buffer)?;
         let n = batch.num_rows();
+        let bytes = batch_bytes(&batch);
         self.writer.write(&batch)?;
         self.buffer.clear();
 
@@ -230,14 +239,14 @@ impl DayWriter {
             self.rows_since_disk_flush = 0;
             info!(path = %self.path.display(), rows = self.disk_flush_interval, "flushed 1s row group");
         }
-        Ok(())
+        Ok(bytes)
     }
 
-    fn close(mut self) -> Result<()> {
-        self.flush()?;
+    fn close(mut self) -> Result<u64> {
+        let bytes = self.flush()?;
         self.writer.finish()?;
         info!(path = %self.path.display(), "closed 1s writer");
-        Ok(())
+        Ok(bytes)
     }
 }
 
@@ -319,6 +328,8 @@ async fn run_snap_writer_inner(
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to open snap writer");
+                            metrics.parquet_write_errors_total.inc();
+                            metrics.record_write_error(Feed::Snap1s);
                             continue;
                         }
                     }
@@ -328,12 +339,16 @@ async fn run_snap_writer_inner(
                     dw.buffer.push(snap);
                     // Flush immediately — 1 row/sec per symbol, no buffering needed
                     match dw.flush() {
-                        Ok(()) => {
+                        Ok(bytes) => {
                             metrics.parquet_writes_total.inc();
+                            if bytes > 0 {
+                                metrics.record_flush(Feed::Snap1s, bytes);
+                            }
                         }
                         Err(e) => {
                             warn!(error = %e, "snap flush error");
                             metrics.parquet_write_errors_total.inc();
+                            metrics.record_write_error(Feed::Snap1s);
                         }
                     }
                 }
@@ -361,6 +376,8 @@ async fn run_snap_writer_inner(
                 }
                 Err(e) => {
                     warn!(error = %e, "drain: failed to open snap writer");
+                    metrics.parquet_write_errors_total.inc();
+                    metrics.record_write_error(Feed::Snap1s);
                     continue;
                 }
             }
@@ -369,12 +386,16 @@ async fn run_snap_writer_inner(
         if let Some(dw) = writers.get_mut(&key) {
             dw.buffer.push(snap);
             match dw.flush() {
-                Ok(()) => {
+                Ok(bytes) => {
                     metrics.parquet_writes_total.inc();
+                    if bytes > 0 {
+                        metrics.record_flush(Feed::Snap1s, bytes);
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "drain: snap flush error");
                     metrics.parquet_write_errors_total.inc();
+                    metrics.record_write_error(Feed::Snap1s);
                 }
             }
         }
@@ -383,12 +404,16 @@ async fn run_snap_writer_inner(
     // Graceful shutdown — close all writers (writes Parquet footers)
     for (_, dw) in writers {
         match dw.close() {
-            Ok(()) => {
+            Ok(bytes) => {
                 metrics.parquet_writes_total.inc();
+                if bytes > 0 {
+                    metrics.record_flush(Feed::Snap1s, bytes);
+                }
             }
             Err(e) => {
                 warn!(error = %e, "shutdown: failed to close snap writer");
                 metrics.parquet_write_errors_total.inc();
+                metrics.record_write_error(Feed::Snap1s);
             }
         }
     }

@@ -33,6 +33,40 @@ pub struct SymbolLabel {
     pub symbol: String,
 }
 
+/// Single "feed" label for write-health metrics (raw / 1s / trades / deriv).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+pub struct FeedLabel {
+    pub feed: String,
+}
+
+/// The four Parquet feeds fathom writes, used as the `feed` label value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feed {
+    Raw,
+    Snap1s,
+    Trades,
+    Deriv,
+}
+
+impl Feed {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Feed::Raw => "raw",
+            Feed::Snap1s => "1s",
+            Feed::Trades => "trades",
+            Feed::Deriv => "deriv",
+        }
+    }
+}
+
+/// Current unix time in seconds, for last-flush timestamp gauges.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 // ── Metrics registry ────────────────────────────────────────────────────────
 
 /// All Prometheus metrics exposed by Fathom.
@@ -46,6 +80,11 @@ pub struct Metrics {
     pub ws_reconnects_total: Family<ConnLabel, Counter>,
     pub parquet_writes_total: Counter,
     pub parquet_write_errors_total: Counter,
+    // Write-health metrics (specs/observability.md): watch data *leaving* the
+    // collector, not events entering it. Labelled per feed.
+    pub parquet_bytes_written_total: Family<FeedLabel, Counter>,
+    pub write_errors_total: Family<FeedLabel, Counter>,
+    pub last_flush_timestamp: Family<FeedLabel, Gauge>,
 }
 
 impl Metrics {
@@ -113,6 +152,27 @@ impl Metrics {
             parquet_write_errors_total.clone(),
         );
 
+        let parquet_bytes_written_total = Family::<FeedLabel, Counter>::default();
+        registry.register(
+            "fathom_parquet_bytes_written_total",
+            "Total bytes written per feed (primary write-health signal)",
+            parquet_bytes_written_total.clone(),
+        );
+
+        let write_errors_total = Family::<FeedLabel, Counter>::default();
+        registry.register(
+            "fathom_write_errors_total",
+            "Total write/flush/create/rename errors per feed",
+            write_errors_total.clone(),
+        );
+
+        let last_flush_timestamp = Family::<FeedLabel, Gauge>::default();
+        registry.register(
+            "fathom_last_flush_timestamp",
+            "Unix seconds of last successful flush per feed",
+            last_flush_timestamp.clone(),
+        );
+
         Self {
             events_total,
             events_by_symbol,
@@ -123,7 +183,32 @@ impl Metrics {
             ws_reconnects_total,
             parquet_writes_total,
             parquet_write_errors_total,
+            parquet_bytes_written_total,
+            write_errors_total,
+            last_flush_timestamp,
         }
+    }
+
+    /// Record a successful feed flush: bump bytes-written and stamp last-flush.
+    /// `bytes` is the in-memory Arrow batch size estimate (see `writer::batch_bytes`).
+    pub fn record_flush(&self, feed: Feed, bytes: u64) {
+        let label = FeedLabel {
+            feed: feed.as_str().to_string(),
+        };
+        self.parquet_bytes_written_total
+            .get_or_create(&label)
+            .inc_by(bytes);
+        self.last_flush_timestamp
+            .get_or_create(&label)
+            .set(now_unix_secs());
+    }
+
+    /// Record a write/flush/create/rename failure for a feed (ENOSPC catcher).
+    pub fn record_write_error(&self, feed: Feed) {
+        let label = FeedLabel {
+            feed: feed.as_str().to_string(),
+        };
+        self.write_errors_total.get_or_create(&label).inc();
     }
 }
 
@@ -393,6 +478,63 @@ mod tests {
 
         handle.metrics.ws_connected.get_or_create(&label).set(0);
         assert_eq!(handle.metrics.ws_connected.get_or_create(&label).get(), 0);
+    }
+
+    #[test]
+    fn test_write_health_metrics_registered_and_recorded() {
+        let handle = new_metrics();
+
+        handle.metrics.record_flush(Feed::Raw, 4096);
+        handle.metrics.record_flush(Feed::Raw, 1024);
+        handle.metrics.record_write_error(Feed::Deriv);
+
+        let raw = FeedLabel {
+            feed: "raw".to_string(),
+        };
+        let deriv = FeedLabel {
+            feed: "deriv".to_string(),
+        };
+        assert_eq!(
+            handle
+                .metrics
+                .parquet_bytes_written_total
+                .get_or_create(&raw)
+                .get(),
+            5120
+        );
+        assert!(
+            handle
+                .metrics
+                .last_flush_timestamp
+                .get_or_create(&raw)
+                .get()
+                > 0
+        );
+        assert_eq!(
+            handle
+                .metrics
+                .write_errors_total
+                .get_or_create(&deriv)
+                .get(),
+            1
+        );
+
+        // Exposed in the Prometheus text output with the feed label.
+        let mut buf = String::new();
+        let registry = handle.registry.read().unwrap();
+        encode(&mut buf, &registry).unwrap();
+        assert!(buf.contains("fathom_parquet_bytes_written_total"));
+        assert!(buf.contains("fathom_write_errors_total"));
+        assert!(buf.contains("fathom_last_flush_timestamp"));
+        assert!(buf.contains(r#"feed="raw""#));
+    }
+
+    #[test]
+    fn test_feed_as_str() {
+        assert_eq!(Feed::Raw.as_str(), "raw");
+        assert_eq!(Feed::Snap1s.as_str(), "1s");
+        assert_eq!(Feed::Trades.as_str(), "trades");
+        assert_eq!(Feed::Deriv.as_str(), "deriv");
     }
 
     #[test]

@@ -1119,3 +1119,353 @@ async fn test_deriv_writer_empty_channel() {
     writer.await.unwrap();
     assert!(find_parquets(&dir.path().to_path_buf()).is_empty());
 }
+
+// ── Write-health metrics ──────────────────────────────────────────────────────
+//
+// Verify each writer bumps the write-health metrics (specs/observability.md):
+// bytes-written + last-flush timestamp on a successful flush, and
+// write_errors_total when a write path fails (injected by planting a regular
+// file where the feed's output directory needs to be created).
+
+use fathom::metrics::{Feed, FeedLabel, new_metrics};
+
+fn feed_label(feed: Feed) -> FeedLabel {
+    FeedLabel {
+        feed: feed.as_str().to_string(),
+    }
+}
+
+#[tokio::test]
+async fn test_raw_writer_records_bytes_and_last_flush() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<RawDiff>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        handle.metrics.clone(),
+    ));
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    for i in 0..5u64 {
+        tx.send(RawDiff {
+            timestamp_us: now_us + i as i64 * 100_000,
+            exchange: "binance_spot".to_string(),
+            symbol: "ETHUSDT".to_string(),
+            seq_id: 101 + i as i64,
+            prev_seq_id: 100 + i as i64,
+            bids: vec![(3000.0, 5.0)],
+            asks: vec![(3001.0, 4.0)],
+        })
+        .unwrap();
+    }
+    drop(tx);
+    writer.await.unwrap();
+
+    let label = feed_label(Feed::Raw);
+    assert!(
+        handle
+            .metrics
+            .parquet_bytes_written_total
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "raw feed should record bytes written"
+    );
+    assert!(
+        handle
+            .metrics
+            .last_flush_timestamp
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "raw feed should stamp last flush timestamp"
+    );
+}
+
+#[tokio::test]
+async fn test_raw_writer_records_write_error_on_failure() {
+    let dir = TempDir::new().unwrap();
+    // Plant a file where `raw/` must become a directory → create_dir_all fails.
+    std::fs::write(dir.path().join("raw"), b"not a dir").unwrap();
+
+    let (tx, rx) = broadcast::channel::<RawDiff>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        handle.metrics.clone(),
+    ));
+
+    tx.send(RawDiff {
+        timestamp_us: chrono::Utc::now().timestamp_micros(),
+        exchange: "binance_spot".to_string(),
+        symbol: "ETHUSDT".to_string(),
+        seq_id: 101,
+        prev_seq_id: 100,
+        bids: vec![(3000.0, 5.0)],
+        asks: vec![(3001.0, 4.0)],
+    })
+    .unwrap();
+    drop(tx);
+    writer.await.unwrap();
+
+    let label = feed_label(Feed::Raw);
+    assert!(
+        handle
+            .metrics
+            .write_errors_total
+            .get_or_create(&label)
+            .get()
+            >= 1,
+        "raw feed should count the open/create failure"
+    );
+    assert_eq!(
+        handle
+            .metrics
+            .parquet_bytes_written_total
+            .get_or_create(&label)
+            .get(),
+        0,
+        "no bytes should be recorded when the write path fails"
+    );
+}
+
+#[tokio::test]
+async fn test_trades_writer_records_bytes_and_last_flush() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<RawTrade>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_trades_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        handle.metrics.clone(),
+    ));
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    for i in 0..5i64 {
+        tx.send(make_trade(
+            "binance_spot",
+            "ETHUSDT",
+            now_us + i * 1_000,
+            100 + i,
+            false,
+        ))
+        .unwrap();
+    }
+    drop(tx);
+    writer.await.unwrap();
+
+    let label = feed_label(Feed::Trades);
+    assert!(
+        handle
+            .metrics
+            .parquet_bytes_written_total
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "trades feed should record bytes written"
+    );
+    assert!(
+        handle
+            .metrics
+            .last_flush_timestamp
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "trades feed should stamp last flush timestamp"
+    );
+}
+
+#[tokio::test]
+async fn test_trades_writer_records_write_error_on_failure() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("trades"), b"not a dir").unwrap();
+
+    let (tx, rx) = broadcast::channel::<RawTrade>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_trades_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        1,
+        handle.metrics.clone(),
+    ));
+
+    tx.send(make_trade(
+        "binance_spot",
+        "ETHUSDT",
+        chrono::Utc::now().timestamp_micros(),
+        1,
+        false,
+    ))
+    .unwrap();
+    drop(tx);
+    writer.await.unwrap();
+
+    let label = feed_label(Feed::Trades);
+    assert!(
+        handle
+            .metrics
+            .write_errors_total
+            .get_or_create(&label)
+            .get()
+            >= 1,
+        "trades feed should count the open/create failure"
+    );
+}
+
+#[tokio::test]
+async fn test_snap_writer_records_bytes_and_last_flush() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        rx,
+        CancellationToken::new(),
+        handle.metrics.clone(),
+    ));
+
+    let now_us = chrono::Utc::now().timestamp_micros();
+    for i in 0..3u64 {
+        tx.send(make_snap(
+            "binance_spot",
+            "ETHUSDT",
+            now_us + i as i64 * 1_000_000,
+        ))
+        .unwrap();
+    }
+    drop(tx);
+    writer.await.unwrap();
+
+    let label = feed_label(Feed::Snap1s);
+    assert!(
+        handle
+            .metrics
+            .parquet_bytes_written_total
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "1s feed should record bytes written"
+    );
+    assert!(
+        handle
+            .metrics
+            .last_flush_timestamp
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "1s feed should stamp last flush timestamp"
+    );
+}
+
+#[tokio::test]
+async fn test_snap_writer_records_write_error_on_failure() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("1s"), b"not a dir").unwrap();
+
+    let (tx, rx) = broadcast::channel::<Snapshot1s>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        rx,
+        CancellationToken::new(),
+        handle.metrics.clone(),
+    ));
+
+    tx.send(make_snap(
+        "binance_spot",
+        "ETHUSDT",
+        chrono::Utc::now().timestamp_micros(),
+    ))
+    .unwrap();
+    drop(tx);
+    writer.await.unwrap();
+
+    let label = feed_label(Feed::Snap1s);
+    assert!(
+        handle
+            .metrics
+            .write_errors_total
+            .get_or_create(&label)
+            .get()
+            >= 1,
+        "1s feed should count the open/create failure"
+    );
+}
+
+#[tokio::test]
+async fn test_deriv_writer_records_bytes_and_last_flush() {
+    let dir = TempDir::new().unwrap();
+    let (tx, rx) = broadcast::channel::<DerivEvent>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_deriv_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        handle.metrics.clone(),
+    ));
+
+    let ts_us = 1_700_000_000_000_000_i64;
+    tx.send(mk_funding(ts_us)).unwrap();
+    tx.send(mk_funding(ts_us + 1_000_000)).unwrap();
+    drop(tx);
+    writer.await.unwrap();
+
+    let label = feed_label(Feed::Deriv);
+    assert!(
+        handle
+            .metrics
+            .parquet_bytes_written_total
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "deriv feed should record bytes written"
+    );
+    assert!(
+        handle
+            .metrics
+            .last_flush_timestamp
+            .get_or_create(&label)
+            .get()
+            > 0,
+        "deriv feed should stamp last flush timestamp"
+    );
+}
+
+#[tokio::test]
+async fn test_deriv_writer_records_write_error_on_failure() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("deriv"), b"not a dir").unwrap();
+
+    let (tx, rx) = broadcast::channel::<DerivEvent>(64);
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_deriv_writer(
+        dir.path().to_path_buf(),
+        rx,
+        1,
+        handle.metrics.clone(),
+    ));
+
+    tx.send(mk_funding(1_700_000_000_000_000_i64)).unwrap();
+    drop(tx);
+    writer.await.unwrap();
+
+    let label = feed_label(Feed::Deriv);
+    assert!(
+        handle
+            .metrics
+            .write_errors_total
+            .get_or_create(&label)
+            .get()
+            >= 1,
+        "deriv feed should count the open/create failure"
+    );
+}
