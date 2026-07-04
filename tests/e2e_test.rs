@@ -1173,7 +1173,8 @@ fn deriv_parquets(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// markPrice + forceOrder events on the combined stream must land in the
-/// deriv parquet family (funding.parquet / liq.parquet, daily files).
+/// deriv parquet family (funding_HHMM_HHMM.parquet / liq_HHMM_HHMM.parquet,
+/// hourly-rotated files).
 ///
 /// Uses the spot-shaped mock harness: stream dispatch is suffix-driven and
 /// venue-agnostic, and that routing is what's under test — a perp harness
@@ -1259,13 +1260,19 @@ async fn test_e2e_mark_price_and_force_order_to_deriv_parquet() {
 
     let funding = derivs
         .iter()
-        .find(|p| p.file_name().unwrap() == "funding.parquet")
-        .expect("funding.parquet");
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("funding_")
+        })
+        .expect("funding_HHMM_HHMM.parquet");
     assert!(
         funding
             .to_string_lossy()
             .contains("/deriv/binance_spot/ETHUSDT/2023-11-14/"),
-        "daily layout deriv/{{exchange}}/{{symbol}}/{{date}}: {funding:?}"
+        "layout deriv/{{exchange}}/{{symbol}}/{{date}}: {funding:?}"
     );
     let file = std::fs::File::open(funding).unwrap();
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -1299,8 +1306,8 @@ async fn test_e2e_mark_price_and_force_order_to_deriv_parquet() {
 
     let liq = derivs
         .iter()
-        .find(|p| p.file_name().unwrap() == "liq.parquet")
-        .expect("liq.parquet");
+        .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with("liq_"))
+        .expect("liq_HHMM_HHMM.parquet");
     let file = std::fs::File::open(liq).unwrap();
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .unwrap()
