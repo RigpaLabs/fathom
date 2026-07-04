@@ -99,13 +99,33 @@ restart), not the 5-minute figure above. Confirmed in production 2026-07-04: 3 f
 destroyed ~22h and ~3.5h of data in the 1s/deriv feeds.
 
 Fix: `snap_1s.rs` and `deriv.rs` now rotate on the same schedule as `raw.rs`/`trades.rs`, via the
-shared temp-file-then-rename `Bucket` pattern (`src/writer/rotation.rs`). Post-fix, a restart's
-worst case is **≤ the configured rotation bucket** (`raw_rotate_hours`, currently 1h in
+same temp-file-then-rename rotation pattern (`snap_1s.rs`/`deriv.rs` via the shared `Bucket` in
+`src/writer/rotation.rs`; `raw.rs`/`trades.rs` via their own pre-existing, independent
+implementation of the identical pattern — see "Restart-crash bound, all writers" below). Post-fix,
+a restart's worst case is **≤ the configured rotation bucket** (`raw_rotate_hours`, currently 1h in
 prod/default — any divisor of 24 up to 24h is configurable), not the entire day. This bounds the
 loss; it does not eliminate it — the bucket open at the moment of the crash is still entirely
 lost. An `ArrowWriter` that never reaches `.finish()` has no Parquet footer, so that bucket's data
 is unreadable, not "missing a few rows". This is a bounded-loss design, not full restart-safety.
 See `specs/storage.md` for the naming/rotation contract.
+
+### Restart-crash bound, all writers (correction to the tables above)
+
+The per-component "Crash loss window" figures in the Decision tables above (≤5s raw, ≤5s trades,
+≤5min snap) describe **steady-state buffering loss only** — how much unflushed, in-memory data is
+lost if a *continuously-running* process crashes between flushes. They were never an accurate
+restart-crash bound, including for raw/trades: an `ArrowWriter` writes row groups into a temp file
+across many `flush()` calls, but the Parquet footer (schema + row-group offsets) is only written at
+`.finish()`. Without it, the *entire* temp file is unreadable — every row group written since the
+bucket opened, not just the last 5 seconds of buffer. This was already true for raw/trades before
+today's fix (their bucket was already hourly, so the practical exposure was smaller — "only" up to
+one hour, not up to a full day like the pre-fix snap/deriv — but the "≤5s" figure was still wrong
+for a *restart*, not just a design gap unique to snap/deriv).
+
+**Post-fix, all four writers (raw, trades, snap, deriv) share the same restart-crash bound: ≤ the
+configured `raw_rotate_hours` bucket, currently 1h in prod/default.** The 5s/5min figures in the
+tables above remain correct descriptions of steady-state buffering loss for a process that keeps
+running; they are not the restart bound for any writer, not just snap/deriv.
 
 ## Alternatives considered
 

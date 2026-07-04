@@ -1632,8 +1632,12 @@ fn test_bucket_close_and_rename_produces_final_path() {
 /// identical params close with the same `as_of`, forcing the same final
 /// filename. Two simultaneously-open `Bucket`s with identical params would
 /// instead collide on creating the shared `temp_path` itself, before ever
-/// reaching rename — that's a different (and already-prevented, since
-/// `File::create` on a live fd doesn't lose data) scenario.
+/// reaching rename — that's a different, out-of-scope scenario: at most one
+/// writer is ever expected on a given path at a time (single-instance
+/// fathom). A second concurrent `File::create` on the same path would
+/// truncate the first writer's in-progress file, corrupting it — this is
+/// not "prevented", it's simply not a supported configuration (blue-green /
+/// concurrent multi-instance deploy is explicitly out of scope, see ADR-005).
 #[test]
 fn test_bucket_close_and_rename_avoids_overwrite() {
     let dir = TempDir::new().unwrap();
