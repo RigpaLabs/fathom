@@ -15,21 +15,25 @@ Root: `{data_dir}` from `config.toml`; `DATA_DIR` env overrides (blue-green depl
 └── metadata/status.json                                       # health snapshot, rewritten every 30s
 ```
 
-All four writers rotate on the same `raw_rotate_hours` config value (default 1) using the same
-temp-file-then-rename rotation pattern: an open bucket writes to `{prefix}_HHMM_open.parquet`,
+All four writers rotate on the same `raw_rotate_hours` config value (default 1) via the shared
+`Bucket` type in `src/writer/rotation.rs`: an open bucket writes to `{prefix}_HHMM_open.parquet`,
 then gets renamed to its final `{prefix}_HHMM_HHMM.parquet` name on rotation or graceful shutdown.
 If that final name is already taken (e.g. two restarts closing the "same" incomplete bucket within
 the same minute), an incrementing suffix is appended instead of overwriting:
-`{prefix}_HHMM_HHMM[_N].parquet`. Only `snap_1s.rs`/`deriv.rs` share this logic through the actual
-`Bucket` type in `src/writer/rotation.rs` — `raw.rs`/`trades.rs` predate it and have their own,
-separate implementation of the identical pattern (they only share the pure `bucket_open` helper
-from `rotation.rs`, not the `Bucket` struct itself; unifying them onto `Bucket` is a possible
-follow-up, not done yet).
+`{prefix}_HHMM_HHMM[_N].parquet`. `Bucket::should_rotate` checks both date and hour-bucket, so a
+bucket correctly rotates across a date boundary even when the hour-bucket value alone is unchanged
+(e.g. `raw_rotate_hours=24`, a single bucket per day: only the date distinguishes one day's bucket
+from the next).
 
-Writers: `src/writer/raw.rs` (hourly rotation), `src/writer/snap_1s.rs` (hourly rotation via
-`Bucket`, flush every row), `src/writer/trades.rs` (hourly rotation, same pattern as raw),
-`src/writer/deriv.rs` (hourly rotation via `Bucket`, per feed, 5s flush, plus a periodic
-force-rotate for sparse feeds — [derivatives-feeds.md](derivatives-feeds.md)).
+Writers: `src/writer/raw.rs` (hourly rotation via `Bucket`, wall-clock-triggered), `src/writer/snap_1s.rs`
+(hourly rotation via `Bucket`, event-time-triggered, flush every row), `src/writer/trades.rs`
+(hourly rotation via `Bucket`, wall-clock-triggered, same pattern as raw), `src/writer/deriv.rs`
+(hourly rotation via `Bucket`, event-time-triggered, per feed, 5s flush, plus a periodic
+force-rotate for sparse feeds — [derivatives-feeds.md](derivatives-feeds.md)). raw.rs/trades.rs
+trigger rotation on wall-clock time (so a totally silent symbol still rotates and doesn't hold a
+stale bucket open); snap_1s.rs/deriv.rs trigger on event time. All four use `Bucket`'s
+`close_and_rename` with a tracked last-event-time as the close marker, never wall-clock, so the
+filename's end-HHMM always reflects the data.
 
 Restart-safety: bounding the file granularity to one hour bounds restart data loss to at most the
 single bucket open at crash time, instead of an entire day (docs/adr/005). This is a bounded-loss

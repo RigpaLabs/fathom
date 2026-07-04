@@ -1,9 +1,10 @@
-//! Shared hourly-rotation infrastructure for the 1s and deriv writers.
+//! Shared hourly-rotation infrastructure for all four Parquet writers.
 //!
-//! `raw.rs`/`trades.rs` already rotate hourly via a temp-file-then-rename
-//! dance (`SymbolWriter`); `Bucket` lifts that same naming/lifecycle logic out
-//! so `snap_1s.rs` and `deriv.rs` can adopt it too, bounding restart data loss
-//! to a single open bucket instead of a full calendar day.
+//! `Bucket` is the one temp-file-then-rename naming/lifecycle mechanism used
+//! by `raw.rs`, `trades.rs`, `snap_1s.rs`, and `deriv.rs` — each writer keeps
+//! its own Arrow schema and buffering, but rotation math, file naming, and
+//! rename-collision handling live here, bounding restart data loss to a
+//! single open bucket instead of a full calendar day.
 
 use std::path::{Path, PathBuf};
 

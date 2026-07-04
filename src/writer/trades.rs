@@ -11,7 +11,7 @@ use std::{
 
 use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow_schema::SchemaRef;
-use chrono::{Timelike, Utc};
+use chrono::{DateTime, Utc};
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -20,20 +20,29 @@ use crate::{
     error::Result,
     metrics::{Feed, Metrics},
     schema::trades_schema,
-    writer::{batch_bytes, raw::bucket_open},
+    writer::{batch_bytes, rotation},
 };
 
 // Re-export from fathom-types crate.
 pub use fathom_types::RawTrade;
 
+/// Derive UTC event time from a timestamp in microseconds. Used only for the
+/// `close_and_rename` marker (see `SymbolWriter::last_event_time`) — the
+/// rotation *trigger* below is wall-clock, not event-time (see `raw.rs`'s
+/// module doc, which this writer mirrors).
+fn event_time_from_ts_us(ts_us: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(ts_us).unwrap_or_else(Utc::now)
+}
+
 struct SymbolWriter {
     writer: ArrowWriter<std::fs::File>,
-    /// Temp path: trades_HHMM_open.parquet
-    temp_path: PathBuf,
-    /// UTC hour when this file was opened (bucket open)
-    bucket_open_hour: u32,
-    /// Formatted HHMM for file renaming on close
-    open_hhmm: String,
+    bucket: rotation::Bucket,
+    /// Timestamp of the most recently written event — used as the `as_of`
+    /// passed to `Bucket::close_and_rename` so the file's end-HHMM reflects
+    /// the data, never the wall-clock time the process happened to close it.
+    /// The rotation *trigger* (`should_rotate` below) stays wall-clock-based,
+    /// same rationale as `raw.rs`.
+    last_event_time: DateTime<Utc>,
     buffer: Vec<RawTrade>,
 }
 
@@ -42,19 +51,12 @@ impl SymbolWriter {
         dir: &Path,
         symbol: &str,
         exchange: &str,
-        now_utc: chrono::DateTime<Utc>,
+        as_of: DateTime<Utc>,
         rotate_hours: u32,
     ) -> Result<Self> {
-        let date_str = now_utc.format("%Y-%m-%d").to_string();
-        let bucket = bucket_open(now_utc.hour(), rotate_hours);
-        let open_hhmm = format!("{bucket:02}00");
+        let bucket = rotation::Bucket::open(dir, exchange, symbol, "trades", as_of, rotate_hours)?;
 
-        let sym_dir = dir.join(exchange).join(symbol).join(&date_str);
-        std::fs::create_dir_all(&sym_dir)?;
-
-        let temp_path = sym_dir.join(format!("trades_{open_hhmm}_open.parquet"));
-
-        let file = std::fs::File::create(&temp_path)?;
+        let file = std::fs::File::create(&bucket.temp_path)?;
         let schema = SchemaRef::new(trades_schema().clone());
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -64,34 +66,25 @@ impl SymbolWriter {
 
         Ok(Self {
             writer,
-            temp_path,
-            bucket_open_hour: bucket,
-            open_hhmm,
+            bucket,
+            last_event_time: as_of,
             buffer: Vec::new(),
         })
     }
 
-    fn should_rotate(&self, now_utc: chrono::DateTime<Utc>, rotate_hours: u32) -> bool {
-        bucket_open(now_utc.hour(), rotate_hours) != self.bucket_open_hour
+    fn should_rotate(&self, as_of: DateTime<Utc>, rotate_hours: u32) -> bool {
+        self.bucket.should_rotate(as_of, rotate_hours)
     }
 
-    /// Flush any buffered rows, finalize the file, and rename it into place.
-    /// Returns the bytes recorded by the final buffer flush.
-    fn close_and_rename(&mut self, end_utc: chrono::DateTime<Utc>) -> Result<u64> {
+    /// Flush any buffered rows, finalize the file, and rename it into place
+    /// using the tracked last-event-time. Returns the bytes recorded by the
+    /// final buffer flush.
+    fn close(mut self) -> Result<u64> {
         let bytes = self.flush_buffer()?;
         self.writer.finish()?;
-
-        let end_hhmm = format!("{:02}{:02}", end_utc.hour(), end_utc.minute());
-        #[allow(clippy::unwrap_used)] // temp_path is always dir/.../file.parquet
-        let new_path = self
-            .temp_path
-            .parent()
-            .unwrap()
-            .join(format!("trades_{}_{}.parquet", self.open_hhmm, end_hhmm));
-
-        std::fs::rename(&self.temp_path, &new_path)?;
+        let new_path = self.bucket.close_and_rename(self.last_event_time)?;
         info!(
-            from = %self.temp_path.display(),
+            from = %self.bucket.temp_path.display(),
             to = %new_path.display(),
             "rotated trades file"
         );
@@ -138,9 +131,32 @@ impl SymbolWriter {
 /// flushes periodically, rotates on hour boundary. Mirrors `run_raw_writer`.
 pub async fn run_trades_writer(
     data_dir: PathBuf,
+    rx: broadcast::Receiver<RawTrade>,
+    flush_interval_s: u64,
+    rotate_hours: u32,
+    metrics: std::sync::Arc<Metrics>,
+) {
+    run_trades_writer_with_clock(
+        data_dir,
+        rx,
+        flush_interval_s,
+        rotate_hours,
+        Arc::new(rotation::SystemClock),
+        metrics,
+    )
+    .await;
+}
+
+/// Testable entry point with an injectable `Clock` driving the wall-clock
+/// rotation trigger — mirrors `raw.rs::run_raw_writer_with_clock`. Production
+/// always uses `SystemClock` via `run_trades_writer`.
+#[doc(hidden)]
+pub async fn run_trades_writer_with_clock(
+    data_dir: PathBuf,
     mut rx: broadcast::Receiver<RawTrade>,
     flush_interval_s: u64,
     rotate_hours: u32,
+    clock: Arc<dyn rotation::Clock>,
     metrics: std::sync::Arc<Metrics>,
 ) {
     let mut writers: HashMap<String, SymbolWriter> = HashMap::new();
@@ -159,25 +175,33 @@ pub async fn run_trades_writer(
             }
             Ok(Ok(trade)) => {
                 let key = format!("{}:{}", trade.exchange, trade.symbol);
-                let now_utc = Utc::now();
+                let now = clock.now();
+                let event_time = event_time_from_ts_us(trade.timestamp_us);
 
-                if let Some(sw) = writers.get_mut(&key)
-                    && sw.should_rotate(now_utc, rotate_hours)
-                {
-                    match sw.close_and_rename(now_utc) {
-                        Ok(bytes) => {
-                            metrics.parquet_writes_total.inc();
-                            if bytes > 0 {
-                                metrics.record_flush(Feed::Trades, bytes);
+                // Rollover check — wall-clock triggered (see module doc).
+                //
+                // The nested ifs cannot be collapsed into a let-chain:
+                // `writers.get(&key)` borrows immutably and the inner
+                // `writers.remove(&key)` needs a mutable borrow.
+                #[allow(clippy::collapsible_if)]
+                if let Some(sw) = writers.get(&key) {
+                    if sw.should_rotate(now, rotate_hours)
+                        && let Some(old) = writers.remove(&key)
+                    {
+                        match old.close() {
+                            Ok(bytes) => {
+                                metrics.parquet_writes_total.inc();
+                                if bytes > 0 {
+                                    metrics.record_flush(Feed::Trades, bytes);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to rotate trades file");
+                                metrics.parquet_write_errors_total.inc();
+                                metrics.record_write_error(Feed::Trades);
                             }
                         }
-                        Err(e) => {
-                            warn!(error = %e, "failed to rotate trades file");
-                            metrics.parquet_write_errors_total.inc();
-                            metrics.record_write_error(Feed::Trades);
-                        }
                     }
-                    writers.remove(&key);
                 }
 
                 if !writers.contains_key(&key) {
@@ -185,7 +209,7 @@ pub async fn run_trades_writer(
                         &data_dir.join("trades"),
                         &trade.symbol,
                         &trade.exchange,
-                        now_utc,
+                        now,
                         rotate_hours,
                     ) {
                         Ok(sw) => {
@@ -201,6 +225,7 @@ pub async fn run_trades_writer(
                 }
 
                 if let Some(sw) = writers.get_mut(&key) {
+                    sw.last_event_time = event_time;
                     sw.buffer.push(trade);
                 }
             }
@@ -228,10 +253,10 @@ pub async fn run_trades_writer(
         }
     }
 
-    // Graceful shutdown: flush all and finalize
-    let now_utc = Utc::now();
-    for (_, mut sw) in writers {
-        match sw.close_and_rename(now_utc) {
+    // Graceful shutdown: flush all and finalize (each writer's own tracked
+    // last_event_time is used as the close marker, not wall-clock).
+    for (_, sw) in writers {
+        match sw.close() {
             Ok(bytes) => {
                 metrics.parquet_writes_total.inc();
                 if bytes > 0 {
