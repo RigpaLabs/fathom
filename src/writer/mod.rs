@@ -1,5 +1,6 @@
 pub mod deriv;
 pub mod raw;
+pub mod rotation;
 pub mod snap_1s;
 pub mod trades;
 

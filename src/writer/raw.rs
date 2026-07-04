@@ -26,9 +26,7 @@ pub use fathom_types::RawDiff;
 
 /// Which hourly bucket does a UTC hour belong to?
 /// `interval` must divide 24 evenly (1, 2, 3, 4, 6, 8, 12, 24).
-pub fn bucket_open(hour: u32, interval: u32) -> u32 {
-    (hour / interval) * interval
-}
+pub use crate::writer::rotation::bucket_open;
 
 struct SymbolWriter {
     writer: ArrowWriter<std::fs::File>,
