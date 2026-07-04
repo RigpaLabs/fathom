@@ -70,18 +70,22 @@ a stub, to compile against).
   connection, N symbols, one tokio task" shape as every other connection task.
 - Subscribe: `{"op": "subscribe", "args": [...]}` listing `orderbook.1000.{symbol}`,
   `publicTrade.{symbol}` for every symbol, plus (linear only) `tickers.{symbol}` and
-  `allLiquidation.{symbol}`.
-- Ping: send `{"op": "ping"}` every ≤20s (spec: heartbeat requirement) — reuse whatever
+  `allLiquidation.{symbol}`. **Spot caps a `subscribe` request at 10 args (spec §Channels), and
+  spot's 6 symbols × 2 topics = 12 → the spot task must send its subscription in ≥2 batched
+  `subscribe` messages (≤10 args each) on the same socket.** Linear (24 args) fits one message.
+  Same batching must run on every reconnect, not only first connect.
+- Ping: send `{"op": "ping"}` about every 20s (spec: heartbeat keepalive) — reuse whatever
   ping/keepalive pattern an existing connection task already has (check `binance.rs`/
   `hyperliquid.rs` for the tokio interval/select pattern) rather than inventing a new one.
 - Message dispatch by `topic` prefix (`orderbook.`, `publicTrade.`, `tickers.`, `allLiquidation.`)
   → parse the JSON shape from the spec → route to the relevant handler:
-  - `orderbook.*`: `type: "snapshot"` → `apply_snapshot` (also treat this as the gap-recovery
-    path, log it via `src/monitor.rs`'s gap tracking, same call as any other venue's resync);
-    `type: "delta"` → gap-check `u` against last-seen `u` for that symbol, then `apply_diff` if
-    contiguous, else log the gap and wait for the next snapshot (per spec's resync design — no
-    active resubscribe/reconnect on a mere gap, only as a timeout fallback if no snapshot arrives
-    within a few seconds).
+  - `orderbook.*`: `type: "snapshot"` → `apply_snapshot`, full reset of that symbol's local book
+    (this handles both first-sync and a server-initiated resync — Bybit may push `snapshot`
+    unprompted on a server-side issue); `type: "delta"` → gap-check `u` against last-seen `u` for
+    that symbol, `apply_diff` if contiguous, else **treat it as a client-detected gap: log it via
+    `src/monitor.rs`'s gap tracking, then break out and reconnect+resubscribe** (per spec §Gap
+    detection — Bybit does NOT promise an unsolicited snapshot for a client-detected loss, so
+    passively waiting can hang; the reconnect rebuilds from a fresh `snapshot`).
   - `publicTrade.*`: iterate the `data` array (can hold up to 1024 trades — **do not assume one
     trade per message**, this is a real behavioral difference from Binance's `aggTrade`), emit one
     `RawTrade` per element.
@@ -89,6 +93,13 @@ a stub, to compile against).
     (see spec's "Ticker" section for the exact merge design), emit `MarkFunding`/`OpenInterest`
     from the merged state on relevant field changes.
   - `allLiquidation.*` (linear only): iterate `data` array, emit one `Liquidation` per element.
+- **Reconnect loop (required, not implicit)**: wrap the connect→subscribe→read-loop in an outer
+  loop that, on any socket close / read error / client-detected gap, applies backoff (reuse the
+  existing connection tasks' reconnect/backoff pattern — check `binance.rs`/`hyperliquid.rs`),
+  **resubscribes all topics** (spot in its ≤10-arg batches), and **resets all per-symbol state —
+  order books AND the in-memory ticker-merge state (WP3)** — before accepting any delta, so a stale
+  pre-reconnect book/ticker can never be merged against a fresh post-reconnect stream. The first
+  post-reconnect message per symbol must be a `snapshot`; drop deltas until it arrives.
 - Gap/reconnect/liveness integration: register with `src/monitor.rs` the same way every other
   connection does (symbol staleness tracking, reconnect counting) — check `ConnStats`/
   `SymbolStats` usage in an existing connection task for the exact calls to make.

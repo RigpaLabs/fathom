@@ -45,18 +45,22 @@ changes how the connection task is shaped:
 
 ## Channels / topics
 
-Subscribe message: `{"op": "subscribe", "args": ["<topic1>", "<topic2>", ...]}`. Multiple topics
-per connection, one message. Heartbeat: client must send `{"op": "ping"}` every ≤20s or the
-connection is dropped after 10 minutes of silence (no traffic at all, including data messages,
-resets the 10-minute idle timer — so in practice the 20s ping is the binding constraint, not the
-10-minute idle window, since market data itself usually arrives well under 10 minutes apart).
+Subscribe message: `{"op": "subscribe", "args": ["<topic1>", "<topic2>", ...]}`. **Per-request
+arg cap: spot allows at most 10 topics per `subscribe` request** (linear/option are far higher; the
+~21000 figure Bybit cites is the message-length limit in bytes, not an arg count). Spot carries 2
+topics/symbol (`orderbook` + `publicTrade` — no ticker/liq on spot), so 6 symbols = 12 args, over
+the spot cap → the **spot connection must split its subscription across multiple `subscribe`
+messages** (batch ≤10 args each) on the same socket. Linear (4 topics/symbol = 24 args) is under
+its cap and can subscribe in one message. Heartbeat: send `{"op": "ping"}` about every 20s (Bybit's
+recommended interval); a socket with no data and no ping-pong is dropped after ~10 min idle — in
+practice data keeps it busy, but the periodic ping is still the required liveness keepalive.
 
 | Channel | Topic | Category | Purpose |
 |---|---|---|---|
 | Orderbook | `orderbook.{depth}.{symbol}` | spot, linear | Book snapshot + deltas |
 | Public trade | `publicTrade.{symbol}` | spot, linear | Trade tape |
 | Ticker | `tickers.{symbol}` | linear only (perp deriv data) | Funding rate, mark price, open interest |
-| All liquidations | `allLiquidation.{symbol}` | linear only | Liquidation events (batched every 500ms, up to 21k args/req like other public topics) |
+| All liquidations | `allLiquidation.{symbol}` | linear only | Liquidation events (batched, ~500ms window) |
 
 `{symbol}` uses the same base+quote concatenation Binance already uses (e.g. `BTCUSDT`) — the
 existing 6-symbol reference set should map directly, but **confirm against Bybit's live symbol
@@ -121,13 +125,18 @@ message's `data.b`/`data.a` arrays touch (most likely, matching how every other 
 jump by more than 1 in a single message under some circumstance. Treat any `u` discontinuity
 (other than the documented `u==1`/`type==snapshot` restart case) as a gap requiring resync.
 
-**Resync on gap**: since Bybit pushes snapshots unprompted on the same connection when it detects
-a server-side issue, the simplest correct approach is **do not resubscribe or reconnect on a gap
-— just wait for the next `type: "snapshot"` message and reset**, logging the gap (mirrors
-`src/monitor.rs`'s existing gap-count tracking). If no snapshot arrives within a reasonable window
-(a few seconds), fall back to a full reconnect (same category WS, resubscribe all topics) as the
-recovery-of-last-resort — this is a stronger self-healing story than Binance's, which requires an
-explicit REST re-snapshot call on every gap.
+**Resync on gap** — distinguish two cases, because Bybit's unsolicited-snapshot promise covers only
+the first:
+- **Server-initiated resync**: Bybit may push a fresh `type: "snapshot"` unprompted when *it*
+  detects a server-side issue. The client just watches `type` and resets local book state on
+  `"snapshot"`. No client action needed.
+- **Client-detected gap** (a `u` discontinuity with no accompanying snapshot): Bybit does **not**
+  promise an unsolicited snapshot for a loss the client detects on its own — passively waiting for
+  one can hang indefinitely. Correct action is to **reconnect and resubscribe immediately** (same
+  category WS, all topics), discard local book/ticker state, and rebuild from the fresh initial
+  `snapshot`. Log the gap (mirrors `src/monitor.rs`'s existing gap-count tracking). Still simpler
+  than Binance — no explicit REST re-snapshot call — just an active reconnect rather than a passive
+  wait.
 
 `seq` (cross sequence) is for comparing orderbook state across **different depth levels of the
 same symbol** (e.g. if you were subscribed to both `orderbook.50` and `orderbook.1000` — smaller
@@ -203,9 +212,9 @@ Push frequency: 100ms for linear tickers.
 }
 ```
 
-One message can batch multiple liquidations (500ms batching window per Bybit's 2026 upgrade to
-this topic, replacing the old one-per-second `liquidation` topic — **use `allLiquidation`, not the
-deprecated `liquidation` topic**). Maps directly to fathom's existing `Liquidation` struct — same
+One message can batch multiple liquidations (~500ms batching window). `allLiquidation` was
+introduced Feb 2025, replacing the older one-per-second `liquidation` topic — **use
+`allLiquidation`, not the deprecated `liquidation` topic**. Maps directly to fathom's existing `Liquidation` struct — same
 shape as Binance's `forceOrder`-derived liquidation rows.
 
 ## Open interest — no REST poll needed (simpler than Binance)
