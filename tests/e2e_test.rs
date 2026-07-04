@@ -1173,7 +1173,8 @@ fn deriv_parquets(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// markPrice + forceOrder events on the combined stream must land in the
-/// deriv parquet family (funding.parquet / liq.parquet, daily files).
+/// deriv parquet family (funding_HHMM_HHMM.parquet / liq_HHMM_HHMM.parquet,
+/// hourly-rotated files).
 ///
 /// Uses the spot-shaped mock harness: stream dispatch is suffix-driven and
 /// venue-agnostic, and that routing is what's under test — a perp harness
@@ -1254,18 +1255,21 @@ async fn test_e2e_mark_price_and_force_order_to_deriv_parquet() {
     assert_eq!(
         derivs.len(),
         2,
-        "funding.parquet + liq.parquet expected: {derivs:?}"
+        "funding_2200_2213.parquet + liq_2200_2213.parquet expected: {derivs:?}"
     );
 
+    // Event times: markPrice at 22:13:21 and 22:13:22 UTC, forceOrder at
+    // 22:13:21.5 UTC (2023-11-14) → both land in the 22:00 hourly bucket,
+    // closed at 22:13 (the last event time in each feed).
     let funding = derivs
         .iter()
-        .find(|p| p.file_name().unwrap() == "funding.parquet")
-        .expect("funding.parquet");
+        .find(|p| p.file_name().unwrap() == "funding_2200_2213.parquet")
+        .expect("funding_2200_2213.parquet");
     assert!(
         funding
             .to_string_lossy()
             .contains("/deriv/binance_spot/ETHUSDT/2023-11-14/"),
-        "daily layout deriv/{{exchange}}/{{symbol}}/{{date}}: {funding:?}"
+        "layout deriv/{{exchange}}/{{symbol}}/{{date}}: {funding:?}"
     );
     let file = std::fs::File::open(funding).unwrap();
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -1299,8 +1303,8 @@ async fn test_e2e_mark_price_and_force_order_to_deriv_parquet() {
 
     let liq = derivs
         .iter()
-        .find(|p| p.file_name().unwrap() == "liq.parquet")
-        .expect("liq.parquet");
+        .find(|p| p.file_name().unwrap() == "liq_2200_2213.parquet")
+        .expect("liq_2200_2213.parquet");
     let file = std::fs::File::open(liq).unwrap();
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .unwrap()
