@@ -10,7 +10,12 @@ use fathom::{
     connection::{connection_task, connection_task_dydx, connection_task_hl},
     exchange::{BinancePerp, BinanceSpot, Hyperliquid},
     metrics, monitor, nats_sink,
-    writer::{deriv::DerivEvent, raw::RawDiff, snap_1s::run_snap_writer, trades::RawTrade},
+    writer::{
+        deriv::{DerivEvent, SystemClock},
+        raw::RawDiff,
+        snap_1s::run_snap_writer_configured,
+        trades::RawTrade,
+    },
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -96,9 +101,10 @@ async fn main() -> anyhow::Result<()> {
         cfg.raw_rotate_hours,
         metrics_handle_data.metrics.clone(),
     ));
-    let mut snap_handle = tokio::spawn(run_snap_writer(
+    let mut snap_handle = tokio::spawn(run_snap_writer_configured(
         data_dir.clone(),
         snap_rx_parquet,
+        cfg.raw_rotate_hours,
         cancel.clone(),
         metrics_handle_data.metrics.clone(),
     ));
@@ -109,10 +115,12 @@ async fn main() -> anyhow::Result<()> {
         cfg.raw_rotate_hours,
         metrics_handle_data.metrics.clone(),
     ));
-    let mut deriv_handle = tokio::spawn(fathom::writer::deriv::run_deriv_writer(
+    let mut deriv_handle = tokio::spawn(fathom::writer::deriv::run_deriv_writer_configured(
         data_dir.clone(),
         deriv_rx_parquet,
         RAW_FLUSH_INTERVAL_S,
+        cfg.raw_rotate_hours,
+        std::sync::Arc::new(SystemClock),
         metrics_handle_data.metrics.clone(),
     ));
 
