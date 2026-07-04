@@ -43,8 +43,10 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
-    /// How often to rotate raw parquet files, in hours.  Must divide 24 evenly.
-    /// Default: 1.
+    /// How often to rotate parquet files, in hours. Governs all four writers
+    /// (raw, trades, 1s snapshots, deriv) — each opens an hourly bucket and
+    /// renames it into place on rotation, bounding restart data loss to at
+    /// most one open bucket. Must divide 24 evenly. Default: 1.
     #[serde(default = "default_raw_rotate_hours")]
     pub raw_rotate_hours: u32,
     pub connections: Vec<ConnectionConfig>,
