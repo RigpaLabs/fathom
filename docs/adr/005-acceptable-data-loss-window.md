@@ -100,7 +100,7 @@ destroyed ~22h and ~3.5h of data in the 1s/deriv feeds.
 
 Fix: `snap_1s.rs` and `deriv.rs` now rotate on the same schedule as `raw.rs`/`trades.rs`, via the
 same temp-file-then-rename rotation pattern (`snap_1s.rs`/`deriv.rs` via the shared `Bucket` in
-`src/writer/rotation.rs`; `raw.rs`/`trades.rs` via their own pre-existing, independent
+`src/writer/rotation.rs`; `raw.rs`/`trades.rs` at the time via their own pre-existing, independent
 implementation of the identical pattern — see "Restart-crash bound, all writers" below). Post-fix,
 a restart's worst case is **≤ the configured rotation bucket** (`raw_rotate_hours`, currently 1h in
 prod/default — any divisor of 24 up to 24h is configurable), not the entire day. This bounds the
@@ -108,6 +108,14 @@ loss; it does not eliminate it — the bucket open at the moment of the crash is
 lost. An `ArrowWriter` that never reaches `.finish()` has no Parquet footer, so that bucket's data
 is unreadable, not "missing a few rows". This is a bounded-loss design, not full restart-safety.
 See `specs/storage.md` for the naming/rotation contract.
+
+**Update (follow-up refactor, same day):** `raw.rs`/`trades.rs` have since been migrated onto the
+same shared `Bucket` type too — the "own, independent implementation" described above and in
+"Restart-crash bound, all writers" below is no longer accurate; all four writers now share one
+mechanism. This also closed a smaller latent gap in `raw.rs`/`trades.rs`'s old separate
+`should_rotate`: it compared only the hour-bucket value, not date+hour like `Bucket::should_rotate`
+does, so a bucket could in theory survive a date boundary uncrossed if the hour-bucket value
+happened to repeat (e.g. `raw_rotate_hours=24`). See `specs/storage.md`.
 
 ### Restart-crash bound, all writers (correction to the tables above)
 
