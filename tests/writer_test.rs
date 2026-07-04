@@ -8,10 +8,16 @@ use chrono::Timelike;
 use fathom::{
     accumulator::Snapshot1s,
     writer::{
-        deriv::{DerivEvent, Liquidation, MarkFunding, OpenInterest, run_deriv_writer},
+        deriv::{
+            DerivEvent, Liquidation, MarkFunding, OpenInterest, run_deriv_writer,
+            run_deriv_writer_configured,
+        },
         raw::RawDiff,
         raw::{bucket_open, run_raw_writer},
-        snap_1s::{run_snap_writer, run_snap_writer_with_flush_interval},
+        rotation::{Bucket, Clock},
+        snap_1s::{
+            run_snap_writer, run_snap_writer_configured, run_snap_writer_with_flush_interval,
+        },
         trades::{RawTrade, run_trades_writer},
     },
 };
@@ -957,17 +963,22 @@ async fn test_deriv_writer_daily_file_per_feed_and_roundtrip() {
     writer.await.unwrap();
 
     let files = find_parquets(&dir.path().to_path_buf());
-    assert_eq!(files.len(), 3, "one daily file per feed: {files:?}");
-    let by_name = |name: &str| -> PathBuf {
+    assert_eq!(
+        files.len(),
+        3,
+        "one file per feed in this hour bucket: {files:?}"
+    );
+    let by_prefix = |prefix: &str| -> PathBuf {
         files
             .iter()
-            .find(|f| f.file_name().unwrap().to_str().unwrap() == name)
-            .unwrap_or_else(|| panic!("missing {name} in {files:?}"))
+            .find(|f| f.file_name().unwrap().to_str().unwrap().starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix}*.parquet in {files:?}"))
             .clone()
     };
 
-    // Layout: deriv/{exchange}/{symbol}/{date}/{feed}.parquet, date from event ts.
-    let funding = by_name("funding.parquet");
+    // Layout: deriv/{exchange}/{symbol}/{date}/{feed}_HHMM_HHMM.parquet,
+    // date+hour bucket from event ts.
+    let funding = by_prefix("funding_");
     assert!(
         funding
             .to_string_lossy()
@@ -975,8 +986,8 @@ async fn test_deriv_writer_daily_file_per_feed_and_roundtrip() {
         "layout must be deriv/{{exchange}}/{{symbol}}/{{date}}: {funding:?}"
     );
     assert_eq!(count_parquet_rows(&funding), 2);
-    assert_eq!(count_parquet_rows(&by_name("oi.parquet")), 1);
-    assert_eq!(count_parquet_rows(&by_name("liq.parquet")), 1);
+    assert_eq!(count_parquet_rows(&by_prefix("oi_")), 1);
+    assert_eq!(count_parquet_rows(&by_prefix("liq_")), 1);
 
     use arrow_array::{Array, Float64Array, Int64Array, StringArray};
 
@@ -1032,7 +1043,7 @@ async fn test_deriv_writer_daily_file_per_feed_and_roundtrip() {
     assert_eq!(nft.value(0), ts_us + 8 * 3600 * 1_000_000);
 
     // oi.parquet: oi_quote must be null (None)
-    let file = std::fs::File::open(&by_name("oi.parquet")).unwrap();
+    let file = std::fs::File::open(&by_prefix("oi_")).unwrap();
     let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
     let batch = reader.build().unwrap().next().unwrap().unwrap();
     let oi_base = batch
@@ -1051,7 +1062,7 @@ async fn test_deriv_writer_daily_file_per_feed_and_roundtrip() {
     assert!(oi_quote.is_null(0), "oi_quote None must round-trip as null");
 
     // liq.parquet values
-    let file = std::fs::File::open(&by_name("liq.parquet")).unwrap();
+    let file = std::fs::File::open(&by_prefix("liq_")).unwrap();
     let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
     let batch = reader.build().unwrap().next().unwrap().unwrap();
     let side = batch
@@ -1526,5 +1537,500 @@ async fn test_deriv_writer_records_write_error_on_failure() {
             .get()
             >= 1,
         "deriv feed should count the open/create failure"
+    );
+}
+
+// ── Bucket rotation infrastructure (writer::rotation) ─────────────────────────
+
+#[test]
+fn test_bucket_open_creates_temp_path_and_directory() {
+    let dir = TempDir::new().unwrap();
+    let as_of = chrono::DateTime::parse_from_rfc3339("2025-01-15T14:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let bucket = Bucket::open(dir.path(), "binance_spot", "ETHUSDT", "snap", as_of, 1).unwrap();
+
+    assert!(
+        bucket.temp_path.parent().unwrap().is_dir(),
+        "open() must create the {{date}}/ directory"
+    );
+    assert!(
+        !bucket.temp_path.exists(),
+        "open() only creates the directory, not the temp file itself"
+    );
+    assert_eq!(
+        bucket.temp_path.file_name().unwrap().to_str().unwrap(),
+        "snap_1400_open.parquet"
+    );
+    assert!(
+        bucket
+            .temp_path
+            .to_string_lossy()
+            .contains("/binance_spot/ETHUSDT/2025-01-15/"),
+        "layout must be {{exchange}}/{{symbol}}/{{date}}: {:?}",
+        bucket.temp_path
+    );
+}
+
+#[test]
+fn test_bucket_should_rotate_hour_and_date_change() {
+    let dir = TempDir::new().unwrap();
+    let opened_at = chrono::DateTime::parse_from_rfc3339("2025-01-15T14:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let bucket = Bucket::open(dir.path(), "binance_spot", "ETHUSDT", "snap", opened_at, 1).unwrap();
+
+    let still_same_hour = chrono::DateTime::parse_from_rfc3339("2025-01-15T14:59:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(
+        !bucket.should_rotate(still_same_hour, 1),
+        "same date+hour must not rotate"
+    );
+
+    let next_hour = chrono::DateTime::parse_from_rfc3339("2025-01-15T15:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(
+        bucket.should_rotate(next_hour, 1),
+        "hour boundary crossed must rotate"
+    );
+
+    let next_day_same_hour = chrono::DateTime::parse_from_rfc3339("2025-01-16T14:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(
+        bucket.should_rotate(next_day_same_hour, 1),
+        "date change (even at the same hour-of-day) must rotate"
+    );
+}
+
+#[test]
+fn test_bucket_close_and_rename_produces_final_path() {
+    let dir = TempDir::new().unwrap();
+    let opened_at = chrono::DateTime::parse_from_rfc3339("2025-01-15T14:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let bucket = Bucket::open(dir.path(), "binance_spot", "ETHUSDT", "snap", opened_at, 1).unwrap();
+    std::fs::write(&bucket.temp_path, b"parquet bytes").unwrap();
+
+    let closed_at = chrono::DateTime::parse_from_rfc3339("2025-01-15T14:47:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let final_path = bucket.close_and_rename(closed_at).unwrap();
+
+    assert!(!bucket.temp_path.exists(), "temp file must be renamed away");
+    assert!(final_path.exists());
+    assert_eq!(
+        final_path.file_name().unwrap().to_str().unwrap(),
+        "snap_1400_1447.parquet"
+    );
+}
+
+/// Sequential (not simultaneous) collision: two bucket lifecycles with
+/// identical params close with the same `as_of`, forcing the same final
+/// filename. Two simultaneously-open `Bucket`s with identical params would
+/// instead collide on creating the shared `temp_path` itself, before ever
+/// reaching rename — that's a different, out-of-scope scenario: at most one
+/// writer is ever expected on a given path at a time (single-instance
+/// fathom). A second concurrent `File::create` on the same path would
+/// truncate the first writer's in-progress file, corrupting it — this is
+/// not "prevented", it's simply not a supported configuration (blue-green /
+/// concurrent multi-instance deploy is explicitly out of scope, see ADR-005).
+#[test]
+fn test_bucket_close_and_rename_avoids_overwrite() {
+    let dir = TempDir::new().unwrap();
+    let opened_at = chrono::DateTime::parse_from_rfc3339("2025-01-15T14:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let closed_at = chrono::DateTime::parse_from_rfc3339("2025-01-15T14:05:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // Bucket A: open -> write -> close_and_rename -> final file #1.
+    let bucket_a =
+        Bucket::open(dir.path(), "binance_spot", "ETHUSDT", "snap", opened_at, 1).unwrap();
+    std::fs::write(&bucket_a.temp_path, b"first").unwrap();
+    let final_a = bucket_a.close_and_rename(closed_at).unwrap();
+
+    // Bucket B: same params — its temp_path is free again since A's was
+    // renamed away. Closing with the SAME `as_of` forces the naming
+    // collision on the final name.
+    let bucket_b =
+        Bucket::open(dir.path(), "binance_spot", "ETHUSDT", "snap", opened_at, 1).unwrap();
+    std::fs::write(&bucket_b.temp_path, b"second").unwrap();
+    let final_b = bucket_b.close_and_rename(closed_at).unwrap();
+
+    assert_ne!(
+        final_a, final_b,
+        "second close must not overwrite the first"
+    );
+    assert!(final_a.exists());
+    assert!(final_b.exists());
+    assert_eq!(
+        final_b.file_name().unwrap().to_str().unwrap(),
+        "snap_1400_1405_2.parquet"
+    );
+    assert_eq!(std::fs::read(&final_a).unwrap(), b"first");
+    assert_eq!(std::fs::read(&final_b).unwrap(), b"second");
+}
+
+// ── FakeClock (deriv periodic force-rotate tests) ─────────────────────────────
+
+/// Settable clock for driving `run_deriv_writer_configured`'s periodic
+/// force-rotate check without racing real wall-clock time.
+struct FakeClock(std::sync::Mutex<chrono::DateTime<chrono::Utc>>);
+
+impl FakeClock {
+    fn new(t: chrono::DateTime<chrono::Utc>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(std::sync::Mutex::new(t)))
+    }
+
+    fn set(&self, t: chrono::DateTime<chrono::Utc>) {
+        *self.0.lock().unwrap() = t;
+    }
+}
+
+impl Clock for FakeClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// A sparse feed (e.g. `liq`) can go silent for hours. Without a periodic
+/// force-rotate, its bucket would stay open (as an unrenamed `_open.parquet`
+/// file) long past its hour boundary — an orphaned, unrecoverable file on
+/// crash. This drives the writer's periodic tick past the bucket boundary
+/// with no second event and asserts the bucket gets force-closed anyway.
+#[tokio::test]
+async fn test_deriv_writer_forces_rotation_without_new_events() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().to_path_buf();
+    let (tx, rx) = broadcast::channel::<DerivEvent>(64);
+
+    let h1_time = chrono::DateTime::parse_from_rfc3339("2025-01-15T14:10:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let clock = FakeClock::new(h1_time);
+
+    let handle = new_metrics();
+    let writer = tokio::spawn(run_deriv_writer_configured(
+        data_dir.clone(),
+        rx,
+        1, // flush_interval_s — also the periodic force-rotate tick cadence
+        1, // rotate_hours
+        clock.clone(),
+        handle.metrics.clone(),
+    ));
+
+    tx.send(mk_funding(h1_time.timestamp_micros())).unwrap();
+
+    // Let the writer receive & open the bucket.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let files = find_parquets(&data_dir);
+    assert_eq!(files.len(), 1, "bucket should be open: {files:?}");
+    assert!(
+        files[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("_open"),
+        "bucket must still be the unrotated temp file before the force-rotate: {files:?}"
+    );
+
+    // Jump "now" 2h past the bucket boundary — no new event sent.
+    clock.set(h1_time + chrono::Duration::hours(2));
+
+    // Wait for a periodic tick (~1s cadence) to observe the stale bucket and
+    // force-close it, all while the writer task is still running.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    let files = find_parquets(&data_dir);
+    assert_eq!(
+        files.len(),
+        1,
+        "H1 must be force-rotated by the periodic tick alone, before shutdown: {files:?}"
+    );
+    let name = files[0].file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("funding_1400_") && !name.contains("_open"),
+        "expected a renamed funding file, got {name}"
+    );
+    assert_eq!(count_parquet_rows(&files[0]), 1);
+
+    drop(tx);
+    writer.await.unwrap();
+
+    // No new bucket was opened after the force-rotate, so shutdown is a no-op.
+    assert_eq!(find_parquets(&data_dir).len(), 1);
+}
+
+// ── Restart-safety regression tests ───────────────────────────────────────────
+//
+// Reproduce the production incident (2026-07-04: 3 fathom restarts destroyed
+// ~22h + ~3.5h of 1s/deriv data) at hour instead of day granularity, and prove
+// the Bucket-based fix bounds the loss to the single bucket open at crash
+// time. RED on the pre-fix daily-file writer (a bare `File::create` on every
+// restart truncates the current day), GREEN after the `Bucket` rotation fix.
+
+#[tokio::test]
+async fn test_snap_writer_restart_preserves_completed_hour() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().to_path_buf();
+
+    let h1_dt = chrono::DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let h2_dt = h1_dt + chrono::Duration::hours(1);
+    let h3_dt = h2_dt + chrono::Duration::hours(1);
+    let h1_ts = h1_dt.timestamp_micros();
+    let h2_ts = h2_dt.timestamp_micros();
+    let h3_ts = h3_dt.timestamp_micros();
+
+    // ---- Writer #1: writes H1 fully, starts H2, then "crashes" ----
+    let (tx1, rx1) = broadcast::channel::<Snapshot1s>(64);
+    let handle1 = new_metrics();
+    let writer1 = tokio::spawn(run_snap_writer_configured(
+        data_dir.clone(),
+        rx1,
+        1, // rotate_hours
+        CancellationToken::new(),
+        handle1.metrics.clone(),
+    ));
+
+    for i in 0..3i64 {
+        tx1.send(make_snap("binance_spot", "ETHUSDT", h1_ts + i * 1_000_000))
+            .unwrap();
+    }
+    // Forces H1 rollover: a real, complete, renamed H1 file now exists.
+    tx1.send(make_snap("binance_spot", "ETHUSDT", h2_ts))
+        .unwrap();
+    // More H2 events, buffered in the still-open H2 writer.
+    tx1.send(make_snap("binance_spot", "ETHUSDT", h2_ts + 1_000_000))
+        .unwrap();
+    tx1.send(make_snap("binance_spot", "ETHUSDT", h2_ts + 2_000_000))
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // "Crash": abort with no graceful shutdown. H2's temp file is left with
+    // no Parquet footer — the pre-abort H2 buffer (3 events) is entirely and
+    // irrecoverably lost. Accepted, bounded-loss trade of this fix (see
+    // docs/adr/005): an ArrowWriter that never reaches `.finish()` has no
+    // footer, so the file isn't "missing a few rows", it's unreadable.
+    writer1.abort();
+    let _ = writer1.await;
+
+    let files_after_crash = find_parquets(&data_dir);
+    let h1_file = files_after_crash
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("snap_1000_")
+        })
+        .expect("H1 must have been renamed before the crash")
+        .clone();
+    assert!(!h1_file.to_string_lossy().contains("_open"));
+    let h1_bytes_before = std::fs::read(&h1_file).unwrap();
+    assert_eq!(count_parquet_rows(&h1_file), 3);
+
+    let h2_temp = files_after_crash
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("snap_1100_open")
+        })
+        .expect("H2's temp file should still be sitting there, unrotated");
+    let h2_temp_file = std::fs::File::open(h2_temp).unwrap();
+    assert!(
+        ParquetRecordBatchReaderBuilder::try_new(h2_temp_file).is_err(),
+        "crashed H2 temp file must have no footer — unrecoverable, not just missing rows"
+    );
+
+    // ---- Writer #2: process restart against the SAME data_dir ----
+    let (tx2, rx2) = broadcast::channel::<Snapshot1s>(64);
+    let handle2 = new_metrics();
+    let writer2 = tokio::spawn(run_snap_writer_configured(
+        data_dir.clone(),
+        rx2,
+        1,
+        CancellationToken::new(),
+        handle2.metrics.clone(),
+    ));
+
+    // Writer #2's own H2 data (writer #1's pre-crash buffer is gone), then H3
+    // events to force H2's rollover, then graceful shutdown.
+    for i in 0..2i64 {
+        tx2.send(make_snap(
+            "binance_spot",
+            "ETHUSDT",
+            h2_ts + 10_000_000 + i * 1_000_000,
+        ))
+        .unwrap();
+    }
+    for i in 0..4i64 {
+        tx2.send(make_snap("binance_spot", "ETHUSDT", h3_ts + i * 1_000_000))
+            .unwrap();
+    }
+    drop(tx2);
+    writer2.await.unwrap();
+
+    assert_eq!(
+        std::fs::read(&h1_file).unwrap(),
+        h1_bytes_before,
+        "H1 must be byte-for-byte identical after the restart"
+    );
+
+    let final_files = find_parquets(&data_dir);
+    assert!(
+        final_files
+            .iter()
+            .all(|f| !f.to_string_lossy().contains("_open")),
+        "no leftover _open files after graceful shutdown: {final_files:?}"
+    );
+
+    let total_rows: usize = final_files.iter().map(count_parquet_rows).sum();
+    assert_eq!(
+        total_rows,
+        3 + 2 + 4,
+        "H1 (3) + writer #2's H2 (2) + H3 (4) — excludes writer #1's lost \
+         pre-abort H2 buffer (3 events)"
+    );
+}
+
+#[tokio::test]
+async fn test_deriv_writer_restart_preserves_completed_feed_hour() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().to_path_buf();
+
+    let h1_dt = chrono::DateTime::parse_from_rfc3339("2025-01-15T10:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let h2_dt = h1_dt + chrono::Duration::hours(1);
+    let h3_dt = h2_dt + chrono::Duration::hours(1);
+    let h1_ts = h1_dt.timestamp_micros();
+    let h2_ts = h2_dt.timestamp_micros();
+    let h3_ts = h3_dt.timestamp_micros();
+
+    // ---- Writer #1: writes H1 fully, starts H2, then "crashes" ----
+    let (tx1, rx1) = broadcast::channel::<DerivEvent>(64);
+    let handle1 = new_metrics();
+    // FakeClock synced to each event's own timestamp at every step so the
+    // periodic force-rotate check never disagrees with this test's deliberate
+    // event-driven timing.
+    let clock1 = FakeClock::new(h1_dt);
+    let writer1 = tokio::spawn(run_deriv_writer_configured(
+        data_dir.clone(),
+        rx1,
+        1, // flush_interval_s
+        1, // rotate_hours
+        clock1.clone(),
+        handle1.metrics.clone(),
+    ));
+
+    clock1.set(h1_dt);
+    tx1.send(mk_funding(h1_ts)).unwrap();
+    clock1.set(h1_dt + chrono::Duration::seconds(10));
+    tx1.send(mk_funding(h1_ts + 10_000_000)).unwrap();
+
+    // Forces H1 rollover: a real, complete, renamed H1 file now exists.
+    clock1.set(h2_dt);
+    tx1.send(mk_funding(h2_ts)).unwrap();
+    // More H2 events, buffered in the still-open H2 writer.
+    clock1.set(h2_dt + chrono::Duration::seconds(5));
+    tx1.send(mk_funding(h2_ts + 5_000_000)).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // "Crash": abort with no graceful shutdown. H2's pre-abort buffer (2
+    // events) is entirely and irrecoverably lost — see snap_1s's twin test
+    // for the full rationale.
+    writer1.abort();
+    let _ = writer1.await;
+
+    let files_after_crash = find_parquets(&data_dir);
+    let h1_file = files_after_crash
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("funding_1000_")
+        })
+        .expect("H1 must have been renamed before the crash")
+        .clone();
+    assert!(!h1_file.to_string_lossy().contains("_open"));
+    let h1_bytes_before = std::fs::read(&h1_file).unwrap();
+    assert_eq!(count_parquet_rows(&h1_file), 2);
+
+    let h2_temp = files_after_crash
+        .iter()
+        .find(|f| {
+            f.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("funding_1100_open")
+        })
+        .expect("H2's temp file should still be sitting there, unrotated");
+    let h2_temp_file = std::fs::File::open(h2_temp).unwrap();
+    assert!(
+        ParquetRecordBatchReaderBuilder::try_new(h2_temp_file).is_err(),
+        "crashed H2 temp file must have no footer — unrecoverable"
+    );
+
+    // ---- Writer #2: process restart against the SAME data_dir ----
+    let (tx2, rx2) = broadcast::channel::<DerivEvent>(64);
+    let handle2 = new_metrics();
+    let clock2 = FakeClock::new(h2_dt);
+    let writer2 = tokio::spawn(run_deriv_writer_configured(
+        data_dir.clone(),
+        rx2,
+        1,
+        1,
+        clock2.clone(),
+        handle2.metrics.clone(),
+    ));
+
+    clock2.set(h2_dt + chrono::Duration::seconds(20));
+    tx2.send(mk_funding(h2_ts + 20_000_000)).unwrap();
+
+    clock2.set(h3_dt);
+    tx2.send(mk_funding(h3_ts)).unwrap();
+    clock2.set(h3_dt + chrono::Duration::seconds(1));
+    tx2.send(mk_funding(h3_ts + 1_000_000)).unwrap();
+
+    drop(tx2);
+    writer2.await.unwrap();
+
+    assert_eq!(
+        std::fs::read(&h1_file).unwrap(),
+        h1_bytes_before,
+        "H1 must be byte-for-byte identical after the restart"
+    );
+
+    let final_files = find_parquets(&data_dir);
+    assert!(
+        final_files
+            .iter()
+            .all(|f| !f.to_string_lossy().contains("_open")),
+        "no leftover _open files after graceful shutdown: {final_files:?}"
+    );
+
+    let total_rows: usize = final_files.iter().map(count_parquet_rows).sum();
+    assert_eq!(
+        total_rows,
+        2 + 1 + 2,
+        "H1 (2) + writer #2's H2 (1) + H3 (2) — excludes writer #1's lost \
+         pre-abort H2 buffer (2 events)"
     );
 }

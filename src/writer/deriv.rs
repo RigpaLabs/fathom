@@ -1,18 +1,26 @@
 //! Derivatives Parquet writer — funding/mark, open interest, liquidations
 //! (specs/derivatives-feeds.md).
 //!
-//! Layout: `{data_dir}/deriv/{exchange}/{symbol}/{date}/{feed}.parquet` with
-//! `feed` ∈ {funding, oi, liq} — DAILY files, no hourly rotation (rates are
-//! ~1 row/s at most; a day of funding is single-digit MB).
+//! Layout: `{data_dir}/deriv/{exchange}/{symbol}/{date}/{feed}_HHMM_HHMM.parquet`
+//! with `feed` ∈ {funding, oi, liq} — hourly-rotated files (`rotate_hours`,
+//! shared with raw/trades/1s), written via the temp-file-then-rename `Bucket`
+//! pattern in `writer::rotation`. Bounds restart data loss to a single open
+//! bucket instead of an entire day.
 //!
-//! Lifecycle composition (deliberate mix of the two existing writer patterns):
-//! - Daily file keyed by *event time* with rollover on date change, like
-//!   `snap_1s.rs` — no `_open`/rename dance, the filename is stable from open.
+//! Lifecycle:
+//! - Bucket rollover on event-time hour/date boundary, like `raw.rs`/`trades.rs`.
+//! - Additionally, a periodic tick (driven by `Clock`, real wall-clock in
+//!   production) force-closes any writer whose bucket has expired even with
+//!   no new events — needed because sparse feeds (e.g. `liq`) can go silent
+//!   for hours and would otherwise hold an `_open.parquet` file well past its
+//!   bucket boundary, an orphaned file on crash that the uploader never picks
+//!   up (roadmap.md: "deriv time-based rollover: sporadic feed holds file
+//!   open >2 days").
 //! - Row buffer drained on a periodic flush interval (default 5 s), like
 //!   `raw.rs` — plus an explicit `ArrowWriter::flush()` each time so row
 //!   groups hit disk. Without it, at deriv rates the 8192-row group would sit
-//!   in memory for hours and a crash would lose the whole day. Tiny row groups
-//!   are an acceptable trade at this volume.
+//!   in memory for hours and a crash would lose the whole bucket. Tiny row
+//!   groups are an acceptable trade at this volume.
 
 use std::{
     collections::HashMap,
@@ -22,6 +30,7 @@ use std::{
 
 use arrow_array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow_schema::SchemaRef;
+use chrono::{DateTime, Utc};
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -30,11 +39,13 @@ use crate::{
     error::Result,
     metrics::{Feed, Metrics},
     schema::{liquidation_schema, mark_funding_schema, open_interest_schema},
-    writer::batch_bytes,
+    writer::{batch_bytes, rotation},
 };
 
 // Re-export from fathom-types crate.
 pub use fathom_types::{Liquidation, MarkFunding, OpenInterest};
+// Rotation infrastructure shared with snap_1s.rs.
+pub use rotation::{Clock, SystemClock};
 
 /// Internal fan-out envelope for the three derivatives structs.
 ///
@@ -93,34 +104,40 @@ impl DerivEvent {
     }
 }
 
-/// Derive UTC date string from event timestamp in microseconds.
-fn date_from_ts_us(ts_us: i64) -> String {
-    chrono::DateTime::from_timestamp_micros(ts_us)
-        .unwrap_or_else(chrono::Utc::now)
-        .format("%Y-%m-%d")
-        .to_string()
+/// Derive UTC event time from a timestamp in microseconds.
+fn event_time_from_ts_us(ts_us: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(ts_us).unwrap_or_else(Utc::now)
 }
 
-/// One open daily file for a single (exchange, symbol, feed).
+/// One open hourly bucket for a single (exchange, symbol, feed).
 /// The buffer only ever holds the variant matching `feed` — the writer map is
 /// keyed by feed, so mixing is impossible by construction.
 struct FeedWriter {
     writer: ArrowWriter<std::fs::File>,
-    date_str: String,
-    path: PathBuf,
+    bucket: rotation::Bucket,
+    /// Timestamp of the most recently written event — used as the `as_of`
+    /// passed to `close_and_rename`, never wall-clock (see module doc).
+    last_event_time: DateTime<Utc>,
     buffer: Vec<DerivEvent>,
 }
 
 impl FeedWriter {
-    fn open(dir: &Path, first: &DerivEvent, date_str: &str) -> Result<Self> {
-        let sym_dir = dir
-            .join(first.exchange())
-            .join(first.symbol())
-            .join(date_str);
-        std::fs::create_dir_all(&sym_dir)?;
-        let path = sym_dir.join(format!("{}.parquet", first.feed()));
+    fn open(
+        dir: &Path,
+        first: &DerivEvent,
+        as_of: DateTime<Utc>,
+        rotate_hours: u32,
+    ) -> Result<Self> {
+        let bucket = rotation::Bucket::open(
+            dir,
+            first.exchange(),
+            first.symbol(),
+            first.feed(),
+            as_of,
+            rotate_hours,
+        )?;
 
-        let file = std::fs::File::create(&path)?;
+        let file = std::fs::File::create(&bucket.temp_path)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .set_max_row_group_size(8192)
@@ -129,10 +146,14 @@ impl FeedWriter {
 
         Ok(Self {
             writer,
-            date_str: date_str.to_string(),
-            path,
+            bucket,
+            last_event_time: as_of,
             buffer: Vec::new(),
         })
+    }
+
+    fn should_rotate(&self, as_of: DateTime<Utc>, rotate_hours: u32) -> bool {
+        self.bucket.should_rotate(as_of, rotate_hours)
     }
 
     /// Write buffered rows to the Parquet writer. Returns the batch byte estimate
@@ -153,7 +174,8 @@ impl FeedWriter {
     fn close(mut self) -> Result<u64> {
         let bytes = self.flush_buffer()?;
         self.writer.finish()?;
-        info!(path = %self.path.display(), "closed deriv writer");
+        let final_path = self.bucket.close_and_rename(self.last_event_time)?;
+        info!(path = %final_path.display(), "closed deriv writer");
         Ok(bytes)
     }
 }
@@ -231,13 +253,54 @@ fn build_batch(buffer: &[DerivEvent]) -> Result<arrow_array::RecordBatch> {
     Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
 }
 
+/// Close a feed writer and record write-health metrics. Shared by the
+/// event-driven rollover, the periodic force-rotate, and shutdown sites.
+fn close_writer(fw: FeedWriter, metrics: &Metrics) {
+    match fw.close() {
+        Ok(bytes) => {
+            metrics.parquet_writes_total.inc();
+            if bytes > 0 {
+                metrics.record_flush(Feed::Deriv, bytes);
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to close deriv writer");
+            metrics.parquet_write_errors_total.inc();
+            metrics.record_write_error(Feed::Deriv);
+        }
+    }
+}
+
 /// Derivatives Parquet writer — receives DerivEvent via broadcast channel,
 /// buffers per (exchange, symbol, feed), flushes every `flush_interval_s`,
-/// rolls files on UTC date change (event time). Supervised as fatal in main.
+/// rotates hourly (event time). Supervised as fatal in main.
 pub async fn run_deriv_writer(
+    data_dir: PathBuf,
+    rx: broadcast::Receiver<DerivEvent>,
+    flush_interval_s: u64,
+    metrics: std::sync::Arc<Metrics>,
+) {
+    run_deriv_writer_configured(
+        data_dir,
+        rx,
+        flush_interval_s,
+        1,
+        Arc::new(SystemClock),
+        metrics,
+    )
+    .await;
+}
+
+/// Testable/production entry point with configurable rotation granularity and
+/// an injectable `Clock` for the periodic force-rotate check. `main.rs` calls
+/// this with `cfg.raw_rotate_hours` and the real `SystemClock`.
+#[doc(hidden)]
+pub async fn run_deriv_writer_configured(
     data_dir: PathBuf,
     mut rx: broadcast::Receiver<DerivEvent>,
     flush_interval_s: u64,
+    rotate_hours: u32,
+    clock: Arc<dyn Clock>,
     metrics: std::sync::Arc<Metrics>,
 ) {
     let mut writers: HashMap<String, FeedWriter> = HashMap::new();
@@ -256,30 +319,30 @@ pub async fn run_deriv_writer(
             }
             Ok(Ok(event)) => {
                 let key = format!("{}:{}:{}", event.exchange(), event.symbol(), event.feed());
-                let date_str = date_from_ts_us(event.timestamp_us());
+                let event_time = event_time_from_ts_us(event.timestamp_us());
 
-                // Day rollover: close the finished day's file (footer written),
+                // Rollover: close the finished bucket's file (footer + rename),
                 // a new one opens below.
-                if writers.get(&key).is_some_and(|fw| fw.date_str != date_str)
-                    && let Some(old) = writers.remove(&key)
-                {
-                    match old.close() {
-                        Ok(bytes) => {
-                            metrics.parquet_writes_total.inc();
-                            if bytes > 0 {
-                                metrics.record_flush(Feed::Deriv, bytes);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "failed to close deriv writer on rollover");
-                            metrics.parquet_write_errors_total.inc();
-                            metrics.record_write_error(Feed::Deriv);
-                        }
+                //
+                // The nested ifs cannot be collapsed into a let-chain:
+                // `writers.get(&key)` borrows immutably and the inner
+                // `writers.remove(&key)` needs a mutable borrow.
+                #[allow(clippy::collapsible_if)]
+                if let Some(fw) = writers.get(&key) {
+                    if fw.should_rotate(event_time, rotate_hours)
+                        && let Some(old) = writers.remove(&key)
+                    {
+                        close_writer(old, &metrics);
                     }
                 }
 
                 if !writers.contains_key(&key) {
-                    match FeedWriter::open(&data_dir.join("deriv"), &event, &date_str) {
+                    match FeedWriter::open(
+                        &data_dir.join("deriv"),
+                        &event,
+                        event_time,
+                        rotate_hours,
+                    ) {
                         Ok(fw) => {
                             writers.insert(key.clone(), fw);
                         }
@@ -293,6 +356,7 @@ pub async fn run_deriv_writer(
                 }
 
                 if let Some(fw) = writers.get_mut(&key) {
+                    fw.last_event_time = event_time;
                     fw.buffer.push(event);
                 }
             }
@@ -317,24 +381,26 @@ pub async fn run_deriv_writer(
                 }
             }
             last_flush = tokio::time::Instant::now();
+
+            // Force-rotate any bucket whose window has elapsed even with no
+            // new events (see module doc — sparse feeds like `liq`).
+            let now = clock.now();
+            let stale_keys: Vec<String> = writers
+                .iter()
+                .filter(|(_, fw)| fw.should_rotate(now, rotate_hours))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in stale_keys {
+                if let Some(old) = writers.remove(&key) {
+                    close_writer(old, &metrics);
+                }
+            }
         }
     }
 
     // Graceful shutdown: flush all and finalize footers
     for (_, fw) in writers {
-        match fw.close() {
-            Ok(bytes) => {
-                metrics.parquet_writes_total.inc();
-                if bytes > 0 {
-                    metrics.record_flush(Feed::Deriv, bytes);
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "shutdown: failed to close deriv writer");
-                metrics.parquet_write_errors_total.inc();
-                metrics.record_write_error(Feed::Deriv);
-            }
-        }
+        close_writer(fw, &metrics);
     }
     info!("deriv_writer shutdown complete");
 }

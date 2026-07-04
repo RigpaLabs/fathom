@@ -48,9 +48,9 @@ dYdX v4:
 
 All paths → four parallel writers + optional NATS sink:
   raw diff  → {data_dir}/raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet
-  1s snap   → {data_dir}/1s/{exchange}/{symbol}/{date}.parquet  (64 columns, 1 row/sec)
+  1s snap   → {data_dir}/1s/{exchange}/{symbol}/{date}/snap_HHMM_HHMM.parquet  (64 columns, 1 row/sec, hourly-rotated)
   trades    → {data_dir}/trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet  (Binance aggTrade + HL trades)
-  deriv     → {data_dir}/deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}.parquet  (daily files, perp venues)
+  deriv     → {data_dir}/deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}_HHMM_HHMM.parquet  (hourly-rotated, perp venues)
 
 Optional NATS streaming (src/nats_sink.rs):
   1s snap   → fathom.v1.{exchange}.{symbol}.snapshot  (FATHOM_SNAPSHOTS, file storage, critical)
@@ -86,9 +86,9 @@ OI REST poll; HL activeAssetCtx. Structs `MarkFunding` / `OpenInterest` / `Liqui
 | `src/accumulator.rs` | 1s window stats (shared by all exchanges) |
 | `src/exchange/` | BinanceSpot / BinancePerp / Hyperliquid adapters, dYdX constants |
 | `src/writer/raw.rs` | Raw diff Parquet writer |
-| `src/writer/snap_1s.rs` | 1s snapshot Parquet writer |
+| `src/writer/snap_1s.rs` | 1s snapshot Parquet writer (hourly-rotated) |
 | `src/writer/trades.rs` | Trade tape Parquet writer |
-| `src/writer/deriv.rs` | Derivatives Parquet writer (funding/OI/liquidations, daily files) |
+| `src/writer/deriv.rs` | Derivatives Parquet writer (funding/OI/liquidations, hourly-rotated) |
 | `src/nats_sink.rs` | NATS JetStream publisher (snapshots + depth diffs + trades + deriv) |
 | `src/monitor.rs` | Reconnect/gap/liveness tracking |
 
@@ -119,10 +119,10 @@ Data is written to `{data_dir}/` (configured in `config.toml`). When `DATA_DIR` 
 
 ```
 {data_dir}/
-├── 1s/{exchange}/{symbol}/{date}.parquet    # 1-second snapshots (1 row/sec)
+├── 1s/{exchange}/{symbol}/{date}/snap_HHMM_HHMM.parquet    # 1-second snapshots, hourly-rotated
 ├── raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet  # raw diffs
 ├── trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet  # raw trade tape
-├── deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}.parquet  # derivatives feeds (daily)
+├── deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}_HHMM_HHMM.parquet  # derivatives feeds, hourly-rotated
 └── metadata/status.json                     # health, updated every 30s
 ```
 

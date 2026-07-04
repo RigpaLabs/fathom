@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **1s/deriv restart data loss (unbounded → ≤1 bucket)** — `snap_1s.rs` and `deriv.rs` wrote one file per calendar day via a bare `File::create`, opened lazily through a `HashMap` that started empty on every process restart. A restart mid-day truncated whatever had already been written for that day — 3 production restarts on 2026-07-04 destroyed ~22h and ~3.5h of data. Both writers now rotate hourly via the same temp-file-then-rename `Bucket` pattern `raw.rs`/`trades.rs` already used, bounding restart loss to the single bucket open at crash time (`raw_rotate_hours`, default 1h). Also fixes a related gap where a sparse deriv feed (e.g. `liq`) could hold its file open for hours past the bucket boundary — the deriv writer now force-rotates a stale bucket on its periodic tick even with no new events.
+
 ## [0.3.0] — 2026-03-08
 
 ### Fixed
