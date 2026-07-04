@@ -17,15 +17,12 @@ use crate::{
     error::Result,
     metrics::{Feed, Metrics},
     schema::snap_1s_schema,
-    writer::batch_bytes,
+    writer::{batch_bytes, rotation::Bucket},
 };
 
-/// Derive UTC date string from event timestamp in microseconds.
-fn date_from_ts_us(ts_us: i64) -> String {
-    DateTime::from_timestamp_micros(ts_us)
-        .unwrap_or_else(Utc::now)
-        .format("%Y-%m-%d")
-        .to_string()
+/// Derive event time (UTC) from a timestamp in microseconds.
+fn datetime_from_ts_us(ts_us: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(ts_us).unwrap_or_else(Utc::now)
 }
 
 /// Build an Arrow RecordBatch from a slice of Snapshot1s rows.
@@ -182,6 +179,10 @@ pub fn write_snap_to_memory(buffer: &[Snapshot1s]) -> Result<Vec<u8>> {
 /// Keeps memory bounded and limits data loss on crash to ~5 min.
 const DEFAULT_DISK_FLUSH_INTERVAL: usize = 300;
 
+/// Default hourly rotation window, matching the other three writers'
+/// implicit behavior before `rotate_hours` was threaded through from config.
+const DEFAULT_ROTATE_HOURS: u32 = 1;
+
 /// Generic over the underlying sink so tests can inject a failing writer to
 /// exercise the `close()` error path (an already-open `std::fs::File` fd cannot
 /// be made to fail its writes via filesystem tricks). Production always uses
@@ -189,8 +190,11 @@ const DEFAULT_DISK_FLUSH_INTERVAL: usize = 300;
 /// and there is no runtime dispatch cost.
 struct DayWriter<W: std::io::Write + Send = std::fs::File> {
     writer: ArrowWriter<W>,
-    date_str: String,
-    path: PathBuf,
+    bucket: Bucket,
+    /// Timestamp of the last event written — used (never wall-clock) as the
+    /// `as_of` for `close_and_rename`, so the filename's end-HHMM reflects
+    /// what's actually in the data.
+    last_event_time: DateTime<Utc>,
     buffer: Vec<Snapshot1s>,
     rows_since_disk_flush: usize,
     disk_flush_interval: usize,
@@ -201,14 +205,20 @@ impl DayWriter<std::fs::File> {
         dir: &Path,
         exchange: &str,
         symbol: &str,
-        date_str: &str,
+        as_of: DateTime<Utc>,
+        rotate_hours: u32,
         disk_flush_interval: usize,
     ) -> Result<Self> {
-        let sym_dir = dir.join("1s").join(exchange).join(symbol);
-        std::fs::create_dir_all(&sym_dir)?;
-        let path = sym_dir.join(format!("{date_str}.parquet"));
+        let bucket = Bucket::open(
+            &dir.join("1s"),
+            exchange,
+            symbol,
+            "snap",
+            as_of,
+            rotate_hours,
+        )?;
 
-        let file = std::fs::File::create(&path)?;
+        let file = std::fs::File::create(&bucket.temp_path)?;
         let schema = SchemaRef::new(snap_1s_schema().clone());
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -218,8 +228,8 @@ impl DayWriter<std::fs::File> {
 
         Ok(Self {
             writer,
-            date_str: date_str.to_string(),
-            path,
+            bucket,
+            last_event_time: as_of,
             buffer: Vec::new(),
             rows_since_disk_flush: 0,
             disk_flush_interval,
@@ -228,6 +238,10 @@ impl DayWriter<std::fs::File> {
 }
 
 impl<W: std::io::Write + Send> DayWriter<W> {
+    fn should_rotate(&self, as_of: DateTime<Utc>, rotate_hours: u32) -> bool {
+        self.bucket.should_rotate(as_of, rotate_hours)
+    }
+
     /// Write buffered rows to the Parquet writer. Returns the batch byte estimate
     /// (0 when the buffer is empty).
     fn flush(&mut self) -> Result<u64> {
@@ -244,7 +258,7 @@ impl<W: std::io::Write + Send> DayWriter<W> {
         if self.rows_since_disk_flush >= self.disk_flush_interval {
             self.writer.flush()?;
             self.rows_since_disk_flush = 0;
-            info!(path = %self.path.display(), rows = self.disk_flush_interval, "flushed 1s row group");
+            info!(path = %self.bucket.temp_path.display(), rows = self.disk_flush_interval, "flushed 1s row group");
         }
         Ok(bytes)
     }
@@ -252,7 +266,8 @@ impl<W: std::io::Write + Send> DayWriter<W> {
     fn close(mut self) -> Result<u64> {
         let bytes = self.flush()?;
         self.writer.finish()?;
-        info!(path = %self.path.display(), "closed 1s writer");
+        let final_path = self.bucket.close_and_rename(self.last_event_time)?;
+        info!(path = %final_path.display(), "closed 1s writer");
         Ok(bytes)
     }
 }
@@ -276,14 +291,24 @@ fn close_and_record<W: std::io::Write + Send>(dw: DayWriter<W>, metrics: &Metric
     }
 }
 
-/// 1s snapshot writer — one daily file per (exchange, symbol), flush on each row.
+/// 1s snapshot writer — hourly-rotated file per (exchange, symbol), flush on
+/// each row. `rotate_hours` defaults to 1 via [`run_snap_writer`]; production
+/// wires it to `cfg.raw_rotate_hours` through [`run_snap_writer_configured`].
 pub async fn run_snap_writer(
     data_dir: PathBuf,
     rx: broadcast::Receiver<Snapshot1s>,
     cancel: CancellationToken,
     metrics: std::sync::Arc<Metrics>,
 ) {
-    run_snap_writer_inner(data_dir, rx, DEFAULT_DISK_FLUSH_INTERVAL, cancel, metrics).await;
+    run_snap_writer_inner(
+        data_dir,
+        rx,
+        DEFAULT_DISK_FLUSH_INTERVAL,
+        DEFAULT_ROTATE_HOURS,
+        cancel,
+        metrics,
+    )
+    .await;
 }
 
 /// Testable entry point with configurable disk flush interval.
@@ -295,13 +320,118 @@ pub async fn run_snap_writer_with_flush_interval(
     cancel: CancellationToken,
     metrics: std::sync::Arc<Metrics>,
 ) {
-    run_snap_writer_inner(data_dir, rx, disk_flush_interval, cancel, metrics).await;
+    run_snap_writer_inner(
+        data_dir,
+        rx,
+        disk_flush_interval,
+        DEFAULT_ROTATE_HOURS,
+        cancel,
+        metrics,
+    )
+    .await;
+}
+
+/// Testable/production entry point with configurable rotation window. Used by
+/// `main.rs` (with `cfg.raw_rotate_hours`) and by restart-safety tests.
+#[doc(hidden)]
+pub async fn run_snap_writer_configured(
+    rotate_hours: u32,
+    data_dir: PathBuf,
+    rx: broadcast::Receiver<Snapshot1s>,
+    cancel: CancellationToken,
+    metrics: std::sync::Arc<Metrics>,
+) {
+    run_snap_writer_inner(
+        data_dir,
+        rx,
+        DEFAULT_DISK_FLUSH_INTERVAL,
+        rotate_hours,
+        cancel,
+        metrics,
+    )
+    .await;
+}
+
+/// Handle one snapshot: rollover check (event-time based), open-if-missing,
+/// buffer + flush. Shared by the main receive loop and the drain loop below
+/// so there is exactly one code path for "what happens to an event" — before
+/// this was extracted, the drain loop skipped the rollover check entirely,
+/// meaning an event for the next bucket landing during drain would be
+/// written into the previous (wrong) bucket's writer.
+fn handle_snap_event(
+    writers: &mut HashMap<String, DayWriter>,
+    data_dir: &Path,
+    rotate_hours: u32,
+    disk_flush_interval: usize,
+    snap: Snapshot1s,
+    metrics: &Metrics,
+) {
+    // Partition by event time, not wall-clock.
+    let event_time = datetime_from_ts_us(snap.ts_us);
+    let key = format!("{}:{}", snap.exchange, snap.symbol);
+    let exchange = snap.exchange.clone();
+    let symbol = snap.symbol.clone();
+
+    // Rollover check.
+    // The nested ifs cannot be collapsed into a let-chain: `writers.get(&key)`
+    // borrows immutably and the inner `writers.remove(&key)` needs a mutable
+    // borrow — the borrow checker would reject the flat form.
+    #[allow(clippy::collapsible_if)]
+    if let Some(dw) = writers.get(&key) {
+        if dw.should_rotate(event_time, rotate_hours) {
+            if let Some(old) = writers.remove(&key) {
+                close_and_record(old, metrics);
+            }
+        }
+    }
+
+    // Open writer if needed.
+    if !writers.contains_key(&key) {
+        match DayWriter::open(
+            data_dir,
+            &exchange,
+            &symbol,
+            event_time,
+            rotate_hours,
+            disk_flush_interval,
+        ) {
+            Ok(dw) => {
+                writers.insert(key.clone(), dw);
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to open snap writer");
+                metrics.parquet_write_errors_total.inc();
+                metrics.record_write_error(Feed::Snap1s);
+                return;
+            }
+        }
+    }
+
+    if let Some(dw) = writers.get_mut(&key) {
+        dw.last_event_time = event_time;
+        dw.buffer.push(snap);
+        // Flush immediately — 1 row/sec per symbol, no buffering needed
+        match dw.flush() {
+            Ok(bytes) => {
+                metrics.parquet_writes_total.inc();
+                if bytes > 0 {
+                    metrics.record_flush(Feed::Snap1s, bytes);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "snap flush error");
+                metrics.parquet_write_errors_total.inc();
+                metrics.record_write_error(Feed::Snap1s);
+            }
+        }
+    }
 }
 
 async fn run_snap_writer_inner(
     data_dir: PathBuf,
     mut rx: broadcast::Receiver<Snapshot1s>,
     disk_flush_interval: usize,
+    rotate_hours: u32,
     cancel: CancellationToken,
     metrics: std::sync::Arc<Metrics>,
 ) {
@@ -319,110 +449,28 @@ async fn run_snap_writer_inner(
                 continue;
             }
             Ok(snap) => {
-                // Partition by event time, not wall-clock
-                let date_str = date_from_ts_us(snap.ts_us);
-                let key = format!("{}:{}", snap.exchange, snap.symbol);
-                let exchange = snap.exchange.clone();
-                let symbol = snap.symbol.clone();
-
-                // Day rollover check.
-                // The nested ifs cannot be collapsed into a let-chain: `writers.get(&key)`
-                // borrows immutably and the inner `writers.remove(&key)` needs a mutable
-                // borrow — the borrow checker would reject the flat form.
-                #[allow(clippy::collapsible_if)]
-                if let Some(dw) = writers.get(&key) {
-                    if dw.date_str != date_str {
-                        if let Some(old) = writers.remove(&key) {
-                            close_and_record(old, &metrics);
-                        }
-                    }
-                }
-
-                // Open writer if needed
-                if !writers.contains_key(&key) {
-                    match DayWriter::open(
-                        &data_dir,
-                        &exchange,
-                        &symbol,
-                        &date_str,
-                        disk_flush_interval,
-                    ) {
-                        Ok(dw) => {
-                            writers.insert(key.clone(), dw);
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "failed to open snap writer");
-                            metrics.parquet_write_errors_total.inc();
-                            metrics.record_write_error(Feed::Snap1s);
-                            continue;
-                        }
-                    }
-                }
-
-                if let Some(dw) = writers.get_mut(&key) {
-                    dw.buffer.push(snap);
-                    // Flush immediately — 1 row/sec per symbol, no buffering needed
-                    match dw.flush() {
-                        Ok(bytes) => {
-                            metrics.parquet_writes_total.inc();
-                            if bytes > 0 {
-                                metrics.record_flush(Feed::Snap1s, bytes);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "snap flush error");
-                            metrics.parquet_write_errors_total.inc();
-                            metrics.record_write_error(Feed::Snap1s);
-                        }
-                    }
-                }
+                handle_snap_event(
+                    &mut writers,
+                    &data_dir,
+                    rotate_hours,
+                    disk_flush_interval,
+                    snap,
+                    &metrics,
+                );
             }
         }
     }
 
     // Drain in-flight messages buffered before cancellation/channel close
     while let Ok(snap) = rx.try_recv() {
-        let date_str = date_from_ts_us(snap.ts_us);
-        let key = format!("{}:{}", snap.exchange, snap.symbol);
-        let exchange = snap.exchange.clone();
-        let symbol = snap.symbol.clone();
-
-        if !writers.contains_key(&key) {
-            match DayWriter::open(
-                &data_dir,
-                &exchange,
-                &symbol,
-                &date_str,
-                disk_flush_interval,
-            ) {
-                Ok(dw) => {
-                    writers.insert(key.clone(), dw);
-                }
-                Err(e) => {
-                    warn!(error = %e, "drain: failed to open snap writer");
-                    metrics.parquet_write_errors_total.inc();
-                    metrics.record_write_error(Feed::Snap1s);
-                    continue;
-                }
-            }
-        }
-
-        if let Some(dw) = writers.get_mut(&key) {
-            dw.buffer.push(snap);
-            match dw.flush() {
-                Ok(bytes) => {
-                    metrics.parquet_writes_total.inc();
-                    if bytes > 0 {
-                        metrics.record_flush(Feed::Snap1s, bytes);
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "drain: snap flush error");
-                    metrics.parquet_write_errors_total.inc();
-                    metrics.record_write_error(Feed::Snap1s);
-                }
-            }
-        }
+        handle_snap_event(
+            &mut writers,
+            &data_dir,
+            rotate_hours,
+            disk_flush_interval,
+            snap,
+            &metrics,
+        );
     }
 
     // Graceful shutdown — close all writers (writes Parquet footers)
@@ -486,10 +534,24 @@ mod tests {
             .build();
         // try_new writes the file magic — must succeed, so arm only afterward.
         let writer = ArrowWriter::try_new(sink, schema, Some(props)).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        #[allow(clippy::expect_used)]
+        let as_of = "2025-01-15T00:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("valid fixed timestamp");
+        let bucket = Bucket::open(
+            &tmp.path().join("1s"),
+            "binance_spot",
+            "ETHUSDT",
+            "snap",
+            as_of,
+            1,
+        )
+        .unwrap();
         let dw = DayWriter {
             writer,
-            date_str: "2025-01-15".to_string(),
-            path: PathBuf::from("<injected>"),
+            bucket,
+            last_event_time: as_of,
             buffer: Vec::new(),
             rows_since_disk_flush: 0,
             disk_flush_interval: 300,
