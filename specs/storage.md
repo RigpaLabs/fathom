@@ -8,14 +8,29 @@ Root: `{data_dir}` from `config.toml`; `DATA_DIR` env overrides (blue-green depl
 
 ```
 {data_dir}/
-├── raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet   # hourly-rotated raw diffs
-├── 1s/{exchange}/{symbol}/{date}.parquet                    # one file per day
-├── trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet  # hourly-rotated trade tape
-├── deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}.parquet   # daily derivatives feeds
-└── metadata/status.json                                     # health snapshot, rewritten every 30s
+├── raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet     # hourly-rotated raw diffs
+├── 1s/{exchange}/{symbol}/{date}/snap_HHMM_HHMM.parquet       # hourly-rotated 1s snapshots
+├── trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet # hourly-rotated trade tape
+├── deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}_HHMM_HHMM.parquet  # hourly-rotated derivatives feeds
+└── metadata/status.json                                       # health snapshot, rewritten every 30s
 ```
 
-Writers: `src/writer/raw.rs` (hourly rotation), `src/writer/snap_1s.rs` (daily file, periodic flush), `src/writer/trades.rs` (hourly rotation, same pattern as raw), `src/writer/deriv.rs` (daily file per feed, 5s flush — [derivatives-feeds.md](derivatives-feeds.md)).
+All four writers rotate on the same `raw_rotate_hours` config value (default 1) using the
+temp-file-then-rename `Bucket` pattern in `src/writer/rotation.rs`: an open bucket writes to
+`{prefix}_HHMM_open.parquet`, then gets renamed to its final `{prefix}_HHMM_HHMM.parquet` name
+on rotation or graceful shutdown. If that final name is already taken (e.g. two restarts closing
+the "same" incomplete bucket within the same minute), an incrementing suffix is appended instead
+of overwriting: `{prefix}_HHMM_HHMM[_N].parquet`.
+
+Writers: `src/writer/raw.rs` (hourly rotation), `src/writer/snap_1s.rs` (hourly rotation, flush
+every row), `src/writer/trades.rs` (hourly rotation, same pattern as raw), `src/writer/deriv.rs`
+(hourly rotation per feed, 5s flush, plus a periodic force-rotate for sparse feeds —
+[derivatives-feeds.md](derivatives-feeds.md)).
+
+Restart-safety: bounding the file granularity to one hour bounds restart data loss to at most the
+single bucket open at crash time, instead of an entire day (docs/adr/005). This is a bounded-loss
+design, not full restart-safety — an `ArrowWriter` that never reaches `.finish()` before a crash
+has no Parquet footer and that bucket's data is entirely unreadable, not partially recoverable.
 
 ## Volumes (order of magnitude, current symbol set)
 
@@ -29,7 +44,7 @@ There is **no rotation-by-age, no size cap, no upload**. On a small disk raw fil
 
 Design (deliberately minimal — no collector/writer split, no new services beyond a sidecar):
 
-1. **Uploader sidecar**: watches for *completed* files (rotated raw hours, previous-day 1s), moves them to object storage (S3-compatible), deletes local copy on verified upload. `rclone move` in a loop is an acceptable v1.
+1. **Uploader sidecar**: watches for *completed* files (any rotated `{prefix}_HHMM_HHMM[_N].parquet`, never a `_open` file), moves them to object storage (S3-compatible), deletes local copy on verified upload. `rclone move` in a loop is an acceptable v1.
 2. **Partitioning**: `{bucket}/{feed}/{exchange}/{symbol}/{date}/...` — mirrors local layout.
 3. **Local retention**: keep last N hours of raw as a buffer (NATS depth stream already covers short replay); 1s files keep longer locally (small).
 4. **Lifecycle**: storage-class transition / expiry handled by bucket policy, not fathom.
