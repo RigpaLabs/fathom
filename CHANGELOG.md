@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **1s/deriv restart truncation (unbounded → ≤1 open bucket)** — `snap_1s.rs` and `deriv.rs` wrote one file per calendar day, opened lazily via a `HashMap` that started empty every process restart; a mid-day restart's `File::create` truncated the existing day's file. Confirmed in production 2026-07-04: 3 fathom restarts destroyed ~22h of one day's data and ~3.5h of another day's data. Both writers now use the same hourly `Bucket` open-temp/rename-on-close lifecycle `raw.rs`/`trades.rs` already had (`src/writer/rotation.rs`), bounding restart loss to at most one open bucket (sized to `raw_rotate_hours`). Deriv also gained a periodic force-rotate (injected `Clock`) so a sparse feed (e.g. `liq`) can't hold an `_open.parquet` file open past its bucket boundary indefinitely.
+
+### Changed
+- Layout: `1s/{exchange}/{symbol}/{date}.parquet` → `1s/{exchange}/{symbol}/{date}/snap_HHMM_HHMM.parquet`; `deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}.parquet` → `.../{funding|oi|liq}_HHMM_HHMM.parquet`. Old daily-format files are not migrated; they coexist untouched.
+- `raw_rotate_hours` config now governs all four writers (raw, trades, 1s, deriv), not just raw/trades.
+
 ## [0.3.0] — 2026-03-08
 
 ### Fixed

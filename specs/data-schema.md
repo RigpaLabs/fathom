@@ -76,7 +76,7 @@ Structs: `crates/fathom-types/src/lib.rs`; Arrow schemas: `src/schema.rs::{mark_
 | `price` | f64 | `o.ap` (average fill price) |
 | `qty` | f64 | `o.q`, base units |
 
-Files: `{data_dir}/deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}.parquet` (daily, `src/writer/deriv.rs`).
+Files: `{data_dir}/deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}_HHMM_HHMM.parquet` (hourly, `src/writer/deriv.rs`).
 
 ## 1s snapshot (`Snapshot1s`)
 

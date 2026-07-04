@@ -9,13 +9,17 @@ Root: `{data_dir}` from `config.toml`; `DATA_DIR` env overrides (blue-green depl
 ```
 {data_dir}/
 ├── raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet   # hourly-rotated raw diffs
-├── 1s/{exchange}/{symbol}/{date}.parquet                    # one file per day
+├── 1s/{exchange}/{symbol}/{date}/snap_HHMM_HHMM.parquet     # hourly-rotated 1s snapshots
 ├── trades/{exchange}/{symbol}/{date}/trades_HHMM_HHMM.parquet  # hourly-rotated trade tape
-├── deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}.parquet   # daily derivatives feeds
+├── deriv/{exchange}/{symbol}/{date}/{funding|oi|liq}_HHMM_HHMM.parquet   # hourly-rotated derivatives feeds
 └── metadata/status.json                                     # health snapshot, rewritten every 30s
 ```
 
-Writers: `src/writer/raw.rs` (hourly rotation), `src/writer/snap_1s.rs` (daily file, periodic flush), `src/writer/trades.rs` (hourly rotation, same pattern as raw), `src/writer/deriv.rs` (daily file per feed, 5s flush — [derivatives-feeds.md](derivatives-feeds.md)).
+All four writers rotate on the same `rotate_hours` window (config `raw_rotate_hours`, default 1h) via the shared `Bucket` open/rename lifecycle (`src/writer/rotation.rs`): each opens a uniquely-named temp file (`{prefix}_{HHMM}_open.parquet`) and renames it to `{prefix}_{HHMM}_{HHMM}.parquet` on rotation or graceful shutdown. If the computed final name already exists (e.g. two restarts closing the "same" incomplete bucket within the same end-minute), an incrementing numeric suffix is appended instead of overwriting: `{prefix}_{HHMM}_{HHMM}[_N].parquet`.
+
+Writers: `src/writer/raw.rs` (hourly rotation), `src/writer/snap_1s.rs` (hourly rotation, flush on each row), `src/writer/trades.rs` (hourly rotation, same pattern as raw), `src/writer/deriv.rs` (hourly rotation + periodic force-rotate for sparse feeds, 5s buffer flush — [derivatives-feeds.md](derivatives-feeds.md)).
+
+Before this rotation scheme, `snap_1s.rs` and `deriv.rs` wrote one file per calendar day, opened lazily via a `HashMap` that started empty every process restart — a mid-day restart's `File::create` truncated the existing day's file. Hourly rotation bounds that loss to at most one open bucket (sized to `rotate_hours`) instead of up to a full day; it does not eliminate it — an `ArrowWriter` that never reaches `.finish()` has no Parquet footer and the file is entirely unreadable (see [ADR-005](../docs/adr/005-acceptable-data-loss-window.md)).
 
 ## Volumes (order of magnitude, current symbol set)
 
