@@ -1,4 +1,5 @@
 pub mod binance;
+pub mod bybit_ticker;
 pub mod dydx;
 pub mod hyperliquid;
 pub mod runtime;
