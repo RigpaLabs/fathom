@@ -153,9 +153,14 @@ struct BybitTradeItem {
     v: String,
     /// Price, string.
     p: String,
-    /// Trade id, string (Bybit encodes as a numeric string large enough to
-    /// need i64, not u32).
+    /// Trade id. A numeric string on spot, but a hyphenated UUID on
+    /// linear/inverse (e.g. `"00448946-2357-5a2c-ba29-44e187a93f43"`) — so it
+    /// is NOT always i64-parseable. `seq` is the numeric fallback.
     i: String,
+    /// Cross-sequence: monotonic numeric id present on both spot and linear.
+    /// Used as the i64 `trade_id` when `i` is a non-numeric UUID.
+    #[serde(default)]
+    seq: Option<i64>,
 }
 
 /// Taker side for Bybit's `publicTrade`/`allLiquidation` `S` field: `"Buy"` =
@@ -176,7 +181,9 @@ fn build_raw_trade(exchange: &str, symbol: &str, item: &BybitTradeItem) -> Optio
     let is_buy = bybit_side_is_buy(&item.side)?;
     let price = item.p.parse::<f64>().ok()?;
     let qty = item.v.parse::<f64>().ok()?;
-    let trade_id = item.i.parse::<i64>().ok()?;
+    // Spot's `i` is a numeric string; linear/inverse `i` is a UUID, so fall
+    // back to the numeric `seq` there (Bybit sends `seq` on both).
+    let trade_id = item.i.parse::<i64>().ok().or(item.seq)?;
     Some(RawTrade {
         timestamp_us: item.time_ms * 1_000,
         exchange: exchange.to_string(),
@@ -956,7 +963,24 @@ mod tests {
             v: "0.012".to_string(),
             p: "43000.5".to_string(),
             i: "2100000000012345".to_string(),
+            seq: None,
         }
+    }
+
+    #[test]
+    fn test_build_raw_trade_linear_uuid_id_falls_back_to_seq() {
+        // Bybit linear/inverse publicTrade `i` is a hyphenated UUID, not an
+        // i64 — the parser must fall back to the numeric `seq`, else every
+        // linear trade is silently dropped (prod incident 2026-07-07).
+        let mut item = trade_item("Buy");
+        item.i = "00448946-2357-5a2c-ba29-44e187a93f43".to_string();
+        item.seq = Some(665_650_966_478);
+        let raw = build_raw_trade("bybit_perp", "BTCUSDT", &item).unwrap();
+        assert_eq!(raw.trade_id, 665_650_966_478, "UUID `i` → numeric `seq`");
+
+        // UUID `i` and no `seq` at all → genuinely unbuildable.
+        item.seq = None;
+        assert!(build_raw_trade("bybit_perp", "BTCUSDT", &item).is_none());
     }
 
     #[test]
