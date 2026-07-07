@@ -1,10 +1,14 @@
 mod binance_perp;
 mod binance_spot;
+mod bybit_perp;
+mod bybit_spot;
 pub mod dydx;
 pub mod hyperliquid;
 
 pub use binance_perp::BinancePerp;
 pub use binance_spot::BinanceSpot;
+pub use bybit_perp::BybitPerp;
+pub use bybit_spot::BybitSpot;
 pub use hyperliquid::Hyperliquid;
 
 /// Adapter for an exchange's WebSocket and REST API endpoints.
