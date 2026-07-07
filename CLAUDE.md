@@ -1,6 +1,6 @@
 # fathom — Multi-Exchange LOB Collector
 
-Collects Level-2 order book data from Binance (Spot + USDM Futures), Hyperliquid, and dYdX v4 via WebSocket and writes Parquet files.
+Collects Level-2 order book data from Binance (Spot + USDM Futures), Hyperliquid, Bybit v5 (Spot + Linear Perp), and dYdX v4 via WebSocket and writes Parquet files.
 
 **Behavior contracts live in `specs/`** (capture matrix, schemas, streams, planned feeds) — check them before changing collection behavior. Decisions: `docs/adr/`.
 
@@ -46,6 +46,21 @@ dYdX v4:
     → local BTreeMap book (DydxBook in src/connection/dydx.rs)
     → accumulation via WindowAccumulator::on_diff_from_levels
 
+Bybit v5 (spot/linear perp):
+  WebSocket, subscribe after connect ({"op":"subscribe"}, spot batched <=10 args/request,
+                                       linear one message: orderbook.1000 + publicTrade;
+                                       linear adds tickers + allLiquidation)
+    → WS-native snapshot (type:"snapshot", also server-initiated resync) + sequenced deltas
+      (type:"delta", u-gap-checked — src/connection/bybit.rs::check_orderbook_gap)
+    → apply diff to shared BTreeMap L2 book (src/orderbook/mod.rs, same as Binance/HL)
+    → OFI / churn / microprice accumulation (src/accumulator.rs)
+    → publicTrade → trade tape + 1s buy/sell volume accumulation (up to 1024 trades/message)
+    → tickers → snapshot+delta ticker-state merge (src/connection/bybit_ticker.rs)
+      → MarkFunding + OpenInterest on relevant field change (linear only; no REST OI poll)
+    → allLiquidation → Liquidation rows (linear only)
+  Client-detected gap or rejected subscribe-ack → reconnect + resubscribe + full per-symbol
+    state reset (books + ticker-merge state), no REST re-snapshot call
+
 All paths → four parallel writers + optional NATS sink:
   raw diff  → {data_dir}/raw/{exchange}/{symbol}/{date}/depth_HHMM_HHMM.parquet
   1s snap   → {data_dir}/1s/{exchange}/{symbol}/{date}/snap_HHMM_HHMM.parquet  (64 columns, 1 row/sec, hourly-rotated)
@@ -68,10 +83,13 @@ Optional NATS streaming (src/nats_sink.rs):
 
 The trade columns (`volume_delta`, `buy_vol`, `sell_vol`, `trade_count`) are populated for all
 exchanges: HL from the `trades` channel, Binance from `aggTrade` (attribution by taker side,
-`is_buy = !is_buyer_maker`). See `specs/trades-feed.md`.
+`is_buy = !is_buyer_maker`), Bybit from `publicTrade` (side given directly as `"Buy"`/`"Sell"`,
+no maker/taker inversion needed, up to 1024 trades per WS message). See `specs/trades-feed.md`.
 
 Derivatives feeds (`specs/derivatives-feeds.md`): Binance perp markPrice@1s + forceOrder +
-OI REST poll; HL activeAssetCtx. Structs `MarkFunding` / `OpenInterest` / `Liquidation` in
+OI REST poll; HL activeAssetCtx; Bybit linear `tickers` (snapshot+delta merge,
+`src/connection/bybit_ticker.rs`) + `allLiquidation` — no REST OI poll for Bybit, `tickers`
+already carries `openInterest` over WS. Structs `MarkFunding` / `OpenInterest` / `Liquidation` in
 `crates/fathom-types`. Deriv events never feed depth-liveness (`record_event`).
 
 ## Key source files
@@ -82,9 +100,11 @@ OI REST poll; HL activeAssetCtx. Structs `MarkFunding` / `OpenInterest` / `Liqui
 | `src/connection/binance.rs` | Binance WS connect → REST snapshot → event loop |
 | `src/connection/hyperliquid.rs` | Hyperliquid WS: L2 snapshots + trades, OFI from snapshot diffs |
 | `src/connection/dydx.rs` | dYdX v4 WS: snapshot + batched diffs + trades, local DydxBook |
+| `src/connection/bybit.rs` | Bybit v5 WS: snapshot + `u`-sequenced deltas, trades, gap detection + reconnect/resubscribe |
+| `src/connection/bybit_ticker.rs` | Bybit `tickers` snapshot+delta state merge → `MarkFunding`/`OpenInterest` |
 | `src/orderbook/mod.rs` | BTreeMap L2 book, Binance sync protocol |
 | `src/accumulator.rs` | 1s window stats (shared by all exchanges) |
-| `src/exchange/` | BinanceSpot / BinancePerp / Hyperliquid adapters, dYdX constants |
+| `src/exchange/` | BinanceSpot / BinancePerp / Hyperliquid / BybitSpot / BybitPerp adapters, dYdX constants |
 | `src/writer/raw.rs` | Raw diff Parquet writer |
 | `src/writer/snap_1s.rs` | 1s snapshot Parquet writer (hourly-rotated) |
 | `src/writer/trades.rs` | Trade tape Parquet writer |
@@ -112,6 +132,11 @@ Ongoing:       pu > last_update_id  → OrderBookGap (missed events)
 
 **Hyperliquid** sends full snapshots (no diffs) — no gap detection needed.
 **dYdX v4** uses batched diffs after initial snapshot; the WS guarantees ordering.
+**Bybit v5** carries a single per-symbol `u` (no separate first/final id): valid continuation is
+`u == last_update_id + 1`; any other value (including `u < last_update_id`) is a client-detected
+gap. Unlike Binance, no REST re-snapshot — Bybit's `type:"snapshot"` frame either arrives
+server-initiated on the same socket, or the client reconnects + resubscribes to force a fresh one
+(`src/connection/bybit.rs::check_orderbook_gap`).
 
 ## Data layout
 
@@ -126,7 +151,7 @@ Data is written to `{data_dir}/` (configured in `config.toml`). When `DATA_DIR` 
 └── metadata/status.json                     # health, updated every 30s
 ```
 
-**Exchanges:** `binance_spot`, `binance_perp`, `hyperliquid`, `dydx` (22 symbols total)
+**Exchanges:** `binance_spot`, `binance_perp`, `hyperliquid`, `bybit_spot`, `bybit_perp`, `dydx` (34 symbols total)
 
 ## Deployment
 

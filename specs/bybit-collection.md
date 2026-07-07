@@ -1,7 +1,9 @@
 # Bybit v5 Collection — Channels, Gap Semantics, Capture Matrix
 
-Status: **planned** (spec only, no implementation yet — see
-[`docs/plans/bybit-collector-implementation.md`](../docs/plans/bybit-collector-implementation.md))
+Status: **implemented** — WP1-WP4 merged (adapters, ticker-merge, connection task + wiring); code
+in `src/connection/bybit.rs` + `src/connection/bybit_ticker.rs` + `src/exchange/bybit_{spot,perp}.rs`.
+Pending: WP5 (e2e/smoke tests + live verification of the flagged assumptions below) and prod-config
+rollout (see [`docs/plans/bybit-collector-implementation.md`](../docs/plans/bybit-collector-implementation.md)).
 
 Sources: [Bybit V5 orderbook](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook),
 [trade](https://bybit-exchange.github.io/docs/v5/websocket/public/trade),
