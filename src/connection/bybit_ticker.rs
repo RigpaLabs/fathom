@@ -196,7 +196,10 @@ pub fn build_deriv_events(
                 mark_px,
                 index_px: state.index_price,
                 funding_rate,
-                next_funding_ts: state.next_funding_time,
+                // Bybit's nextFundingTime is epoch ms; MarkFunding.next_funding_ts
+                // is µs (same convention Binance perp uses: *1_000). State keeps
+                // the raw ms; convert only at emit.
+                next_funding_ts: state.next_funding_time.map(|ms| ms * 1_000),
             })
         })
         .flatten();
@@ -267,7 +270,7 @@ mod tests {
         assert_eq!(mf.mark_px, 43001.20);
         assert_eq!(mf.index_px, Some(43000.50));
         assert_eq!(mf.funding_rate, 0.0001);
-        assert_eq!(mf.next_funding_ts, Some(1_700_006_400_000));
+        assert_eq!(mf.next_funding_ts, Some(1_700_006_400_000_000)); // ms → µs
         assert_eq!(oi.oi_base, 1234.567);
         assert_eq!(oi.oi_quote, Some(53_112_345.6));
     }
