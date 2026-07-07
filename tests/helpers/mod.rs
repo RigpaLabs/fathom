@@ -1,3 +1,4 @@
+pub mod bybit;
 pub mod parquet;
 
 /// Mock Binance HTTP + WebSocket server for e2e tests.
