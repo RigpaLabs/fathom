@@ -84,9 +84,14 @@ fn bybit_trade_msg(
     let data: Vec<_> = items
         .iter()
         .map(|(side, qty, price, id)| {
+            // Real Bybit linear publicTrade `i` is a hyphenated UUID (not i64);
+            // the numeric id lives in `seq`. Mirror that here so the e2e path
+            // exercises build_raw_trade's seq-fallback — a numeric `i` (the old
+            // mock) silently skipped the whole class (prod incident 2026-07-07).
+            let seq: i64 = id.parse().expect("trade_id param must be numeric (→ seq)");
             serde_json::json!({
                 "T": ts_ms, "s": symbol, "S": side, "v": qty, "p": price,
-                "L": "PlusTick", "i": id, "seq": 1
+                "L": "PlusTick", "i": "00448946-2357-5a2c-ba29-44e187a93f43", "seq": seq
             })
         })
         .collect();
