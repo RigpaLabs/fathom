@@ -1,4 +1,6 @@
-use fathom::exchange::{BinancePerp, BinanceSpot, ExchangeAdapter, Hyperliquid};
+use fathom::exchange::{
+    BinancePerp, BinanceSpot, BybitPerp, BybitSpot, ExchangeAdapter, Hyperliquid,
+};
 
 // ── BinanceSpot ──────────────────────────────────────────────────────────────
 
@@ -176,4 +178,87 @@ fn test_perp_open_interest_url() {
 fn test_open_interest_url_none_for_non_perp_venues() {
     assert!(BinanceSpot.open_interest_url("ETHUSDT").is_none());
     assert!(Hyperliquid.open_interest_url("ETH").is_none());
+}
+
+// ── BybitSpot ────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_bybit_spot_name() {
+    assert_eq!(BybitSpot.name(), "bybit_spot");
+}
+
+#[test]
+fn test_bybit_spot_ws_url_fixed() {
+    let url = BybitSpot.ws_url(&["ETHUSDT".to_string()], 100);
+    assert_eq!(url, "wss://stream.bybit.com/v5/public/spot");
+}
+
+#[test]
+fn test_bybit_spot_ws_url_ignores_symbols_and_depth_ms() {
+    let url1 = BybitSpot.ws_url(&["ETHUSDT".to_string()], 100);
+    let url2 = BybitSpot.ws_url(&["BTCUSDT".to_string(), "SOLUSDT".to_string()], 250);
+    assert_eq!(
+        url1, url2,
+        "Bybit subscribes via a post-connect WS message, not URL query params"
+    );
+    assert!(!url1.contains('?'), "no query params: {url1}");
+}
+
+#[test]
+fn test_bybit_spot_snapshot_url_empty() {
+    let url = BybitSpot.snapshot_url("ETHUSDT");
+    assert!(
+        url.is_empty(),
+        "Bybit sends the initial book as a WS snapshot message — no REST endpoint"
+    );
+}
+
+#[test]
+fn test_bybit_spot_open_interest_url_none() {
+    assert!(BybitSpot.open_interest_url("ETHUSDT").is_none());
+}
+
+// ── BybitPerp ────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_bybit_perp_name() {
+    assert_eq!(BybitPerp.name(), "bybit_perp");
+}
+
+#[test]
+fn test_bybit_perp_ws_url_fixed() {
+    let url = BybitPerp.ws_url(&["ETHUSDT".to_string()], 100);
+    assert_eq!(url, "wss://stream.bybit.com/v5/public/linear");
+}
+
+#[test]
+fn test_bybit_perp_ws_url_ignores_symbols_and_depth_ms() {
+    let url1 = BybitPerp.ws_url(&["ETHUSDT".to_string()], 100);
+    let url2 = BybitPerp.ws_url(&["BTCUSDT".to_string(), "SOLUSDT".to_string()], 250);
+    assert_eq!(url1, url2);
+    assert!(!url1.contains('?'), "no query params: {url1}");
+}
+
+#[test]
+fn test_bybit_perp_snapshot_url_empty() {
+    let url = BybitPerp.snapshot_url("ETHUSDT");
+    assert!(
+        url.is_empty(),
+        "Bybit sends the initial book as a WS snapshot message — no REST endpoint"
+    );
+}
+
+#[test]
+fn test_bybit_perp_open_interest_url_none() {
+    // OI comes from the WS `tickers` channel, no REST poll (specs/bybit-collection.md).
+    assert!(BybitPerp.open_interest_url("ETHUSDT").is_none());
+}
+
+#[test]
+fn test_bybit_spot_perp_different_urls() {
+    assert_ne!(
+        BybitSpot.ws_url(&["ETHUSDT".to_string()], 100),
+        BybitPerp.ws_url(&["ETHUSDT".to_string()], 100),
+        "spot and linear use different category base URLs"
+    );
 }
