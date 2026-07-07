@@ -7,8 +7,10 @@ use std::{path::PathBuf, time::Instant};
 use fathom::{
     CHANNEL_BUFFER,
     config::{Config, Exchange},
-    connection::{connection_task, connection_task_dydx, connection_task_hl},
-    exchange::{BinancePerp, BinanceSpot, Hyperliquid},
+    connection::{
+        connection_task, connection_task_bybit, connection_task_dydx, connection_task_hl,
+    },
+    exchange::{BinancePerp, BinanceSpot, BybitPerp, BybitSpot, Hyperliquid},
     metrics, monitor, nats_sink,
     writer::{
         deriv::{DerivEvent, SystemClock},
@@ -191,6 +193,34 @@ async fn main() -> anyhow::Result<()> {
                 handles.push(tokio::spawn(connection_task_hl(
                     conn,
                     Box::new(Hyperliquid),
+                    data_dir,
+                    mon,
+                    rtx,
+                    stx,
+                    ttx,
+                    dtx,
+                    ct,
+                    m,
+                )));
+            }
+            Exchange::BybitSpot => {
+                handles.push(tokio::spawn(connection_task_bybit(
+                    conn,
+                    Box::new(BybitSpot),
+                    data_dir,
+                    mon,
+                    rtx,
+                    stx,
+                    ttx,
+                    dtx,
+                    ct,
+                    m,
+                )));
+            }
+            Exchange::BybitPerp => {
+                handles.push(tokio::spawn(connection_task_bybit(
+                    conn,
+                    Box::new(BybitPerp),
                     data_dir,
                     mon,
                     rtx,

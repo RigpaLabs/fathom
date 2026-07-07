@@ -10,6 +10,8 @@ use crate::error::Result;
 pub enum Exchange {
     BinanceSpot,
     BinancePerp,
+    BybitSpot,
+    BybitPerp,
     Dydx,
     Hyperliquid,
 }
