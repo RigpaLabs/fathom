@@ -16,3 +16,18 @@ name     = "binance_perp"
 exchange = "binance_perp"
 symbols  = ["ETHUSDT", "BTCUSDT", "BNBUSDT"]
 depth_ms = 100
+
+# Bybit: depth_ms is ignored (orderbook.1000 hardcoded — same precedent as
+# Hyperliquid, see specs/bybit-collection.md), kept only to satisfy the
+# shared ConnectionConfig schema.
+[[connections]]
+name     = "bybit_spot"
+exchange = "bybit_spot"
+symbols  = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+depth_ms = 100
+
+[[connections]]
+name     = "bybit_perp"
+exchange = "bybit_perp"
+symbols  = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+depth_ms = 100
