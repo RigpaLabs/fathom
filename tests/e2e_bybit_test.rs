@@ -12,6 +12,17 @@
 /// Scenario 2 exercises spot's mandated multi-batch subscribe (6 symbols ×
 /// 2 topics = 12 args, over the documented 10-arg cap) actually happening on
 /// the wire, plus a basic snapshot+delta sync.
+///
+/// Scenario 3 exercises `bybit.rs`'s `!ack.success` → `break 'inner` wiring
+/// end-to-end (not just `BybitAck`'s own parsing unit tests): a rejected
+/// subscribe ack on the first connection must tear the connection down and
+/// reconnect+resubscribe, and the second (accepted) connection must recover
+/// normal snapshot/delta flow.
+///
+/// Scenario 4 exercises the `should_drop_ticker_delta`/`ticker_seen` gate
+/// through real `connection_task_bybit` dispatch (not just the pure fn's
+/// unit tests): a `tickers` delta arriving before the symbol's first
+/// `tickers` snapshot must be dropped, contributing zero deriv rows.
 mod helpers;
 
 use std::path::{Path, PathBuf};
@@ -582,4 +593,251 @@ async fn test_e2e_bybit_spot_subscribe_batching_and_sync() {
         .find(|p| p.to_string_lossy().contains("BTCUSDT"))
         .expect("BTCUSDT raw parquet");
     assert_eq!(count_rows(btc), 2, "snapshot + 1 delta for BTCUSDT");
+}
+
+// ── Scenario 3: subscribe-ack rejection → reconnect + resubscribe ─────────
+
+/// First connection's subscribe batch is rejected (`{"success":false}` —
+/// `MockBybitServer::push_subscribe_ack_rejection`). `bybit.rs`'s
+/// `!ack.success` branch must treat this exactly like a client-detected gap:
+/// tear the connection down and reconnect *before* consuming anything else
+/// on that socket.
+///
+/// Round 1 carries "trap" orderbook data behind the rejected ack — data that
+/// would only ever reach `connection_task_bybit`'s dispatch if the client
+/// stayed on that connection past the ack (i.e. if the `!ack.success` branch
+/// were missing/broken and reconnection instead waited for the natural
+/// per-connection socket close every `MockBybitServer` connection eventually
+/// does). A working implementation disconnects fast enough that the mock's
+/// send of that trap data fails (socket already torn down client-side)
+/// before it can ever apply to the book; round 2 (ack accepted — the mock's
+/// default behavior) then resubscribes and delivers the real snapshot+delta.
+/// Asserting the final raw-parquet row count is exactly round 2's 2 rows
+/// (not round 1's trap rows too) is what actually proves the rejection was
+/// caught immediately, not just that *some* reconnect eventually happened
+/// (that part would be true even with the branch deleted, since this mock
+/// closes every connection after its round regardless of ack outcome).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_bybit_subscribe_ack_rejection_reconnects_and_resubscribes() {
+    let server = MockBybitServer::new().await;
+    let symbol = "BTCUSDT";
+
+    server.push_subscribe_ack_rejection();
+    server.push_ws_round(vec![
+        // Trap: must never be applied — proves the client bailed out on the
+        // rejected ack instead of riding the connection to its natural close.
+        bybit_ob_msg(
+            symbol,
+            "snapshot",
+            1_700_000_000_000,
+            900,
+            vec![("40000.0", "9.9")],
+            vec![("40001.0", "9.9")],
+        ),
+        bybit_ob_msg(
+            symbol,
+            "delta",
+            1_700_000_001_000,
+            901,
+            vec![("40000.0", "8.8")],
+            vec![],
+        ),
+    ]);
+
+    server.push_ws_round(vec![
+        bybit_ob_msg(
+            symbol,
+            "snapshot",
+            1_700_000_010_000,
+            100,
+            vec![("43000.0", "1.0")],
+            vec![("43001.0", "1.0")],
+        ),
+        bybit_ob_msg(
+            symbol,
+            "delta",
+            1_700_000_011_000,
+            101,
+            vec![("43000.0", "1.1")],
+            vec![],
+        ),
+    ]);
+
+    let dir = TempDir::new().unwrap();
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(256);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(256);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(256);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(256);
+
+    let raw_w = tokio::spawn(run_raw_writer(
+        dir.path().to_path_buf(),
+        raw_tx.subscribe(),
+        60,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+    let snap_w = tokio::spawn(run_snap_writer(
+        dir.path().to_path_buf(),
+        snap_tx.subscribe(),
+        CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    let state = monitor::new_state();
+    let conn = perp_conn("bybit_perp_ack_reject_e2e", vec![symbol], &server);
+    let task = tokio::spawn(connection_task_bybit(
+        conn,
+        Box::new(BybitPerp),
+        dir.path().to_path_buf(),
+        state.clone(),
+        raw_tx,
+        snap_tx,
+        trade_tx,
+        deriv_tx,
+        CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    // Rejected-ack reconnect backoff (~1s, BACKOFF_START_MS) + round 2 + slack.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    task.abort();
+    let _ = task.await;
+    raw_w.await.unwrap();
+    snap_w.await.unwrap();
+
+    assert!(
+        server.connected_count() >= 2,
+        "ack rejection must trigger a reconnect (got {} connections)",
+        server.connected_count()
+    );
+
+    let batches = server.subscribed_batches();
+    assert!(
+        batches.len() >= 2,
+        "expected >= 2 subscribe frames (rejected + post-reconnect resubscribe): {batches:?}"
+    );
+
+    let all = find_parquets(dir.path());
+    let raws = by_dir(&all, "raw");
+    assert_eq!(raws.len(), 1, "one raw parquet for {symbol}: {raws:?}");
+    assert_eq!(
+        count_rows(raws[0]),
+        2,
+        "only round 2's snapshot + delta persisted; round 1's trap snapshot+delta \
+         (behind the rejected ack) must never have reached the book — a count of 4 \
+         here would mean the client rode the rejected connection to its natural \
+         close instead of bailing on `!ack.success`"
+    );
+
+    let guard = state.lock().unwrap();
+    let cs = guard
+        .get("bybit_perp_ack_reject_e2e")
+        .expect("connection in monitor");
+    assert!(
+        cs.reconnects_today >= 1,
+        "reconnects_today should be >= 1 after ack rejection (got {})",
+        cs.reconnects_today
+    );
+}
+
+// ── Scenario 4: tickers delta before any snapshot is gated ────────────────
+
+/// A `tickers` `delta` carrying a full valid field set (mark price + funding
+/// rate + open interest — everything `build_deriv_events` needs to build
+/// both a `MarkFunding` and an `OpenInterest` row) arrives before any
+/// `tickers` `snapshot` for the symbol. `should_drop_ticker_delta`'s
+/// `ticker_seen` gate must drop it silently rather than merging it onto
+/// `BybitTickerState::default()` — merging would still register both groups
+/// as "changed" (None → Some) and, since every required field is present,
+/// would emit both rows right there. The snapshot that follows seeds the
+/// real state and emits its own rows; a further funding-rate-only delta
+/// emits one more `MarkFunding` row. Exact final row counts (funding=2,
+/// oi=1) prove the premature delta contributed nothing — a broken gate
+/// would leave funding=3, oi=2.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_e2e_bybit_ticker_delta_gated_before_snapshot() {
+    let server = MockBybitServer::new().await;
+    let symbol = "ETHUSDT";
+
+    server.push_ws_round(vec![
+        // Premature delta: full field set, arrives before any snapshot —
+        // must be dropped by ticker_seen gating, not merged.
+        bybit_ticker_msg(
+            symbol,
+            "delta",
+            1_700_000_000_000,
+            serde_json::json!({
+                "markPrice": "43001.0",
+                "fundingRate": "0.0001",
+                "openInterest": "500.0"
+            }),
+        ),
+        bybit_ticker_msg(
+            symbol,
+            "snapshot",
+            1_700_000_001_000,
+            serde_json::json!({
+                "markPrice": "43005.0",
+                "indexPrice": "43004.5",
+                "fundingRate": "0.00012",
+                "nextFundingTime": "1700006400000",
+                "openInterest": "600.0",
+                "openInterestValue": "25800000.0"
+            }),
+        ),
+        bybit_ticker_msg(
+            symbol,
+            "delta",
+            1_700_000_002_000,
+            serde_json::json!({ "fundingRate": "0.0002" }),
+        ),
+    ]);
+
+    let dir = TempDir::new().unwrap();
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(256);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(256);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(256);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(256);
+
+    let deriv_w = tokio::spawn(run_deriv_writer(
+        dir.path().to_path_buf(),
+        deriv_tx.subscribe(),
+        60,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    let state = monitor::new_state();
+    let conn = perp_conn("bybit_perp_ticker_gate_e2e", vec![symbol], &server);
+    let task = tokio::spawn(connection_task_bybit(
+        conn,
+        Box::new(BybitPerp),
+        dir.path().to_path_buf(),
+        state,
+        raw_tx,
+        snap_tx,
+        trade_tx,
+        deriv_tx,
+        CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    task.abort();
+    let _ = task.await;
+    deriv_w.await.unwrap();
+
+    let all = find_parquets(dir.path());
+    let derivs = by_dir(&all, "deriv");
+    let funding = by_stem_prefix(&derivs, "funding_").expect("funding_HHMM_HHMM.parquet");
+    assert_eq!(
+        count_rows(funding),
+        2,
+        "snapshot + funding-rate delta only; the premature pre-snapshot delta must not have emitted a row"
+    );
+    let oi = by_stem_prefix(&derivs, "oi_").expect("oi_HHMM_HHMM.parquet");
+    assert_eq!(
+        count_rows(oi),
+        1,
+        "snapshot only; the premature pre-snapshot delta must not have emitted an OI row"
+    );
 }

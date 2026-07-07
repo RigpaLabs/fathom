@@ -41,6 +41,14 @@ struct BybitServerState {
     /// split into multiple frames actually happened on the wire, not just
     /// in `bybit.rs`'s own unit tests.
     subscribed_batches: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Queue of subscribe-ack outcomes to inject, consumed one entry per
+    /// connection (same round-robin consumption as `ws_rounds`): `true`
+    /// rejects every subscribe frame on that connection with
+    /// `success:false` instead of the default `success:true`. An empty (or
+    /// exhausted) queue keeps the default accept-everything behavior, so
+    /// existing tests that never call `push_subscribe_ack_rejection` are
+    /// unaffected.
+    reject_subscribe_ack: Arc<Mutex<VecDeque<bool>>>,
 }
 
 async fn ws_handler(
@@ -52,6 +60,17 @@ async fn ws_handler(
 
 async fn handle_ws(mut socket: WebSocket, state: BybitServerState) {
     state.connect_count.fetch_add(1, Ordering::Relaxed);
+
+    // One entry consumed per connection — decides whether every subscribe
+    // frame on *this* connection gets acked success:true (default) or
+    // rejected success:false (test-scripted, see
+    // `push_subscribe_ack_rejection`).
+    let reject_ack = state
+        .reject_subscribe_ack
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or(false);
 
     // Drain the client's op:subscribe (and any op:ping) frames for a short
     // window, replying with the ack shape `src/connection/bybit.rs`'s
@@ -74,13 +93,23 @@ async fn handle_ws(mut socket: WebSocket, state: BybitServerState) {
                                 .collect();
                             state.subscribed_batches.lock().unwrap().push(batch);
                         }
-                        let ack = serde_json::json!({
-                            "success": true,
-                            "ret_msg": "",
-                            "conn_id": "mock",
-                            "req_id": "",
-                            "op": "subscribe"
-                        })
+                        let ack = if reject_ack {
+                            serde_json::json!({
+                                "success": false,
+                                "ret_msg": "mocked rejection",
+                                "conn_id": "mock",
+                                "req_id": "",
+                                "op": "subscribe"
+                            })
+                        } else {
+                            serde_json::json!({
+                                "success": true,
+                                "ret_msg": "",
+                                "conn_id": "mock",
+                                "req_id": "",
+                                "op": "subscribe"
+                            })
+                        }
                         .to_string();
                         if socket.send(Message::Text(ack.into())).await.is_err() {
                             return;
@@ -139,6 +168,7 @@ impl MockBybitServer {
             ws_rounds: Arc::new(Mutex::new(VecDeque::new())),
             connect_count: Arc::new(AtomicUsize::new(0)),
             subscribed_batches: Arc::new(Mutex::new(Vec::new())),
+            reject_subscribe_ack: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let app = Router::new()
@@ -158,6 +188,20 @@ impl MockBybitServer {
     /// Queue a batch of WS messages to send on the next incoming connection.
     pub fn push_ws_round(&self, messages: Vec<String>) {
         self.state.ws_rounds.lock().unwrap().push_back(messages);
+    }
+
+    /// Script the next incoming connection's subscribe frame(s) to be
+    /// rejected (`{"op":"subscribe","success":false,...}`) instead of the
+    /// default `success:true` — lets a test exercise `bybit.rs`'s
+    /// `!ack.success` → reconnect+resubscribe branch end-to-end. Consumed
+    /// one entry per connection, round-robin like `push_ws_round`; a
+    /// connection with nothing queued gets the default accepted ack.
+    pub fn push_subscribe_ack_rejection(&self) {
+        self.state
+            .reject_subscribe_ack
+            .lock()
+            .unwrap()
+            .push_back(true);
     }
 
     /// Full WebSocket URL (use as `ws_url_override`) — Bybit has no separate
