@@ -79,6 +79,24 @@ struct BybitEnvelope {
     data: serde_json::Value,
 }
 
+/// Bybit's admin ack frame (subscribe ack, ping/pong ack — spec's "Channels /
+/// topics" section). Has no `topic` field, so `BybitEnvelope` parsing always
+/// fails on it first; this struct is only tried as the fallback once that
+/// parse has already failed. Only `op == "subscribe"` is acted on here — a
+/// rejected batch (`success: false`) leaves those topics permanently
+/// unsubscribed with the socket still alive, so the caller must treat it as
+/// a connection failure and reconnect+resubscribe rather than silently
+/// discard it as an unparsable frame.
+#[derive(Debug, Deserialize)]
+struct BybitAck {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    ret_msg: String,
+    #[serde(default)]
+    op: String,
+}
+
 /// `orderbook.1000.{symbol}` `data` object (spec's "Message schemas" section).
 #[derive(Debug, Deserialize)]
 struct BybitOrderBookData {
@@ -95,10 +113,31 @@ struct BybitOrderBookData {
 }
 
 #[allow(clippy::type_complexity)]
-fn parse_ob_levels(data: &BybitOrderBookData) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
-    let bids = data.b.iter().filter_map(parse_level).collect();
-    let asks = data.a.iter().filter_map(parse_level).collect();
-    (bids, asks)
+fn parse_ob_levels(data: &BybitOrderBookData) -> (Vec<(f64, f64)>, Vec<(f64, f64)>, usize) {
+    let mut errs = 0usize;
+    let bids: Vec<(f64, f64)> = data
+        .b
+        .iter()
+        .filter_map(|v| match parse_level(v) {
+            Some(l) => Some(l),
+            None => {
+                errs += 1;
+                None
+            }
+        })
+        .collect();
+    let asks: Vec<(f64, f64)> = data
+        .a
+        .iter()
+        .filter_map(|v| match parse_level(v) {
+            Some(l) => Some(l),
+            None => {
+                errs += 1;
+                None
+            }
+        })
+        .collect();
+    (bids, asks, errs)
 }
 
 /// One `publicTrade.{symbol}` `data` array element.
@@ -220,24 +259,23 @@ pub(crate) enum GapCheck {
 
 /// Compare the last-applied Bybit orderbook `u` to a new delta's `u`.
 ///
-/// Contiguous exactly when `new_u == prev_u + 1`. Bybit's documented
-/// restart-sequence marker (`u == 1` mid-stream, which per the docs is always
-/// paired with `type: "snapshot"` on the wire) is also treated as `Ok` here —
-/// defense in depth per the spec ("checking `type` is the primary signal,
-/// `u`-sequence checking is the secondary check"): the caller dispatches
-/// `type: "snapshot"` messages to `apply_snapshot` before this function is
-/// ever consulted for a `"delta"`, so in practice this function should never
-/// see `new_u == 1`; the branch exists so that *if* it somehow did (the wire
-/// contradicting the documented pairing), it could never be misread as a
-/// "genuine gap" requiring an unwarranted reconnect.
+/// Contiguous exactly when `new_u == prev_u + 1`. This function is only ever
+/// consulted for `type: "delta"` messages — the caller dispatches `type:
+/// "snapshot"` messages straight to `apply_snapshot` (which reseeds `prev_u`
+/// from the snapshot's own `u`), so Bybit's documented restart-sequence
+/// marker (`u == 1` mid-stream) is handled entirely on that snapshot dispatch
+/// path, never here. Treating a bare `new_u == 1` as automatically `Ok` in
+/// this function (regardless of `prev_u`) would be wrong: it would silently
+/// accept a delta claiming a restart while `prev_u` is still, say, 5000 —
+/// exactly the kind of loss this function exists to catch.
 ///
 /// Any other discontinuity is a gap — including a `new_u` smaller than
-/// `prev_u` by more than the `u == 1` marker. Bybit's docs do not describe
-/// `u` as a fixed-width counter that wraps; a backward jump this large is
-/// treated the same as a forward jump: not tolerated, reconnect required.
-/// (Flagged as a spec assumption needing live verification — see PR body.)
+/// `prev_u`. Bybit's docs do not describe `u` as a fixed-width counter that
+/// wraps; a backward jump is treated the same as a forward jump: not
+/// tolerated, reconnect required. (Flagged as a spec assumption needing live
+/// verification — see PR body.)
 pub(crate) fn check_orderbook_gap(prev_u: i64, new_u: i64) -> GapCheck {
-    if new_u == 1 || new_u == prev_u + 1 {
+    if new_u == prev_u + 1 {
         GapCheck::Ok
     } else {
         GapCheck::Gap {
@@ -245,6 +283,18 @@ pub(crate) fn check_orderbook_gap(prev_u: i64, new_u: i64) -> GapCheck {
             got: new_u,
         }
     }
+}
+
+/// Whether a `tickers.*` message should be dropped rather than merged: true
+/// for a `"delta"` on a symbol that has not yet received its first
+/// `"snapshot"` (pre-first-snapshot, or post-reconnect once `ticker_seen`
+/// tracking has been cleared) — merging it would apply a partial delta onto
+/// `BybitTickerState::default()` instead of a real seeded state. A
+/// `"snapshot"` is never dropped, since it's the seeding event itself.
+/// Mirrors the orderbook's `book.has_snapshot` gate on the `"delta"` branch
+/// above.
+fn should_drop_ticker_delta(seen: bool, msg_type: &str) -> bool {
+    msg_type != "snapshot" && !seen
 }
 
 // ── Subscribe message construction ──────────────────────────────────────────
@@ -278,6 +328,51 @@ fn subscribe_batches(topics: &[String], max_per_batch: usize) -> Vec<Vec<String>
         .collect()
 }
 
+// ── Reconnect state reset ────────────────────────────────────────────────────
+
+/// Reset ALL per-symbol connection state — order books, accumulators (after
+/// flushing whatever partial window they hold), ticker-merge state, and
+/// ticker-snapshot-seen tracking — and mark the connection disconnected.
+///
+/// Must run on EVERY reconnect trigger (normal disconnect, subscribe-send
+/// failure, subscribe-ack rejection), not only the "clean" disconnect path —
+/// otherwise stale ticker/accumulator state from before a failed
+/// (re)subscribe survives into the next connection attempt, and the
+/// reconnect metric undercounts actual reconnect events.
+#[allow(clippy::too_many_arguments)]
+fn reset_connection_state(
+    monitor: &MonitorState,
+    name: &str,
+    symbols: &[String],
+    books: &mut HashMap<String, OrderBook>,
+    accumulators: &mut HashMap<String, WindowAccumulator>,
+    ticker_states: &mut HashMap<String, bybit_ticker::BybitTickerState>,
+    ticker_seen: &mut std::collections::HashSet<String>,
+    snap_tx: &broadcast::Sender<Snapshot1s>,
+) {
+    runtime::mark_disconnected(monitor, name);
+
+    // Flush partial accumulators before resetting state.
+    let ts_us = Utc::now().timestamp_micros();
+    for sym in symbols {
+        if let Some(acc) = accumulators.get_mut(sym)
+            && let Some(book) = books.get(sym)
+        {
+            let snap = acc.flush(book, ts_us);
+            if snap_tx.send(snap).is_err() {
+                warn!(conn = %name, symbol = %sym, "snap: no receivers (disconnect flush)");
+            }
+        }
+    }
+
+    for book in books.values_mut() {
+        *book = OrderBook::new();
+    }
+    accumulators.clear();
+    ticker_states.clear();
+    ticker_seen.clear();
+}
+
 // ── Connection task ─────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -307,6 +402,13 @@ pub async fn connection_task_bybit(
         .collect();
     let mut accumulators: HashMap<String, WindowAccumulator> = HashMap::new();
     let mut ticker_states: HashMap<String, bybit_ticker::BybitTickerState> = HashMap::new();
+    // Symbols that have received at least one `tickers.*` `type: "snapshot"`
+    // message — mirrors the orderbook's `book.has_snapshot` gate. Without
+    // this, a `delta` arriving before the first snapshot (e.g. right after
+    // reconnect, once `ticker_states` has been cleared) would merge onto
+    // `BybitTickerState::default()` and could emit a partial/wrong
+    // MarkFunding/OpenInterest row.
+    let mut ticker_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     runtime::init_monitor(&monitor, &name, &symbols);
 
@@ -366,6 +468,16 @@ pub async fn connection_task_bybit(
         if !sub_ok {
             forwarder.abort();
             let _ = forwarder.await;
+            reset_connection_state(
+                &monitor,
+                &name,
+                &symbols,
+                &mut books,
+                &mut accumulators,
+                &mut ticker_states,
+                &mut ticker_seen,
+                &snap_tx,
+            );
             runtime::sleep_backoff(&mut backoff_ms).await;
             continue;
         }
@@ -397,7 +509,20 @@ pub async fn connection_task_bybit(
 
                     let envelope: BybitEnvelope = match serde_json::from_str(&text) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(_) => {
+                            // Not a topic message — check whether it's a
+                            // rejected subscribe ack before discarding it.
+                            // `success: true` (subscribe or ping) is an
+                            // ignorable admin frame, same as before.
+                            if let Ok(ack) = serde_json::from_str::<BybitAck>(&text)
+                                && ack.op == "subscribe"
+                                && !ack.success
+                            {
+                                warn!(conn = %name, ret_msg = %ack.ret_msg, "subscribe rejected by server — reconnecting");
+                                break 'inner;
+                            }
+                            continue;
+                        }
                     };
 
                     let Some(symbol) = envelope.topic.rsplit('.').next() else { continue };
@@ -408,7 +533,10 @@ pub async fn connection_task_bybit(
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let (bids, asks) = parse_ob_levels(&data);
+                        let (bids, asks, parse_errs) = parse_ob_levels(&data);
+                        if parse_errs > 0 {
+                            warn!(conn = %name, symbol = %symbol, errors = parse_errs, "parse errors in orderbook levels");
+                        }
                         let timestamp_us = envelope.cts.unwrap_or(envelope.ts) * 1_000;
 
                         let book = books.entry(symbol.to_string()).or_default();
@@ -502,15 +630,26 @@ pub async fn connection_task_bybit(
                             Err(_) => continue,
                         };
                         for item in &items {
+                            // Accumulator update needs only side + qty (+ a
+                            // timestamp for a first-touch seed), so it must
+                            // not depend on `build_raw_trade` succeeding —
+                            // that also requires price and trade_id, and a
+                            // failure there (tape persistence) must not
+                            // silently undercount 1s volume stats. Mirrors
+                            // hyperliquid.rs's trades dispatch (side+size
+                            // parsed independently of the tape-build call).
+                            if let Some(is_buy) = bybit_side_is_buy(&item.side)
+                                && let Ok(qty) = item.v.parse::<f64>()
+                            {
+                                let ts_us = item.time_ms * 1_000;
+                                let acc = accumulators.entry(symbol.to_string()).or_insert_with(|| {
+                                    WindowAccumulator::new(&exchange_name, symbol, ts_us)
+                                });
+                                acc.accumulate_trade(qty, is_buy);
+                            }
+
                             match build_raw_trade(&exchange_name, symbol, item) {
                                 Some(raw) => {
-                                    let is_buy = !raw.is_buyer_maker;
-                                    let qty = raw.qty;
-                                    let ts_us = raw.timestamp_us;
-                                    let acc = accumulators.entry(symbol.to_string()).or_insert_with(|| {
-                                        WindowAccumulator::new(&exchange_name, symbol, ts_us)
-                                    });
-                                    acc.accumulate_trade(qty, is_buy);
                                     if trade_tx.send(raw).is_err() {
                                         warn!(conn = %name, symbol = %symbol, "trade: no receivers");
                                     }
@@ -524,6 +663,9 @@ pub async fn connection_task_bybit(
                     }
 
                     if linear && envelope.topic.starts_with("tickers.") {
+                        if should_drop_ticker_delta(ticker_seen.contains(symbol), &envelope.msg_type) {
+                            continue;
+                        }
                         let fields: bybit_ticker::BybitTickerFields =
                             match serde_json::from_value(envelope.data.clone()) {
                                 Ok(v) => v,
@@ -533,6 +675,9 @@ pub async fn connection_task_bybit(
                             msg_type: envelope.msg_type.clone(),
                             data: fields,
                         };
+                        if envelope.msg_type == "snapshot" {
+                            ticker_seen.insert(symbol.to_string());
+                        }
                         let state = ticker_states.entry(symbol.to_string()).or_default();
                         let change = bybit_ticker::merge_ticker_message(state, &ticker_msg);
                         if !change.is_empty() {
@@ -613,31 +758,16 @@ pub async fn connection_task_bybit(
         forwarder.abort();
         let _ = forwarder.await;
 
-        runtime::mark_disconnected(&monitor, &name);
-
-        // Flush partial accumulators before resetting state.
-        {
-            let ts_us = Utc::now().timestamp_micros();
-            for sym in &symbols {
-                if let Some(acc) = accumulators.get_mut(sym)
-                    && let Some(book) = books.get(sym)
-                {
-                    let snap = acc.flush(book, ts_us);
-                    if snap_tx.send(snap).is_err() {
-                        warn!(conn = %name, symbol = %sym, "snap: no receivers (disconnect flush)");
-                    }
-                }
-            }
-        }
-
-        // Reset ALL per-symbol state — order books AND ticker-merge state —
-        // so a stale pre-reconnect book/ticker can never be merged against a
-        // fresh post-reconnect stream (spec's reconnect requirements).
-        for book in books.values_mut() {
-            *book = OrderBook::new();
-        }
-        accumulators.clear();
-        ticker_states.clear();
+        reset_connection_state(
+            &monitor,
+            &name,
+            &symbols,
+            &mut books,
+            &mut accumulators,
+            &mut ticker_states,
+            &mut ticker_seen,
+            &snap_tx,
+        );
         runtime::sleep_backoff(&mut backoff_ms).await;
     }
 }
@@ -665,20 +795,27 @@ mod tests {
         );
     }
 
-    /// Bybit's documented restart marker: `u == 1` mid-stream is not a gap
-    /// (defense-in-depth secondary check — `type == "snapshot"` is the
-    /// primary signal, handled by the caller's dispatch before this function
-    /// is ever consulted for a "delta").
+    /// Bybit's documented restart marker (`u == 1` mid-stream) is handled by
+    /// the caller dispatching `type: "snapshot"` straight to
+    /// `apply_snapshot` — this function only ever sees `"delta"` messages, so
+    /// a bare `new_u == 1` with a nonzero `prev_u` here is a genuine gap, not
+    /// a special case.
     #[test]
-    fn test_gap_check_u_equals_one_restart_marker() {
-        assert_eq!(check_orderbook_gap(999_999_999, 1), GapCheck::Ok);
+    fn test_gap_check_u_equals_one_with_nonzero_prev_is_a_gap() {
+        assert_eq!(
+            check_orderbook_gap(999_999_999, 1),
+            GapCheck::Gap {
+                expected: 1_000_000_000,
+                got: 1,
+            }
+        );
     }
 
     /// No documented wraparound for Bybit's `u` (unlike a fixed-width
-    /// counter) — a backward jump other than the literal `u == 1` marker is
-    /// still treated as a gap, not silently tolerated.
+    /// counter) — any backward jump is treated as a gap, not silently
+    /// tolerated.
     #[test]
-    fn test_gap_check_backward_jump_not_one_is_still_a_gap() {
+    fn test_gap_check_backward_jump_is_still_a_gap() {
         assert_eq!(
             check_orderbook_gap(100, 50),
             GapCheck::Gap {
@@ -746,6 +883,24 @@ mod tests {
         assert_eq!(batches[0].len(), 24);
     }
 
+    // ── Ticker delta gating (pre-first-snapshot drop) ───────────────────
+
+    #[test]
+    fn test_ticker_delta_dropped_before_snapshot_seen() {
+        assert!(should_drop_ticker_delta(false, "delta"));
+    }
+
+    #[test]
+    fn test_ticker_delta_kept_after_snapshot_seen() {
+        assert!(!should_drop_ticker_delta(true, "delta"));
+    }
+
+    #[test]
+    fn test_ticker_snapshot_never_dropped() {
+        assert!(!should_drop_ticker_delta(false, "snapshot"));
+        assert!(!should_drop_ticker_delta(true, "snapshot"));
+    }
+
     // ── Orderbook data parsing ───────────────────────────────────────────
 
     fn ob_data_json() -> serde_json::Value {
@@ -762,9 +917,34 @@ mod tests {
     fn test_orderbook_data_parse_and_levels() {
         let data: BybitOrderBookData = serde_json::from_value(ob_data_json()).unwrap();
         assert_eq!(data.u, 123456);
-        let (bids, asks) = parse_ob_levels(&data);
+        let (bids, asks, errs) = parse_ob_levels(&data);
         assert_eq!(bids, vec![(43000.5, 1.234), (42999.0, 0.5)]);
         assert_eq!(asks, vec![(43001.0, 0.567)]);
+        assert_eq!(errs, 0, "no unparseable levels in this fixture");
+    }
+
+    #[test]
+    fn test_orderbook_data_parse_counts_unparseable_levels() {
+        let data: BybitOrderBookData = serde_json::from_value(serde_json::json!({
+            "s": "BTCUSDT",
+            "b": [["43000.5", "1.234"], ["oops", "0.5"]],
+            "a": [["43001.0", "0.567"], ["43002.0", "bad"]],
+            "u": 123456,
+            "seq": 9876543210_i64
+        }))
+        .unwrap();
+        let (bids, asks, errs) = parse_ob_levels(&data);
+        assert_eq!(
+            bids,
+            vec![(43000.5, 1.234)],
+            "unparseable bid level dropped"
+        );
+        assert_eq!(
+            asks,
+            vec![(43001.0, 0.567)],
+            "unparseable ask level dropped"
+        );
+        assert_eq!(errs, 2, "one bad bid + one bad ask counted");
     }
 
     // ── Trade parsing ────────────────────────────────────────────────────
@@ -888,5 +1068,33 @@ mod tests {
         assert!(serde_json::from_str::<BybitEnvelope>(ack).is_err());
         let pong = r#"{"success":true,"ret_msg":"pong","conn_id":"abc","op":"ping"}"#;
         assert!(serde_json::from_str::<BybitEnvelope>(pong).is_err());
+    }
+
+    // ── Subscribe ack parsing (MAJOR 3: rejected batches must be caught) ──
+
+    #[test]
+    fn test_subscribe_ack_success_parses_as_ignorable() {
+        let ack = r#"{"success":true,"ret_msg":"","conn_id":"abc","req_id":"","op":"subscribe"}"#;
+        let parsed: BybitAck = serde_json::from_str(ack).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.op, "subscribe");
+    }
+
+    #[test]
+    fn test_subscribe_ack_failure_flagged() {
+        let ack = r#"{"success":false,"ret_msg":"topic invalid","conn_id":"abc","req_id":"","op":"subscribe"}"#;
+        let parsed: BybitAck = serde_json::from_str(ack).unwrap();
+        assert!(!parsed.success);
+        assert_eq!(parsed.op, "subscribe");
+        assert_eq!(parsed.ret_msg, "topic invalid");
+    }
+
+    #[test]
+    fn test_ping_ack_not_mistaken_for_subscribe_ack() {
+        let pong = r#"{"success":false,"ret_msg":"pong","conn_id":"abc","op":"ping"}"#;
+        let parsed: BybitAck = serde_json::from_str(pong).unwrap();
+        // op != "subscribe" — the connection task must not react to this
+        // even though success is false.
+        assert_ne!(parsed.op, "subscribe");
     }
 }
