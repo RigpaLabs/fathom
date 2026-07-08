@@ -8,8 +8,8 @@ Low-rate, high-value context feeds for perp venues. Tiny volume (~single MB/day 
 
 | Exchange | Channel | Provides | Implementation |
 |---|---|---|---|
-| binance perp | `{sym}@markPrice@1s` | mark price, index price, funding rate + next funding time | `src/connection/binance.rs::mark_price_to_funding` (dispatch by stream suffix, sync replay + event loop); subscribed in `src/exchange/binance_perp.rs::ws_url` |
-| binance perp | `{sym}@forceOrder` | liquidation orders (side, avg price `ap`, qty, time) | `src/connection/binance.rs::force_order_to_liquidation` |
+| binance perp | `{sym}@markPrice@1s` | mark price, index price, funding rate + next funding time | `src/connection/binance.rs::mark_price_to_funding` (dispatch by stream suffix, sync replay + event loop); subscribed on the `/market/stream` connection, `src/exchange/binance_perp.rs::market_ws_url` (depth-only `ws_url` is a separate `/public/stream` connection — see `specs/collection.md`) |
+| binance perp | `{sym}@forceOrder` | liquidation orders (side, avg price `ap`, qty, time) | `src/connection/binance.rs::force_order_to_liquidation`; also subscribed on `market_ws_url` |
 | binance perp | REST poll `/fapi/v1/openInterest` (no WS) | open interest per symbol, polled every 60 s | `src/connection/binance.rs::poll_open_interest`, URL from `ExchangeAdapter::open_interest_url` (None for spot/HL) |
 | hyperliquid | `activeAssetCtx` (subscribe per coin) | funding, oracle px, mark px, open interest — one channel covers all four | `src/connection/hyperliquid.rs::asset_ctx_to_events` — each message emits one `MarkFunding` + one `OpenInterest` |
 

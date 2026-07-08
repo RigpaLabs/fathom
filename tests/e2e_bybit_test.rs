@@ -162,6 +162,7 @@ fn perp_conn(name: &str, symbols: Vec<&str>, server: &MockBybitServer) -> Connec
         symbols: symbols.iter().map(|s| s.to_string()).collect(),
         depth_ms: 0, // ignored by the Bybit adapter (spec: depth-1000 hardcoded)
         ws_url_override: Some(server.ws_url()),
+        market_ws_url_override: None,
         snapshot_url_override: None, // Bybit is WS-native, no REST snapshot
     }
 }
@@ -173,6 +174,7 @@ fn spot_conn(name: &str, symbols: Vec<&str>, server: &MockBybitServer) -> Connec
         symbols: symbols.iter().map(|s| s.to_string()).collect(),
         depth_ms: 0,
         ws_url_override: Some(server.ws_url()),
+        market_ws_url_override: None,
         snapshot_url_override: None,
     }
 }

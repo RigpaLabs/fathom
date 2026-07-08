@@ -27,12 +27,6 @@ fn test_spot_ws_url_includes_agg_trade_per_symbol() {
 }
 
 #[test]
-fn test_perp_ws_url_includes_agg_trade() {
-    let url = BinancePerp.ws_url(&["ETHUSDT".to_string()], 100);
-    assert!(url.contains("ethusdt@aggTrade"));
-}
-
-#[test]
 fn test_spot_ws_url_multiple_symbols() {
     let symbols = vec!["ETHUSDT".to_string(), "BTCUSDT".to_string()];
     let url = BinanceSpot.ws_url(&symbols, 100);
@@ -93,6 +87,93 @@ fn test_perp_ws_url() {
     assert!(url.contains("ethusdt@depth@100ms"));
 }
 
+/// fathom#62: the legacy unrouted `/stream` endpoint silently drops
+/// non-depth categories after Binance's 2026-03 WS routing upgrade — depth
+/// must go through the routed `/public/stream` endpoint.
+#[test]
+fn test_perp_ws_url_uses_routed_public_endpoint() {
+    let url = BinancePerp.ws_url(&["ETHUSDT".to_string()], 100);
+    assert!(
+        url.starts_with("wss://fstream.binance.com/public/stream?streams="),
+        "depth must use the routed /public endpoint: {url}"
+    );
+}
+
+/// fathom#62: aggTrade/markPrice/forceOrder are /market-category streams —
+/// the legacy unrouted URL silently drops them. They must be requested via
+/// the routed `/market/stream` endpoint instead (`market_ws_url`).
+#[test]
+fn test_perp_ws_url_has_no_market_category_streams() {
+    let url = BinancePerp.ws_url(&["ETHUSDT".to_string()], 100);
+    assert!(
+        !url.contains("aggTrade") && !url.contains("markPrice") && !url.contains("forceOrder"),
+        "depth connection must not carry /market-category streams: {url}"
+    );
+}
+
+#[test]
+fn test_perp_market_ws_url_uses_routed_market_endpoint() {
+    let url = BinancePerp
+        .market_ws_url(&["ETHUSDT".to_string()])
+        .expect("binance_perp must expose a market_ws_url");
+    assert!(
+        url.starts_with("wss://fstream.binance.com/market/stream?streams="),
+        "url: {url}"
+    );
+}
+
+#[test]
+fn test_perp_market_ws_url_includes_agg_trade_mark_price_force_order() {
+    let url = BinancePerp.market_ws_url(&["ETHUSDT".to_string()]).unwrap();
+    assert!(url.contains("ethusdt@aggTrade"), "url: {url}");
+    assert!(url.contains("ethusdt@markPrice@1s"), "url: {url}");
+    assert!(url.contains("ethusdt@forceOrder"), "url: {url}");
+}
+
+#[test]
+fn test_perp_market_ws_url_multiple_symbols() {
+    let symbols = vec!["ETHUSDT".to_string(), "BTCUSDT".to_string()];
+    let url = BinancePerp.market_ws_url(&symbols).unwrap();
+    assert!(url.contains("ethusdt@aggTrade"));
+    assert!(url.contains("btcusdt@aggTrade"));
+    assert!(url.contains("ethusdt@markPrice@1s"));
+    assert!(url.contains("btcusdt@markPrice@1s"));
+    assert!(url.contains("ethusdt@forceOrder"));
+    assert!(url.contains("btcusdt@forceOrder"));
+}
+
+#[test]
+fn test_perp_ws_url_and_market_ws_url_differ() {
+    let sym = vec!["ETHUSDT".to_string()];
+    assert_ne!(
+        BinancePerp.ws_url(&sym, 100),
+        BinancePerp.market_ws_url(&sym).unwrap(),
+        "depth and market connections must use different URLs"
+    );
+}
+
+/// Only binance_perp splits into two connections — every other venue's
+/// `market_ws_url` default is `None` (single connection carries everything).
+#[test]
+fn test_spot_market_ws_url_is_none() {
+    assert!(
+        BinanceSpot
+            .market_ws_url(&["ETHUSDT".to_string()])
+            .is_none()
+    );
+}
+
+#[test]
+fn test_hl_market_ws_url_is_none() {
+    assert!(Hyperliquid.market_ws_url(&["ETH".to_string()]).is_none());
+}
+
+#[test]
+fn test_bybit_market_ws_url_is_none() {
+    assert!(BybitSpot.market_ws_url(&["ETHUSDT".to_string()]).is_none());
+    assert!(BybitPerp.market_ws_url(&["ETHUSDT".to_string()]).is_none());
+}
+
 #[test]
 fn test_perp_snapshot_url() {
     let url = BinancePerp.snapshot_url("BTCUSDT");
@@ -147,13 +228,6 @@ fn test_hl_snapshot_url_empty() {
 }
 
 // ── Derivatives feeds (specs/derivatives-feeds.md) ──────────────────────────
-
-#[test]
-fn test_perp_ws_url_includes_mark_price_and_force_order() {
-    let url = BinancePerp.ws_url(&["ETHUSDT".to_string()], 100);
-    assert!(url.contains("ethusdt@markPrice@1s"), "url: {url}");
-    assert!(url.contains("ethusdt@forceOrder"), "url: {url}");
-}
 
 #[test]
 fn test_spot_ws_url_has_no_derivatives_streams() {

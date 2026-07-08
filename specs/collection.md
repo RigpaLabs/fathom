@@ -4,12 +4,12 @@ Status: **stable** (matrix rows marked otherwise)
 
 ## Connections
 
-One WebSocket connection per configured `[[connections]]` entry (`config.toml`), one tokio task each (`src/main.rs`). All book state is in-memory; a restart re-seeds from snapshots.
+One WebSocket connection per configured `[[connections]]` entry (`config.toml`), one tokio task each (`src/main.rs`) — except `binance_perp`, which opens two WS connections per entry (see below) merged onto the same per-symbol book/accumulator in that one task. All book state is in-memory; a restart re-seeds from snapshots.
 
 | Exchange | Transport | Book model | Update cadence |
 |---|---|---|---|
 | `binance_spot` | Combined stream `{sym}@depth@100ms` + `{sym}@aggTrade` | REST snapshot (limit 5000) + sequenced diffs applied to BTreeMap (`src/orderbook/mod.rs`) | 100 ms diffs + event-rate trades |
-| `binance_perp` | Combined stream `{sym}@depth@100ms` + `{sym}@aggTrade` + `{sym}@markPrice@1s` + `{sym}@forceOrder`; REST OI poll (60s) | REST snapshot (limit 1000) + sequenced diffs, `pu`-based sequencing | 100 ms diffs + event-rate trades + 1s mark/funding |
+| `binance_perp` | **Two WS connections**, merged in one `connection_task` (`src/connection/binance.rs`): depth-only `{sym}@depth@100ms` on the routed `/public/stream` endpoint (`ExchangeAdapter::ws_url`), `{sym}@aggTrade` + `{sym}@markPrice@1s` + `{sym}@forceOrder` on the routed `/market/stream` endpoint (`ExchangeAdapter::market_ws_url`); REST OI poll (60s). Binance's 2026-03 WS routing upgrade made the legacy unrouted `/stream` endpoint silently drop non-depth categories — fathom#62 — hence the split | REST snapshot (limit 1000) + sequenced diffs, `pu`-based sequencing | 100 ms diffs + event-rate trades + 1s mark/funding |
 | `hyperliquid` | Single WS, subscribe per symbol: `l2Book` (`nSigFigs: 5`) + `trades` + `activeAssetCtx` | Full snapshot each message — no diff protocol, no gap detection needed | ~500 ms snapshots |
 | `bybit_spot` | WS `{"op":"subscribe"}` after connect: `orderbook.1000.{sym}` + `publicTrade.{sym}`, batched ≤10 args/request (spot's per-request cap) | WS-native `type:"snapshot"` (initial sync + server-initiated resync) + `type:"delta"` sequenced by `u`, gap-checked client-side (`src/connection/bybit.rs::check_orderbook_gap`) — applied to the shared `OrderBook` (`src/orderbook/mod.rs`), no REST snapshot call | 200 ms diffs (`orderbook.1000` cadence) + event-rate trades |
 | `bybit_perp` | Same as `bybit_spot` plus `tickers.{sym}` + `allLiquidation.{sym}`, one `subscribe` message (24 args, under cap) | Same book model as `bybit_spot`, plus snapshot+delta ticker-merge state (`src/connection/bybit_ticker.rs`) for funding/mark/OI; no REST OI poll | 200 ms diffs + event-rate trades + 100 ms ticker push |

@@ -40,7 +40,7 @@ Side semantics: `is_buyer_maker = true` ⇔ the taker **sold** (aggressive sell 
 
 ## Implementation notes
 
-- Binance combined stream subscribes `{sym}@depth@{ms}ms/{sym}@aggTrade` per symbol (`src/exchange/binance_spot.rs::ws_url`, `src/exchange/binance_perp.rs::ws_url`). Events are dispatched by stream-name suffix; aggTrade handled in both the sync-phase replay and the main event loop (`src/connection/binance.rs::handle_agg_trade`, parse in `::agg_trade_to_raw`).
+- `binance_spot` combined stream subscribes `{sym}@depth@{ms}ms/{sym}@aggTrade` per symbol (`src/exchange/binance_spot.rs::ws_url`). `binance_perp` subscribes aggTrade on its separate `/market/stream` connection (`src/exchange/binance_perp.rs::market_ws_url` — depth stays on `ws_url`/`/public/stream`; see `specs/collection.md` for why the two are split). Events are dispatched by stream-name suffix regardless of which physical connection they arrive on (`src/connection/binance.rs::dispatch_non_depth`); aggTrade handled in both the sync-phase replay and the main event loop (`::handle_agg_trade`, parse in `::agg_trade_to_raw`).
 - Hyperliquid: `src/connection/hyperliquid.rs::build_raw_trade` (side-mapping comment lives there). The pre-existing `accumulate_trade` path is unchanged.
 - Channel: `trade_tx` broadcast (`src/main.rs`), drop-on-backpressure per ADR-002; NATS publisher best-effort (`src/nats_sink.rs::publish_trades`).
 - Trades writer is supervised as fatal, same as the raw/snap writers (`src/main.rs::wait_for_shutdown_or_writer_exit`).
