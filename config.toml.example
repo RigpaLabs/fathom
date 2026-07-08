@@ -4,6 +4,10 @@ data_dir = "data"
 # [nats]
 # url = "nats://127.0.0.1:4222"
 # enabled = true
+# Optional symbol allowlist — restricts NATS publishing only, Parquet
+# collection is always the full symbol set above. Omit or leave empty to
+# publish every symbol (default).
+# symbols = ["ETHUSDT"]
 
 [[connections]]
 name     = "binance_spot"

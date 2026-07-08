@@ -40,6 +40,14 @@ pub struct NatsConfig {
     pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Symbol allowlist for NATS publishing only — Parquet collection always
+    /// covers the full symbol set regardless of this field. `None` or an
+    /// empty list publishes every symbol (default, backward-compatible with
+    /// prod behavior before this field existed). Non-empty restricts NATS
+    /// publish to the listed symbols, matched case-sensitively as they
+    /// appear upstream (e.g. "ETHUSDT").
+    #[serde(default)]
+    pub symbols: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
