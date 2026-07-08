@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use chrono::Utc;
 
@@ -323,6 +327,47 @@ fn handle_force_order(
     }
 }
 
+/// Dispatch one parsed combined-stream event by its stream-name suffix.
+///
+/// Handles aggTrade/markPrice/forceOrder in place and returns `None`. For a
+/// depth update (or any unrecognized suffix) returns the event's `data`
+/// unchanged so the caller can parse it as a `DepthUpdate` — this lets both
+/// the sync-phase buffer replay and the steady-state event loop dispatch
+/// messages identically, regardless of which physical WS connection they
+/// arrived on (binance_perp merges two: see `connection_task`).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_non_depth(
+    conn_name: &str,
+    exchange_name: &str,
+    stream: &str,
+    symbol: &str,
+    data: serde_json::Value,
+    accumulators: &mut HashMap<String, WindowAccumulator>,
+    trade_tx: &broadcast::Sender<RawTrade>,
+    deriv_tx: &broadcast::Sender<DerivEvent>,
+) -> Option<serde_json::Value> {
+    if stream.ends_with("@aggTrade") {
+        handle_agg_trade(
+            conn_name,
+            exchange_name,
+            symbol,
+            data,
+            accumulators,
+            trade_tx,
+        );
+        return None;
+    }
+    if stream.ends_with("@markPrice@1s") {
+        handle_mark_price(conn_name, exchange_name, symbol, data, deriv_tx);
+        return None;
+    }
+    if stream.ends_with("@forceOrder") {
+        handle_force_order(conn_name, exchange_name, symbol, data, deriv_tx);
+        return None;
+    }
+    Some(data)
+}
+
 /// Poll interval for the open-interest REST endpoint (per symbol batch).
 const OI_POLL_INTERVAL_S: u64 = 60;
 
@@ -385,6 +430,144 @@ async fn poll_open_interest(
     }
 }
 
+// ── Two-connection merge (binance_perp only) ─────────────────────────────────
+//
+// binance_perp opens a second WS (`ExchangeAdapter::market_ws_url`) alongside
+// the depth connection (fathom#62 — see module doc comment in
+// `exchange/binance_perp.rs`). Both feed the SAME per-symbol book +
+// accumulator: `handle_event_message` is the shared per-message handler so the
+// dispatch logic doesn't care which physical socket a frame arrived on. The
+// two connections are treated as one unit — either one closing tears down and
+// reconnects both (`recv_opt` surfaces the market connection's closure the
+// same way `fwd_rx.recv() -> None` already does for the depth connection).
+
+/// `rx.recv().await`, or pend forever when there is no second connection
+/// (every venue except binance_perp) — lets a single `tokio::select!` treat
+/// the optional market channel uniformly with the always-present depth one.
+async fn recv_opt(rx: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Abort and join an optional forwarder task (no-op when `None`).
+async fn abort_forwarder(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(h) = handle {
+        h.abort();
+        let _ = h.await;
+    }
+}
+
+/// Parse and dispatch one WS text frame in the steady-state event loop.
+/// Shared by the depth (`fwd_rx`) and market (`market_fwd_rx`) select arms —
+/// see the module comment above. Returns `true` when a sequence gap was
+/// detected and the caller should tear down and reconnect.
+#[allow(clippy::too_many_arguments)]
+fn handle_event_message(
+    name: &str,
+    exchange_name: &str,
+    adapter_name: &str,
+    symbols_set: &HashSet<String>,
+    text: &str,
+    books: &mut HashMap<String, OrderBook>,
+    accumulators: &mut HashMap<String, WindowAccumulator>,
+    monitor: &MonitorState,
+    raw_tx: &broadcast::Sender<RawDiff>,
+    trade_tx: &broadcast::Sender<RawTrade>,
+    deriv_tx: &broadcast::Sender<DerivEvent>,
+    metrics: &Metrics,
+    stats: &mut runtime::StatsTracker,
+) -> bool {
+    let combined: WsCombined = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let sym_lower = combined.stream.split('@').next().unwrap_or("").to_string();
+    let symbol = sym_lower.to_uppercase();
+    if !symbols_set.contains(&symbol) {
+        return false;
+    }
+
+    let data = match dispatch_non_depth(
+        name,
+        exchange_name,
+        &combined.stream,
+        &symbol,
+        combined.data,
+        accumulators,
+        trade_tx,
+        deriv_tx,
+    ) {
+        Some(d) => d,
+        None => return false,
+    };
+
+    let depth: DepthUpdate = match serde_json::from_value(data) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let (bids, asks, parse_errs) = parse_depth_levels(&depth);
+    if parse_errs > 0 {
+        warn!(conn = %name, symbol = %symbol, errors = parse_errs, "parse errors in depth levels");
+    }
+    let timestamp_us = depth.event_time_ms * 1_000;
+
+    let diff = DepthDiff {
+        exchange: exchange_name.to_string(),
+        symbol: symbol.clone(),
+        timestamp_us,
+        seq_id: depth.final_update_id,
+        prev_seq_id: depth.first_update_id,
+        prev_final_update_id: depth.prev_final_update_id,
+        bids: bids.clone(),
+        asks: asks.clone(),
+    };
+
+    let book = books.entry(symbol.clone()).or_default();
+
+    match book.apply_diff(&diff) {
+        Err(AppError::SnapshotRequired(_)) | Err(AppError::OrderBookGap { .. }) => {
+            warn!(conn = %name, symbol = %symbol, "gap — reconnecting");
+            runtime::record_gap(monitor, name, &symbol);
+            true
+        }
+        Err(e) => {
+            warn!(error = %e, "book error");
+            false
+        }
+        Ok(None) => false,
+        Ok(Some(applied)) => {
+            runtime::record_event(monitor, name, &symbol);
+
+            if raw_tx
+                .send(RawDiff {
+                    timestamp_us,
+                    exchange: exchange_name.to_string(),
+                    symbol: symbol.clone(),
+                    seq_id: diff.seq_id,
+                    prev_seq_id: diff.prev_seq_id,
+                    bids,
+                    asks,
+                })
+                .is_err()
+            {
+                warn!(conn = %name, symbol = %symbol, "raw: no receivers");
+            }
+
+            let acc = accumulators
+                .entry(symbol.clone())
+                .or_insert_with(|| WindowAccumulator::new(adapter_name, &symbol, timestamp_us));
+            acc.on_diff(book, &applied);
+            stats.inc();
+            runtime::inc_event_metrics(metrics, name, &symbol);
+            false
+        }
+    }
+}
+
 // ── Connection task ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -403,7 +586,7 @@ pub async fn connection_task(
     let name = conn.name.clone();
     let exchange_name = adapter.name().to_string();
     let symbols: Vec<String> = conn.symbols.iter().map(|s| s.to_uppercase()).collect();
-    let symbols_set: std::collections::HashSet<String> = symbols.iter().cloned().collect();
+    let symbols_set: HashSet<String> = symbols.iter().cloned().collect();
 
     let mut books: HashMap<String, OrderBook> = symbols
         .iter()
@@ -454,6 +637,22 @@ pub async fn connection_task(
             None => continue,
         };
 
+        // Second (market) connection — binance_perp only, see module comment
+        // above `recv_opt`. Connected before either forwarder is spawned so a
+        // failure here drops the already-open depth socket and retries both
+        // together rather than running depth-only.
+        let market_url = conn
+            .market_ws_url_override
+            .clone()
+            .or_else(|| adapter.market_ws_url(&symbols));
+        let market_ws = match &market_url {
+            Some(url) => match runtime::connect_ws(url, &name, &mut backoff_ms).await {
+                Some(ws) => Some(ws),
+                None => continue,
+            },
+            None => None,
+        };
+
         let (ws_sink, ws_stream) = ws.split();
         let (fwd_tx, mut fwd_rx) = mpsc::channel::<String>(crate::CHANNEL_BUFFER);
         let forwarder = runtime::spawn_forwarder(
@@ -463,6 +662,25 @@ pub async fn connection_task(
             DEFAULT_HEARTBEAT_TIMEOUT_S,
             fwd_tx,
         );
+
+        let (mut market_fwd_rx, market_forwarder): (
+            Option<mpsc::Receiver<String>>,
+            Option<tokio::task::JoinHandle<()>>,
+        ) = match market_ws {
+            Some(ws) => {
+                let (sink, stream) = ws.split();
+                let (tx, rx) = mpsc::channel::<String>(crate::CHANNEL_BUFFER);
+                let handle = runtime::spawn_forwarder(
+                    name.clone(),
+                    sink,
+                    stream,
+                    DEFAULT_HEARTBEAT_TIMEOUT_S,
+                    tx,
+                );
+                (Some(rx), Some(handle))
+            }
+            None => (None, None),
+        };
 
         // Fetch REST snapshots for all symbols in parallel (bounded concurrency: max 8).
         let mut rate_limited = false;
@@ -498,6 +716,7 @@ pub async fn connection_task(
                 warn!(conn = %name, "snapshot fetch cancelled during shutdown");
                 forwarder.abort();
                 let _ = forwarder.await;
+                abort_forwarder(market_forwarder).await;
                 break;
             }
         };
@@ -555,6 +774,7 @@ pub async fn connection_task(
             warn!(conn = %name, backoff_s = RATE_LIMIT_BACKOFF_S, "rate limited — extended backoff");
             forwarder.abort();
             let _ = forwarder.await;
+            abort_forwarder(market_forwarder).await;
             runtime::mark_disconnected(&monitor, &name);
             for book in books.values_mut() {
                 *book = OrderBook::new();
@@ -576,11 +796,23 @@ pub async fn connection_task(
             while let Ok(msg) = fwd_rx.try_recv() {
                 buf.push(msg);
             }
+            if let Some(rx) = market_fwd_rx.as_mut() {
+                while let Ok(msg) = rx.try_recv() {
+                    buf.push(msg);
+                }
+            }
             debug!(conn = %name, attempt, buf_size = buf.len(), "sync phase drain");
             if buf.is_empty() && attempt > 0 {
                 break 'sync;
             }
 
+            // Once a depth gap is found in this attempt, `gap_this_attempt` stops
+            // further depth application (the book is getting reset + reconnected
+            // regardless) but the loop keeps draining `buf` — market events
+            // (aggTrade/markPrice/forceOrder) are dispatched unconditionally
+            // above and must never be discarded just because a later/earlier
+            // depth entry in the same buffer triggered a gap (fathom#65 review).
+            let mut gap_this_attempt = false;
             for text in &buf {
                 let combined: WsCombined = match serde_json::from_str(text) {
                     Ok(v) => v,
@@ -593,27 +825,29 @@ pub async fn connection_task(
                     continue;
                 }
 
-                if combined.stream.ends_with("@aggTrade") {
-                    handle_agg_trade(
-                        &name,
-                        &exchange_name,
-                        &symbol,
-                        combined.data,
-                        &mut accumulators,
-                        &trade_tx,
-                    );
+                let Some(data) = dispatch_non_depth(
+                    &name,
+                    &exchange_name,
+                    &combined.stream,
+                    &symbol,
+                    combined.data,
+                    &mut accumulators,
+                    &trade_tx,
+                    &deriv_tx,
+                ) else {
+                    // Market event — already dispatched above. Never depends on
+                    // the depth-gap state below.
                     continue;
-                }
-                if combined.stream.ends_with("@markPrice@1s") {
-                    handle_mark_price(&name, &exchange_name, &symbol, combined.data, &deriv_tx);
-                    continue;
-                }
-                if combined.stream.ends_with("@forceOrder") {
-                    handle_force_order(&name, &exchange_name, &symbol, combined.data, &deriv_tx);
+                };
+
+                if gap_this_attempt {
+                    // Depth sync already failed this attempt — skip further
+                    // book mutation, but keep looping so trailing market
+                    // events in `buf` still reach dispatch_non_depth above.
                     continue;
                 }
 
-                let depth: DepthUpdate = match serde_json::from_value(combined.data) {
+                let depth: DepthUpdate = match serde_json::from_value(data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -645,7 +879,7 @@ pub async fn connection_task(
                         warn!(conn = %name, symbol = %symbol, "gap detected during sync replay — will reconnect");
                         runtime::record_gap(&monitor, &name, &symbol);
                         sync_gap_detected = true;
-                        break 'sync;
+                        gap_this_attempt = true;
                     }
                     Err(_) => continue,
                     Ok(None) => continue,
@@ -673,6 +907,10 @@ pub async fn connection_task(
                         acc.on_diff(book, &applied);
                     }
                 }
+            }
+
+            if gap_this_attempt {
+                break 'sync;
             }
 
             let unsynced: Vec<String> = books
@@ -772,6 +1010,7 @@ pub async fn connection_task(
         if sync_gap_detected {
             forwarder.abort();
             let _ = forwarder.await;
+            abort_forwarder(market_forwarder).await;
             runtime::mark_disconnected(&monitor, &name);
             for book in books.values_mut() {
                 *book = OrderBook::new();
@@ -799,91 +1038,28 @@ pub async fn connection_task(
                         None => break 'inner,
                         Some(t) => t,
                     };
+                    let gap = handle_event_message(
+                        &name, &exchange_name, adapter.name(), &symbols_set, &text,
+                        &mut books, &mut accumulators, &monitor,
+                        &raw_tx, &trade_tx, &deriv_tx, &metrics, &mut stats,
+                    );
+                    if gap { break 'inner; }
+                }
 
-                    let combined: WsCombined = match serde_json::from_str(&text) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                // Market connection (binance_perp only) — aggTrade/markPrice/forceOrder.
+                // See module comment above `recv_opt`: its closure is treated the same
+                // as the depth connection's, tearing down and reconnecting both.
+                msg = recv_opt(&mut market_fwd_rx) => {
+                    let text = match msg {
+                        None => break 'inner,
+                        Some(t) => t,
                     };
-
-                    let sym_lower = combined.stream.split('@').next().unwrap_or("").to_string();
-                    let symbol = sym_lower.to_uppercase();
-                    if !symbols_set.contains(&symbol) { continue; }
-
-                    if combined.stream.ends_with("@aggTrade") {
-                        handle_agg_trade(
-                            &name,
-                            &exchange_name,
-                            &symbol,
-                            combined.data,
-                            &mut accumulators,
-                            &trade_tx,
-                        );
-                        continue;
-                    }
-                    if combined.stream.ends_with("@markPrice@1s") {
-                        handle_mark_price(&name, &exchange_name, &symbol, combined.data, &deriv_tx);
-                        continue;
-                    }
-                    if combined.stream.ends_with("@forceOrder") {
-                        handle_force_order(&name, &exchange_name, &symbol, combined.data, &deriv_tx);
-                        continue;
-                    }
-
-                    let depth: DepthUpdate = match serde_json::from_value(combined.data) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    let (bids, asks, parse_errs) = parse_depth_levels(&depth);
-                    if parse_errs > 0 {
-                        warn!(conn = %name, symbol = %symbol, errors = parse_errs, "parse errors in depth levels");
-                    }
-                    let timestamp_us = depth.event_time_ms * 1_000;
-
-                    let diff = DepthDiff {
-                        exchange: exchange_name.clone(),
-                        symbol: symbol.clone(),
-                        timestamp_us,
-                        seq_id: depth.final_update_id,
-                        prev_seq_id: depth.first_update_id,
-                        prev_final_update_id: depth.prev_final_update_id,
-                        bids: bids.clone(),
-                        asks: asks.clone(),
-                    };
-
-                    let book = books.entry(symbol.clone()).or_default();
-
-                    match book.apply_diff(&diff) {
-                        Err(AppError::SnapshotRequired(_)) | Err(AppError::OrderBookGap { .. }) => {
-                            warn!(conn = %name, symbol = %symbol, "gap — reconnecting");
-                            runtime::record_gap(&monitor, &name, &symbol);
-                            break 'inner;
-                        }
-                        Err(e) => { warn!(error = %e, "book error"); continue; }
-                        Ok(None) => continue,
-                        Ok(Some(applied)) => {
-                            runtime::record_event(&monitor, &name, &symbol);
-
-                            if raw_tx.send(RawDiff {
-                                timestamp_us,
-                                exchange: exchange_name.clone(),
-                                symbol: symbol.clone(),
-                                seq_id: diff.seq_id,
-                                prev_seq_id: diff.prev_seq_id,
-                                bids,
-                                asks,
-                            }).is_err() {
-                                warn!(conn = %name, symbol = %symbol, "raw: no receivers");
-                            }
-
-                            let acc = accumulators.entry(symbol.clone()).or_insert_with(|| {
-                                WindowAccumulator::new(adapter.name(), &symbol, timestamp_us)
-                            });
-                            acc.on_diff(book, &applied);
-                            stats.inc();
-                            runtime::inc_event_metrics(&metrics, &name, &symbol);
-                        }
-                    }
+                    let gap = handle_event_message(
+                        &name, &exchange_name, adapter.name(), &symbols_set, &text,
+                        &mut books, &mut accumulators, &monitor,
+                        &raw_tx, &trade_tx, &deriv_tx, &metrics, &mut stats,
+                    );
+                    if gap { break 'inner; }
                 }
 
                 _ = snap_ticker.tick() => {
@@ -908,6 +1084,7 @@ pub async fn connection_task(
 
         forwarder.abort();
         let _ = forwarder.await;
+        abort_forwarder(market_forwarder).await;
 
         runtime::mark_disconnected(&monitor, &name);
 

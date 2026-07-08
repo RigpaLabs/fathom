@@ -37,6 +37,7 @@ fn dydx_conn(name: &str, symbols: Vec<&str>) -> ConnectionConfig {
         symbols: symbols.iter().map(|s| s.to_string()).collect(),
         depth_ms: 250,
         ws_url_override: None,
+        market_ws_url_override: None,
         snapshot_url_override: None,
     }
 }

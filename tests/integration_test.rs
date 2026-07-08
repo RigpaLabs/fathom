@@ -25,12 +25,12 @@ use fathom::{
     accumulator::Snapshot1s,
     config::{ConnectionConfig, Exchange},
     connection::connection_task,
-    exchange::BinanceSpot,
+    exchange::{BinancePerp, BinanceSpot},
     monitor,
-    writer::deriv::DerivEvent,
+    writer::deriv::{DerivEvent, run_deriv_writer},
     writer::raw::{RawDiff, run_raw_writer},
     writer::snap_1s::run_snap_writer,
-    writer::trades::RawTrade,
+    writer::trades::{RawTrade, run_trades_writer},
 };
 
 // ── Mock HTTP server ──────────────────────────────────────────────────────────
@@ -81,6 +81,47 @@ async fn spawn_mock_ws(messages: Vec<String>) -> u16 {
         let (mut sink, _rx) = futures_util::StreamExt::split(ws);
 
         for msg in messages {
+            let _ = sink
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                .await;
+        }
+        let _ = sink
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
+    });
+
+    port
+}
+
+/// Spawn a WS server that sends an initial burst of `messages`, waits `delay`,
+/// then sends `messages_after` before closing. The socket stays open across
+/// `delay` — used to push a message into the connection task's steady-state
+/// `tokio::select!` event loop instead of the sync-phase buffer replay (the
+/// sync phase only ever sees whatever arrived before its ~150ms drain).
+async fn spawn_mock_ws_delayed(
+    messages: Vec<String>,
+    delay: Duration,
+    messages_after: Vec<String>,
+) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let (mut sink, _rx) = futures_util::StreamExt::split(ws);
+
+        for msg in messages {
+            let _ = sink
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                .await;
+        }
+
+        tokio::time::sleep(delay).await;
+
+        for msg in messages_after {
             let _ = sink
                 .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
                 .await;
@@ -241,6 +282,7 @@ async fn test_integration_binance_spot_pipeline() {
             "ws://127.0.0.1:{}/stream?streams=ethusdt@depth@100ms",
             ws_port
         )),
+        market_ws_url_override: None,
         snapshot_url_override: Some(format!(
             "http://127.0.0.1:{}/depth?symbol={{symbol}}&limit=5000",
             http_port
@@ -372,6 +414,7 @@ async fn test_integration_monitor_state_updated() {
             "ws://127.0.0.1:{}/stream?streams=btcusdt@depth@100ms",
             ws_port
         )),
+        market_ws_url_override: None,
         snapshot_url_override: Some(format!(
             "http://127.0.0.1:{}/depth?symbol={{symbol}}&limit=5000",
             http_port
@@ -414,5 +457,222 @@ async fn test_integration_monitor_state_updated() {
     assert!(
         conn_stats.reconnects_today >= 1,
         "reconnects_today should be >= 1 after WS close"
+    );
+}
+
+// ── binance_perp two-connection merge (fathom#62) ────────────────────────────
+
+/// fathom#62: Binance's 2026-03 WS routing upgrade split USDM Futures streams
+/// into a `/public` endpoint (depth) and a `/market` endpoint (aggTrade,
+/// markPrice, forceOrder) — the legacy unrouted URL silently drops the latter.
+/// `connection_task` now opens TWO WS connections for binance_perp and merges
+/// them onto the same per-symbol book/accumulator (`market_ws_url_override`
+/// lets a test point the second connection at its own mock server).
+///
+/// This test mocks both sockets independently and asserts events from BOTH
+/// physical connections reach their writers: depth (raw) from the /public
+/// mock, and trade + funding + liquidation (trades/deriv) from the /market
+/// mock — proving the merge dispatch actually routes each stream type
+/// correctly regardless of which socket it arrived on.
+///
+/// The /market mock also stays open past sync-phase completion and pushes one
+/// more markPrice update from there — exercising the live `tokio::select!`
+/// merge in `connection_task`'s steady-state event loop (`recv_opt` on the
+/// market channel), not just the sync-phase buffer replay every message used
+/// to resolve through.
+#[tokio::test]
+async fn test_integration_binance_perp_two_connection_merge() {
+    let snap_body = serde_json::json!({
+        "lastUpdateId": 100,
+        "bids": [["3000.00", "5.00"]],
+        "asks": [["3001.00", "4.00"]]
+    })
+    .to_string();
+    let http_port = spawn_mock_http(snap_body).await;
+
+    // Depth connection ("/public"): one perp-shaped event carrying `pu` — the
+    // perp initial-sync rule accepts any event with `pu` present, regardless
+    // of its value (src/orderbook/mod.rs: apply_diff).
+    let depth_msg = serde_json::json!({
+        "stream": "ethusdt@depth@100ms",
+        "data": {
+            "E": 1_700_000_000_000_i64,
+            "U": 101,
+            "u": 101,
+            "pu": 100,
+            "b": [["3000.00", "6.00"]],
+            "a": []
+        }
+    })
+    .to_string();
+    let public_port = spawn_mock_ws(vec![depth_msg]).await;
+
+    // Market connection ("/market"): aggTrade + markPrice@1s + forceOrder —
+    // exactly the categories fathom#62 lost when both rode the legacy
+    // unrouted URL alongside depth.
+    let agg_trade_msg = serde_json::json!({
+        "stream": "ethusdt@aggTrade",
+        "data": {
+            "e": "aggTrade", "E": 1_700_000_000_500_i64, "s": "ETHUSDT",
+            "a": 1, "p": "3000.50", "q": "1.5", "f": 1, "l": 1,
+            "T": 1_700_000_000_400_i64, "m": false, "M": true
+        }
+    })
+    .to_string();
+    let mark_price_msg = serde_json::json!({
+        "stream": "ethusdt@markPrice@1s",
+        "data": {
+            "e": "markPriceUpdate", "E": 1_700_000_000_600_i64, "s": "ETHUSDT",
+            "p": "3000.10", "i": "3000.00", "P": "3000.20", "r": "0.00010000",
+            "T": 1_700_028_800_000_i64
+        }
+    })
+    .to_string();
+    let force_order_msg = serde_json::json!({
+        "stream": "ethusdt@forceOrder",
+        "data": {
+            "e": "forceOrder", "E": 1_700_000_000_700_i64,
+            "o": {
+                "s": "ETHUSDT", "S": "SELL", "o": "LIMIT", "f": "IOC",
+                "q": "0.01", "p": "2990", "ap": "2990.5", "X": "FILLED",
+                "l": "0.01", "z": "0.01", "T": 1_700_000_000_699_i64
+            }
+        }
+    })
+    .to_string();
+    // A second markPrice update, sent only after `delay` — well after the
+    // ~150ms sync-phase drain plus this single-depth-message sync attempt
+    // completes — so it can only be dispatched via the steady-state select
+    // loop's market arm, never the sync-phase buffer replay.
+    let second_mark_price_msg = serde_json::json!({
+        "stream": "ethusdt@markPrice@1s",
+        "data": {
+            "e": "markPriceUpdate", "E": 1_700_000_001_600_i64, "s": "ETHUSDT",
+            "p": "3005.10", "i": "3005.00", "P": "3005.20", "r": "0.00020000",
+            "T": 1_700_057_600_000_i64
+        }
+    })
+    .to_string();
+    let market_port = spawn_mock_ws_delayed(
+        vec![agg_trade_msg, mark_price_msg, force_order_msg],
+        Duration::from_millis(250),
+        vec![second_mark_price_msg],
+    )
+    .await;
+
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().to_path_buf();
+
+    let (raw_tx, _) = broadcast::channel::<RawDiff>(64);
+    let (snap_tx, _) = broadcast::channel::<Snapshot1s>(64);
+    let (trade_tx, _) = broadcast::channel::<RawTrade>(64);
+    let (deriv_tx, _) = broadcast::channel::<DerivEvent>(64);
+
+    let raw_writer = tokio::spawn(run_raw_writer(
+        data_dir.clone(),
+        raw_tx.subscribe(),
+        60,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+    let snap_writer = tokio::spawn(run_snap_writer(
+        data_dir.clone(),
+        snap_tx.subscribe(),
+        CancellationToken::new(),
+        fathom::metrics::new_metrics().metrics,
+    ));
+    let trades_writer = tokio::spawn(run_trades_writer(
+        data_dir.clone(),
+        trade_tx.subscribe(),
+        60,
+        1,
+        fathom::metrics::new_metrics().metrics,
+    ));
+    let deriv_writer = tokio::spawn(run_deriv_writer(
+        data_dir.clone(),
+        deriv_tx.subscribe(),
+        60,
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    let conn = ConnectionConfig {
+        name: "test_perp".to_string(),
+        exchange: Exchange::BinancePerp,
+        symbols: vec!["ETHUSDT".to_string()],
+        depth_ms: 100,
+        ws_url_override: Some(format!(
+            "ws://127.0.0.1:{}/stream?streams=ethusdt@depth@100ms",
+            public_port
+        )),
+        market_ws_url_override: Some(format!(
+            "ws://127.0.0.1:{}/stream?streams=ethusdt@aggTrade/ethusdt@markPrice@1s/ethusdt@forceOrder",
+            market_port
+        )),
+        snapshot_url_override: Some(format!(
+            "http://127.0.0.1:{}/depth?symbol={{symbol}}&limit=1000",
+            http_port
+        )),
+    };
+
+    let adapter: Box<dyn fathom::exchange::ExchangeAdapter> = Box::new(BinancePerp);
+    let state = monitor::new_state();
+
+    let cancel = CancellationToken::new();
+    let conn_task = tokio::spawn(connection_task(
+        conn,
+        adapter,
+        data_dir.clone(),
+        state,
+        raw_tx,
+        snap_tx,
+        trade_tx,
+        deriv_tx,
+        cancel.clone(),
+        fathom::metrics::new_metrics().metrics,
+    ));
+
+    // Long enough for: sync phase (~150ms drain + one attempt) to complete,
+    // then the /market mock's delayed second markPrice (sent at +250ms) to be
+    // received and dispatched by the steady-state select loop, with margin
+    // before cancel.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
+
+    raw_writer.await.unwrap();
+    snap_writer.await.unwrap();
+    trades_writer.await.unwrap();
+    deriv_writer.await.unwrap();
+
+    let all_parquets = find_parquets(&data_dir);
+    let rows_under = |component: &str| -> usize {
+        all_parquets
+            .iter()
+            .filter(|p| p.components().any(|c| c.as_os_str() == component))
+            .map(|p| {
+                let file = std::fs::File::open(p).unwrap();
+                ParquetRecordBatchReaderBuilder::try_new(file)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .map(|b| b.unwrap().num_rows())
+                    .sum::<usize>()
+            })
+            .sum()
+    };
+
+    assert!(
+        rows_under("raw") >= 1,
+        "depth connection (/public mock) must produce at least one raw row"
+    );
+    assert!(
+        rows_under("trades") >= 1,
+        "market connection (/market mock) must produce at least one trade row"
+    );
+    assert!(
+        rows_under("deriv") >= 3,
+        "market connection (/market mock) must produce 2 funding rows (sync-phase \
+         + steady-state via live select merge) + 1 liquidation row"
     );
 }

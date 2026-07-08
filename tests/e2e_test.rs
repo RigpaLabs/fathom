@@ -109,6 +109,7 @@ fn make_conn(name: &str, symbols: Vec<&str>, server: &MockBinanceServer) -> Conn
         symbols: symbols.iter().map(|s| s.to_string()).collect(),
         depth_ms: 100,
         ws_url_override: Some(server.ws_url()),
+        market_ws_url_override: None,
         snapshot_url_override: Some(server.snapshot_url_template()),
     }
 }

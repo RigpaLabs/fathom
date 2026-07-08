@@ -25,6 +25,10 @@ pub struct ConnectionConfig {
     /// Override WebSocket URL (full URL including ?streams=...). Used in tests.
     #[serde(default)]
     pub ws_url_override: Option<String>,
+    /// Override the second (market) WebSocket URL — binance_perp only, see
+    /// `ExchangeAdapter::market_ws_url`. Used in tests.
+    #[serde(default)]
+    pub market_ws_url_override: Option<String>,
     /// Override snapshot base URL template. Use `{symbol}` as placeholder.
     /// Example: "http://127.0.0.1:9001/depth?symbol={symbol}&limit=5000"
     #[serde(default)]

@@ -14,8 +14,19 @@ pub use hyperliquid::Hyperliquid;
 /// Adapter for an exchange's WebSocket and REST API endpoints.
 pub trait ExchangeAdapter: Send + Sync {
     fn name(&self) -> &str;
-    /// Build combined-stream WS URL for the given symbols.
+    /// Build combined-stream WS URL for the given symbols. For `binance_perp`
+    /// this carries depth only (routed `/public` streams) — see `market_ws_url`.
     fn ws_url(&self, symbols: &[String], depth_ms: u64) -> String;
+    /// Second WS connection for venues that route event categories to
+    /// separate endpoints (currently `binance_perp` only: aggTrade/markPrice/
+    /// forceOrder on the routed `/market` endpoint, fathom#62). `None` means a
+    /// single connection (`ws_url`) carries everything, which is every other
+    /// venue's behavior. When `Some`, `connection::binance::connection_task`
+    /// opens both connections and merges their events onto the same per-symbol
+    /// book + accumulator.
+    fn market_ws_url(&self, _symbols: &[String]) -> Option<String> {
+        None
+    }
     /// Build REST depth snapshot URL for a single symbol.
     fn snapshot_url(&self, symbol: &str) -> String;
     /// REST open-interest URL for a single symbol. `None` when the venue has

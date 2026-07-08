@@ -53,6 +53,7 @@ fn bybit_conn(name: &str, exchange: Exchange, symbols: &[&str]) -> ConnectionCon
         symbols: symbols.iter().map(|s| s.to_string()).collect(),
         depth_ms: 0, // ignored by the Bybit adapter
         ws_url_override: None,
+        market_ws_url_override: None,
         snapshot_url_override: None,
     }
 }
