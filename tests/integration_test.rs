@@ -617,6 +617,12 @@ async fn test_integration_binance_perp_two_connection_merge() {
     let adapter: Box<dyn fathom::exchange::ExchangeAdapter> = Box::new(BinancePerp);
     let state = monitor::new_state();
 
+    // Deterministic wait: probe the deriv broadcast for the 3 expected deriv
+    // events (2 funding + 1 liquidation) instead of a fixed sleep, so the test
+    // is not timing-flaky on slow CI runners (the delayed steady-state markPrice
+    // arrives at +250ms but processing/scheduling latency is unbounded there).
+    let mut deriv_probe = deriv_tx.subscribe();
+
     let cancel = CancellationToken::new();
     let conn_task = tokio::spawn(connection_task(
         conn,
@@ -631,11 +637,18 @@ async fn test_integration_binance_perp_two_connection_merge() {
         fathom::metrics::new_metrics().metrics,
     ));
 
-    // Long enough for: sync phase (~150ms drain + one attempt) to complete,
-    // then the /market mock's delayed second markPrice (sent at +250ms) to be
-    // received and dispatched by the steady-state select loop, with margin
-    // before cancel.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Wait until all 3 deriv events have actually been dispatched (2 funding —
+    // one in sync phase, one via the steady-state select merge — + 1 liq), with
+    // a generous ceiling. Deterministic regardless of CI speed.
+    let wait_derivs = async {
+        let mut n = 0;
+        while n < 3 {
+            if deriv_probe.recv().await.is_ok() {
+                n += 1;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(10), wait_derivs).await;
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
