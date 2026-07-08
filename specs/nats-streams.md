@@ -4,6 +4,8 @@ Status: **stable**
 
 Optional: enabled via `[nats]` config section; fathom runs fine without it (Parquet writers are independent). Publisher: `src/nats_sink.rs`. Backpressure policy: drop, never block collection (ADR-002).
 
+**Symbol allowlist:** `nats.symbols` (optional string list) restricts which symbols get published to NATS — Parquet collection always covers the full configured symbol set regardless. `None`/empty publishes every symbol (default). Matching is case-sensitive against the upstream symbol string (e.g. `ETHUSDT`). Filtering happens per-event before serialization (`nats_sink::should_publish`), applied identically across all four publish paths (snapshots, depth, trades, deriv).
+
 ## Streams
 
 | Stream | Subjects | Storage | Retention | Purpose |

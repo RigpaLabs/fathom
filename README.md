@@ -124,7 +124,10 @@ Both streams use the JetStream double-await pattern (send request → await ACK)
 [nats]
 url = "nats://127.0.0.1:4222"
 enabled = true   # default: true when [nats] section is present
+symbols = ["ETHUSDT"]   # optional allowlist — see below
 ```
+
+`nats.symbols` restricts NATS publishing to the listed symbols only; omit or leave empty to publish every symbol (default). Parquet collection is unaffected either way — it always covers the full `connections[].symbols` set.
 
 ## Config reference
 
@@ -138,6 +141,7 @@ enabled = true   # default: true when [nats] section is present
 | `connections[].depth_ms` | integer | required | WebSocket update speed in ms (Binance: `100`/`1000`, HL: `500`). Not used for `dydx` — the dYdX WebSocket uses a fixed update interval controlled by the exchange. |
 | `nats.url` | string | — | NATS server URL (e.g. `nats://127.0.0.1:4222`). Omit `[nats]` section to disable. |
 | `nats.enabled` | bool | `true` | Set `false` to disable NATS while keeping the config section. |
+| `nats.symbols` | string[] | — (all) | Optional NATS publish allowlist. Omit/empty publishes all symbols; non-empty restricts NATS publish to the listed symbols. Parquet collection is always the full `connections[].symbols` set regardless. |
 
 ### Environment variables
 

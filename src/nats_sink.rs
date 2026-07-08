@@ -1,9 +1,34 @@
+use std::{collections::HashSet, sync::Arc};
+
 use async_nats::jetstream::{self, stream};
 use fathom_types::{RawDiff, RawTrade, Snapshot1s, wire_encode};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::{config::NatsConfig, writer::deriv::DerivEvent};
+
+/// Publish-time symbol allowlist. `None` (or an empty set) means
+/// unrestricted — every symbol is published, matching behavior from before
+/// this field existed. This only gates the NATS sink; Parquet writers never
+/// see it and always cover the full configured symbol set.
+type Allowlist = Option<Arc<HashSet<String>>>;
+
+fn build_allowlist(symbols: &Option<Vec<String>>) -> Allowlist {
+    symbols
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .map(|s| Arc::new(s.iter().cloned().collect()))
+}
+
+/// Whether an event for `symbol` should be published to NATS. Pure and cheap
+/// (single hash lookup) so it's called before any serialization work.
+fn should_publish(symbol: &str, allowlist: &Allowlist) -> bool {
+    match allowlist {
+        None => true,
+        Some(set) if set.is_empty() => true,
+        Some(set) => set.contains(symbol),
+    }
+}
 
 fn snapshot_subject(exchange: &str, symbol: &str) -> String {
     format!("fathom.v1.{exchange}.{symbol}.snapshot")
@@ -53,10 +78,19 @@ pub async fn run(
 
     info!("NATS sink connected to {}", config.url);
 
-    let snap_handle = tokio::spawn(publish_snapshots(js.clone(), snap_rx));
-    let trade_handle = tokio::spawn(publish_trades(js.clone(), trade_rx));
-    let deriv_handle = tokio::spawn(publish_deriv(js.clone(), deriv_rx));
-    let raw_handle = tokio::spawn(publish_depth(js, raw_rx));
+    let allowlist = build_allowlist(&config.symbols);
+    if let Some(set) = &allowlist {
+        info!(
+            "NATS publish restricted to {} symbol(s): {:?}",
+            set.len(),
+            set
+        );
+    }
+
+    let snap_handle = tokio::spawn(publish_snapshots(js.clone(), snap_rx, allowlist.clone()));
+    let trade_handle = tokio::spawn(publish_trades(js.clone(), trade_rx, allowlist.clone()));
+    let deriv_handle = tokio::spawn(publish_deriv(js.clone(), deriv_rx, allowlist.clone()));
+    let raw_handle = tokio::spawn(publish_depth(js, raw_rx, allowlist));
 
     let _ = tokio::join!(snap_handle, raw_handle, trade_handle, deriv_handle);
     info!("NATS sink stopped");
@@ -121,10 +155,17 @@ async fn ensure_streams(js: &jetstream::Context) -> Result<(), async_nats::Error
 /// Publish derivatives events. One channel carries all three structs; each
 /// variant is wire-encoded as its *inner* struct on its own subject —
 /// `DerivEvent` never crosses the wire (no type discriminant in the format).
-async fn publish_deriv(js: jetstream::Context, mut rx: broadcast::Receiver<DerivEvent>) {
+async fn publish_deriv(
+    js: jetstream::Context,
+    mut rx: broadcast::Receiver<DerivEvent>,
+    allowlist: Allowlist,
+) {
     loop {
         match rx.recv().await {
             Ok(event) => {
+                if !should_publish(event.symbol(), &allowlist) {
+                    continue;
+                }
                 let subject = deriv_subject(&event);
                 let encoded = match &event {
                     DerivEvent::MarkFunding(m) => wire_encode(m),
@@ -151,10 +192,17 @@ async fn publish_deriv(js: jetstream::Context, mut rx: broadcast::Receiver<Deriv
     }
 }
 
-async fn publish_trades(js: jetstream::Context, mut rx: broadcast::Receiver<RawTrade>) {
+async fn publish_trades(
+    js: jetstream::Context,
+    mut rx: broadcast::Receiver<RawTrade>,
+    allowlist: Allowlist,
+) {
     loop {
         match rx.recv().await {
             Ok(trade) => {
+                if !should_publish(&trade.symbol, &allowlist) {
+                    continue;
+                }
                 let subject = trade_subject(&trade.exchange, &trade.symbol);
                 match wire_encode(&trade) {
                     Ok(payload) => match js.publish(subject, payload.into()).await {
@@ -176,10 +224,17 @@ async fn publish_trades(js: jetstream::Context, mut rx: broadcast::Receiver<RawT
     }
 }
 
-async fn publish_snapshots(js: jetstream::Context, mut rx: broadcast::Receiver<Snapshot1s>) {
+async fn publish_snapshots(
+    js: jetstream::Context,
+    mut rx: broadcast::Receiver<Snapshot1s>,
+    allowlist: Allowlist,
+) {
     loop {
         match rx.recv().await {
             Ok(snap) => {
+                if !should_publish(&snap.symbol, &allowlist) {
+                    continue;
+                }
                 let subject = snapshot_subject(&snap.exchange, &snap.symbol);
                 match wire_encode(&snap) {
                     Ok(payload) => {
@@ -205,10 +260,17 @@ async fn publish_snapshots(js: jetstream::Context, mut rx: broadcast::Receiver<S
     }
 }
 
-async fn publish_depth(js: jetstream::Context, mut rx: broadcast::Receiver<RawDiff>) {
+async fn publish_depth(
+    js: jetstream::Context,
+    mut rx: broadcast::Receiver<RawDiff>,
+    allowlist: Allowlist,
+) {
     loop {
         match rx.recv().await {
             Ok(diff) => {
+                if !should_publish(&diff.symbol, &allowlist) {
+                    continue;
+                }
                 let subject = depth_subject(&diff.exchange, &diff.symbol);
                 match wire_encode(&diff) {
                     Ok(payload) => match js.publish(subject, payload.into()).await {
@@ -291,6 +353,49 @@ mod tests {
             qty: 1.0,
         });
         assert_eq!(deriv_subject(&liq), "fathom.v1.binance_perp.BTCUSDT.liq");
+    }
+
+    #[test]
+    fn should_publish_allows_all_when_allowlist_absent() {
+        let allowlist: Allowlist = None;
+        assert!(should_publish("ETHUSDT", &allowlist));
+        assert!(should_publish("BTCUSDT", &allowlist));
+        assert!(should_publish("ANYTHING", &allowlist));
+    }
+
+    #[test]
+    fn should_publish_allows_all_when_allowlist_empty() {
+        let allowlist: Allowlist = Some(Arc::new(HashSet::new()));
+        assert!(should_publish("ETHUSDT", &allowlist));
+        assert!(should_publish("BTCUSDT", &allowlist));
+    }
+
+    #[test]
+    fn should_publish_restricts_to_listed_symbols_only() {
+        let allowlist = build_allowlist(&Some(vec!["ETHUSDT".to_string()]));
+        assert!(should_publish("ETHUSDT", &allowlist));
+        assert!(!should_publish("BTCUSDT", &allowlist));
+    }
+
+    #[test]
+    fn should_publish_is_case_sensitive() {
+        let allowlist = build_allowlist(&Some(vec!["ETHUSDT".to_string()]));
+        assert!(!should_publish("ethusdt", &allowlist));
+    }
+
+    #[test]
+    fn build_allowlist_none_for_absent_or_empty_config() {
+        assert!(build_allowlist(&None).is_none());
+        assert!(build_allowlist(&Some(vec![])).is_none());
+    }
+
+    #[test]
+    fn build_allowlist_some_for_non_empty_config() {
+        let allowlist = build_allowlist(&Some(vec!["ETHUSDT".to_string(), "BTCUSDT".to_string()]));
+        let set = allowlist.expect("non-empty config must build Some allowlist");
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("ETHUSDT"));
+        assert!(set.contains("BTCUSDT"));
     }
 
     #[test]
