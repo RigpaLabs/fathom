@@ -93,6 +93,47 @@ async fn spawn_mock_ws(messages: Vec<String>) -> u16 {
     port
 }
 
+/// Spawn a WS server that sends an initial burst of `messages`, waits `delay`,
+/// then sends `messages_after` before closing. The socket stays open across
+/// `delay` — used to push a message into the connection task's steady-state
+/// `tokio::select!` event loop instead of the sync-phase buffer replay (the
+/// sync phase only ever sees whatever arrived before its ~150ms drain).
+async fn spawn_mock_ws_delayed(
+    messages: Vec<String>,
+    delay: Duration,
+    messages_after: Vec<String>,
+) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let (mut sink, _rx) = futures_util::StreamExt::split(ws);
+
+        for msg in messages {
+            let _ = sink
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                .await;
+        }
+
+        tokio::time::sleep(delay).await;
+
+        for msg in messages_after {
+            let _ = sink
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                .await;
+        }
+        let _ = sink
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
+    });
+
+    port
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build a Binance combined-stream depth update JSON string.
@@ -433,6 +474,12 @@ async fn test_integration_monitor_state_updated() {
 /// mock, and trade + funding + liquidation (trades/deriv) from the /market
 /// mock — proving the merge dispatch actually routes each stream type
 /// correctly regardless of which socket it arrived on.
+///
+/// The /market mock also stays open past sync-phase completion and pushes one
+/// more markPrice update from there — exercising the live `tokio::select!`
+/// merge in `connection_task`'s steady-state event loop (`recv_opt` on the
+/// market channel), not just the sync-phase buffer replay every message used
+/// to resolve through.
 #[tokio::test]
 async fn test_integration_binance_perp_two_connection_merge() {
     let snap_body = serde_json::json!({
@@ -493,7 +540,25 @@ async fn test_integration_binance_perp_two_connection_merge() {
         }
     })
     .to_string();
-    let market_port = spawn_mock_ws(vec![agg_trade_msg, mark_price_msg, force_order_msg]).await;
+    // A second markPrice update, sent only after `delay` — well after the
+    // ~150ms sync-phase drain plus this single-depth-message sync attempt
+    // completes — so it can only be dispatched via the steady-state select
+    // loop's market arm, never the sync-phase buffer replay.
+    let second_mark_price_msg = serde_json::json!({
+        "stream": "ethusdt@markPrice@1s",
+        "data": {
+            "e": "markPriceUpdate", "E": 1_700_000_001_600_i64, "s": "ETHUSDT",
+            "p": "3005.10", "i": "3005.00", "P": "3005.20", "r": "0.00020000",
+            "T": 1_700_057_600_000_i64
+        }
+    })
+    .to_string();
+    let market_port = spawn_mock_ws_delayed(
+        vec![agg_trade_msg, mark_price_msg, force_order_msg],
+        Duration::from_millis(250),
+        vec![second_mark_price_msg],
+    )
+    .await;
 
     let dir = TempDir::new().unwrap();
     let data_dir = dir.path().to_path_buf();
@@ -566,9 +631,11 @@ async fn test_integration_binance_perp_two_connection_merge() {
         fathom::metrics::new_metrics().metrics,
     ));
 
-    // Same generous ceiling as the spot pipeline test above — both mock WS
-    // servers push their few messages well within this window.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Long enough for: sync phase (~150ms drain + one attempt) to complete,
+    // then the /market mock's delayed second markPrice (sent at +250ms) to be
+    // received and dispatched by the steady-state select loop, with margin
+    // before cancel.
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), conn_task).await;
@@ -604,7 +671,8 @@ async fn test_integration_binance_perp_two_connection_merge() {
         "market connection (/market mock) must produce at least one trade row"
     );
     assert!(
-        rows_under("deriv") >= 2,
-        "market connection (/market mock) must produce funding + liquidation rows"
+        rows_under("deriv") >= 3,
+        "market connection (/market mock) must produce 2 funding rows (sync-phase \
+         + steady-state via live select merge) + 1 liquidation row"
     );
 }

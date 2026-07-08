@@ -806,6 +806,13 @@ pub async fn connection_task(
                 break 'sync;
             }
 
+            // Once a depth gap is found in this attempt, `gap_this_attempt` stops
+            // further depth application (the book is getting reset + reconnected
+            // regardless) but the loop keeps draining `buf` — market events
+            // (aggTrade/markPrice/forceOrder) are dispatched unconditionally
+            // above and must never be discarded just because a later/earlier
+            // depth entry in the same buffer triggered a gap (fathom#65 review).
+            let mut gap_this_attempt = false;
             for text in &buf {
                 let combined: WsCombined = match serde_json::from_str(text) {
                     Ok(v) => v,
@@ -828,8 +835,17 @@ pub async fn connection_task(
                     &trade_tx,
                     &deriv_tx,
                 ) else {
+                    // Market event — already dispatched above. Never depends on
+                    // the depth-gap state below.
                     continue;
                 };
+
+                if gap_this_attempt {
+                    // Depth sync already failed this attempt — skip further
+                    // book mutation, but keep looping so trailing market
+                    // events in `buf` still reach dispatch_non_depth above.
+                    continue;
+                }
 
                 let depth: DepthUpdate = match serde_json::from_value(data) {
                     Ok(v) => v,
@@ -863,7 +879,7 @@ pub async fn connection_task(
                         warn!(conn = %name, symbol = %symbol, "gap detected during sync replay — will reconnect");
                         runtime::record_gap(&monitor, &name, &symbol);
                         sync_gap_detected = true;
-                        break 'sync;
+                        gap_this_attempt = true;
                     }
                     Err(_) => continue,
                     Ok(None) => continue,
@@ -891,6 +907,10 @@ pub async fn connection_task(
                         acc.on_diff(book, &applied);
                     }
                 }
+            }
+
+            if gap_this_attempt {
+                break 'sync;
             }
 
             let unsynced: Vec<String> = books
