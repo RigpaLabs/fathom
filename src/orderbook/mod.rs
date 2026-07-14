@@ -40,6 +40,15 @@ pub struct DiffApplied {
     pub ask_abs_change: f64,
 }
 
+/// Levels kept per side after a prune (nearest the mid). We only ever read the
+/// top ~10 (snapshot columns, OFI, microprice), so 1000 is ~100× headroom —
+/// pruning never touches live near-mid state.
+const BOOK_LEVEL_CAP: usize = 1000;
+/// Prune only once a side exceeds this. The gap between it and `BOOK_LEVEL_CAP`
+/// is hysteresis: it amortizes the O(n) prune walk over ~200 events instead of
+/// firing on every near-mid insert while the book sits full.
+const BOOK_PRUNE_TRIGGER: usize = 1200;
+
 /// Level-2 order book with Binance sync protocol.
 pub struct OrderBook {
     /// Price → quantity, descending iteration (best bid first)
@@ -98,11 +107,43 @@ impl OrderBook {
                 self.ask_last.insert(key, qty);
             }
         }
+        self.prune_far_levels();
         self.last_update_id = snap.last_update_id;
         self.has_snapshot = true;
         self.synced = false;
         self.prev_best_bid_qty = self.best_bid_qty();
         self.prev_best_ask_qty = self.best_ask_qty();
+    }
+
+    /// Keep only the `BOOK_LEVEL_CAP` levels nearest the mid on each side,
+    /// dropping far-from-mid levels. Binance/Bybit only send an explicit 0-qty
+    /// diff for levels inside their active window, so a level that drifts out of
+    /// range is never removed — a long-lived book (Binance perp resyncs ~once per
+    /// 6 days) accumulates stale deep levels unboundedly (observed ~800 MB anon
+    /// RSS over 6 days). Far levels are never read (we emit top-10 only) and full
+    /// depth lives in the raw-diff stream, not this book — so pruning loses
+    /// nothing. `bid_last`/`ask_last` share the book's exact key set, so the same
+    /// dropped keys are removed from them to keep the mirror in sync.
+    fn prune_far_levels(&mut self) {
+        if self.bids.len() > BOOK_PRUNE_TRIGGER {
+            // Best bid = highest price; keep the highest CAP, drop the lowest.
+            if let Some(&cutoff) = self.bids.keys().nth_back(BOOK_LEVEL_CAP - 1) {
+                let kept = self.bids.split_off(&cutoff); // keys >= cutoff (near mid)
+                let dropped = std::mem::replace(&mut self.bids, kept);
+                for k in dropped.keys() {
+                    self.bid_last.remove(k);
+                }
+            }
+        }
+        if self.asks.len() > BOOK_PRUNE_TRIGGER {
+            // Best ask = lowest price; keep the lowest CAP, drop the highest.
+            if let Some(&cutoff) = self.asks.keys().nth(BOOK_LEVEL_CAP) {
+                let dropped = self.asks.split_off(&cutoff); // keys >= cutoff (far)
+                for k in dropped.keys() {
+                    self.ask_last.remove(k);
+                }
+            }
+        }
     }
 
     /// Apply a diff event. Returns `Err(SnapshotRequired)` on gap.
@@ -227,6 +268,8 @@ impl OrderBook {
         self.prev_best_bid_qty = new_best_bid_qty;
         self.prev_best_ask_qty = new_best_ask_qty;
 
+        self.prune_far_levels();
+
         DiffApplied {
             ofi_l1_delta,
             bid_abs_change,
@@ -335,6 +378,22 @@ impl OrderBook {
 
     fn ask_last_contains(&self, price: f64) -> bool {
         self.ask_last.contains_key(&OrderedFloat(price))
+    }
+
+    fn bids_len(&self) -> usize {
+        self.bids.len()
+    }
+
+    fn asks_len(&self) -> usize {
+        self.asks.len()
+    }
+
+    fn bid_last_len(&self) -> usize {
+        self.bid_last.len()
+    }
+
+    fn ask_last_len(&self) -> usize {
+        self.ask_last.len()
     }
 }
 
@@ -530,5 +589,53 @@ mod tests {
         };
         let result = book.apply_diff(&gap_event);
         assert!(result.is_err(), "genuine perp gap must still trigger error");
+    }
+
+    #[test]
+    fn test_snapshot_caps_levels_and_keeps_near_mid() {
+        // Snapshot far wider than the cap on both sides.
+        let bids: Vec<(f64, f64)> = (1..=1300).map(|i| (i as f64, 1.0)).collect();
+        let asks: Vec<(f64, f64)> = (2000..=3300).map(|i| (i as f64, 1.0)).collect();
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(bids, asks));
+
+        assert!(book.bids_len() <= BOOK_LEVEL_CAP, "bids capped to near-mid");
+        assert!(book.asks_len() <= BOOK_LEVEL_CAP, "asks capped to near-mid");
+        // Best levels (nearest the mid) survive: highest bid, lowest ask.
+        assert_eq!(book.best_bid_px(), 1300.0, "best bid preserved after prune");
+        assert_eq!(book.best_ask_px(), 2000.0, "best ask preserved after prune");
+        // _last maps mirror the book exactly — no independent leak.
+        assert_eq!(book.bid_last_len(), book.bids_len());
+        assert_eq!(book.ask_last_len(), book.asks_len());
+    }
+
+    #[test]
+    fn test_apply_diff_caps_far_levels() {
+        // Reproduces the prod leak: a synced book fed levels far from mid that
+        // never receive an explicit 0-removal must not grow past the cap.
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(vec![(1000.0, 5.0)], vec![(5000.0, 5.0)]));
+        let far_bids: Vec<(f64, f64)> = (1..=1300).map(|i| (i as f64, 1.0)).collect();
+        // Sync diff also carries levels → applies + prunes in one shot.
+        book.apply_diff(&diff(101, 100, far_bids, vec![])).unwrap();
+
+        assert!(book.bids_len() <= BOOK_LEVEL_CAP, "far bids pruned");
+        assert_eq!(
+            book.bid_last_len(),
+            book.bids_len(),
+            "bid_last mirrors bids after prune"
+        );
+        assert_eq!(book.best_bid_px(), 1300.0, "near-mid best preserved");
+    }
+
+    #[test]
+    fn test_prune_leaves_small_book_untouched() {
+        // Below the trigger: nothing is pruned, exact levels retained.
+        let bids: Vec<(f64, f64)> = (1..=50).map(|i| (i as f64, 1.0)).collect();
+        let asks: Vec<(f64, f64)> = (100..=150).map(|i| (i as f64, 1.0)).collect();
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(bids, asks));
+        assert_eq!(book.bids_len(), 50);
+        assert_eq!(book.asks_len(), 51);
     }
 }
