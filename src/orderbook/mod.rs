@@ -120,10 +120,14 @@ impl OrderBook {
     /// diff for levels inside their active window, so a level that drifts out of
     /// range is never removed — a long-lived book (Binance perp resyncs ~once per
     /// 6 days) accumulates stale deep levels unboundedly (observed ~800 MB anon
-    /// RSS over 6 days). Far levels are never read (we emit top-10 only) and full
-    /// depth lives in the raw-diff stream, not this book — so pruning loses
-    /// nothing. `bid_last`/`ask_last` share the book's exact key set, so the same
-    /// dropped keys are removed from them to keep the mirror in sync.
+    /// RSS over 6 days). Near-mid metrics stay exact — we emit top-10 only and the
+    /// cap is ~100× deeper than any level read (best/OFI/microprice/imbalance/
+    /// depth L5/L10), and full depth lives in the raw-diff stream, not this book.
+    /// The one caveat: a pruned level that later re-enters loses its remembered
+    /// qty, so full-book churn (`bid_abs_change`) is then measured from a zero
+    /// baseline — deep-book noise dwarfed by near-mid churn, accepted as such.
+    /// `bid_last`/`ask_last` share the book's exact key set, so the same dropped
+    /// keys are removed from them to keep the mirror in sync.
     fn prune_far_levels(&mut self) {
         if self.bids.len() > BOOK_PRUNE_TRIGGER {
             // Best bid = highest price; keep the highest CAP, drop the lowest.
@@ -395,6 +399,14 @@ impl OrderBook {
     fn ask_last_len(&self) -> usize {
         self.ask_last.len()
     }
+
+    fn bids_contains(&self, price: f64) -> bool {
+        self.bids.contains_key(&OrderedFloat(price))
+    }
+
+    fn asks_contains(&self, price: f64) -> bool {
+        self.asks.contains_key(&OrderedFloat(price))
+    }
 }
 
 #[cfg(test)]
@@ -599,14 +611,50 @@ mod tests {
         let mut book = OrderBook::new();
         book.apply_snapshot(snap(bids, asks));
 
-        assert!(book.bids_len() <= BOOK_LEVEL_CAP, "bids capped to near-mid");
-        assert!(book.asks_len() <= BOOK_LEVEL_CAP, "asks capped to near-mid");
+        // Exact retained window, not just a count — catches off-by-one in the
+        // split_off boundary. bids 1..=1300 keep the highest 1000 → 301..=1300;
+        // asks 2000..=3300 keep the lowest 1000 → 2000..=2999.
+        assert_eq!(book.bids_len(), BOOK_LEVEL_CAP, "bids pruned to exact cap");
+        assert_eq!(book.asks_len(), BOOK_LEVEL_CAP, "asks pruned to exact cap");
+        assert!(book.bids_contains(301.0), "lowest kept bid retained");
+        assert!(book.bids_contains(1300.0), "best bid retained");
+        assert!(!book.bids_contains(300.0), "far bid dropped at boundary");
+        assert!(!book.bids_contains(1.0), "farthest bid dropped");
+        assert!(book.asks_contains(2000.0), "best ask retained");
+        assert!(book.asks_contains(2999.0), "highest kept ask retained");
+        assert!(!book.asks_contains(3000.0), "far ask dropped at boundary");
+        assert!(!book.asks_contains(3300.0), "farthest ask dropped");
         // Best levels (nearest the mid) survive: highest bid, lowest ask.
         assert_eq!(book.best_bid_px(), 1300.0, "best bid preserved after prune");
         assert_eq!(book.best_ask_px(), 2000.0, "best ask preserved after prune");
         // _last maps mirror the book exactly — no independent leak.
         assert_eq!(book.bid_last_len(), book.bids_len());
         assert_eq!(book.ask_last_len(), book.asks_len());
+    }
+
+    #[test]
+    fn test_churn_baseline_lost_for_pruned_level_reentry() {
+        // Documents an accepted limitation (not a bug): a level pruned as
+        // far-from-mid loses its remembered qty, so if it later re-enters, churn
+        // (bid_abs_change) is measured against a zero baseline instead of the
+        // pre-prune qty. This only affects levels >1000 ranks deep — deep-book
+        // noise dwarfed by near-mid churn. Near-mid metrics stay exact.
+        let bids: Vec<(f64, f64)> = (100..=1400).map(|i| (i as f64, 5.0)).collect();
+        let mut book = OrderBook::new();
+        book.apply_snapshot(snap(bids, vec![]));
+        // 200.0 was pruned (kept range is 401..=1400).
+        assert!(!book.bids_contains(200.0), "level 200 was pruned");
+
+        // Re-add 200.0 at qty 7 via a sync diff. Correct churn would be |7-5|=2,
+        // but the baseline is gone → reported as |7-0|=7.
+        let applied = book
+            .apply_diff(&diff(101, 100, vec![(200.0, 7.0)], vec![]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            applied.bid_abs_change, 7.0,
+            "pruned-level re-entry uses zero churn baseline (accepted limitation)"
+        );
     }
 
     #[test]
