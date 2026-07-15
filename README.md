@@ -154,9 +154,12 @@ symbols = ["ETHUSDT"]   # optional allowlist — see below
 
 ## Deployment
 
-CI (`.github/workflows/`) runs `cargo test` + `clippy` + `fmt` on every push, and builds a
-multi-stage Docker image pushed to `ghcr.io` with the version tag `vYYYYMMDD-{sha7}`. Deployment
-itself is yours to run: pull the image and start it with Compose or `docker run`. See
+`ci.yml` runs `cargo test` + `clippy` + `fmt` on pull requests to `main`. `build.yml` produces the
+multi-stage Docker image and pushes it to `ghcr.io` tagged `vYYYYMMDD-{sha7}` — it is
+**`workflow_dispatch` only**, so merging to `main` does not by itself build or publish anything;
+someone runs the build deliberately.
+
+Deployment is yours to run: pull the image and start it with Compose or `docker run`. See
 `docker-compose.yml` for local development and `docker-compose.prod.yml` as a production reference.
 
 ### Graceful shutdown — set `stop_grace_period`
