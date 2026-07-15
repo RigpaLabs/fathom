@@ -31,11 +31,13 @@ Disallowed changes (require a major version bump):
 1. **Bump schema version** in code and document the new column(s) here
 2. **Update `DATA_DIR`** version suffix (e.g. `v2/`) so the new schema writes to a separate directory tree — old and new data coexist without conflict
 3. **Update consumers** (sigil, ar-quant) to handle the new columns. Since old columns are preserved, consumers can adopt new columns at their own pace
-4. **Blue-green deploy** ensures both old and new fathom instances can run simultaneously with isolated data directories
+4. **Overlap the instances** — old and new fathom can run simultaneously as long as each gets its own `DATA_DIR`, so neither touches the other's files
 
 ## `DATA_DIR` versioning
 
-When `DATA_DIR` is set (typically during deploy), data is written under `{DATA_DIR}/{version}/`. This isolates schema changes between deploys:
+`DATA_DIR` is used verbatim — fathom does not append a version segment of its own. Pass the version
+as part of the path you set (e.g. `DATA_DIR=/data/v2`) and the layout below lands under it, which
+is what isolates schema changes between deploys:
 
 ```
 /data/
@@ -47,6 +49,8 @@ When `DATA_DIR` is set (typically during deploy), data is written under `{DATA_D
     └── raw/
 ```
 
-During blue-green deploy, both versions coexist. Once the new instance is healthy and the old one is stopped, the old version directory can be archived or left in place for historical queries.
+Point the new instance at the new version directory via `DATA_DIR` and both versions coexist while
+the two instances overlap. Once the new one is healthy and the old one is stopped, the old version
+directory can be archived or left in place for historical queries.
 
 This approach avoids in-place schema migrations entirely — each version is a clean, self-contained dataset.

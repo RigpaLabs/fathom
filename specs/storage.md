@@ -35,10 +35,25 @@ stale bucket open); snap_1s.rs/deriv.rs trigger on event time. All four use `Buc
 `close_and_rename` with a tracked last-event-time as the close marker, never wall-clock, so the
 filename's end-HHMM always reflects the data.
 
-Restart-safety: bounding the file granularity to one hour bounds restart data loss to at most the
-single bucket open at crash time, instead of an entire day (docs/adr/005). This is a bounded-loss
-design, not full restart-safety — an `ArrowWriter` that never reaches `.finish()` before a crash
-has no Parquet footer and that bucket's data is entirely unreadable, not partially recoverable.
+Restart-safety: a **graceful** stop (SIGTERM/SIGINT) loses no bucket at all — the writers drain,
+`close()` calls `.finish()` to emit the Parquet footer, and `close_and_rename` renames the partial
+bucket to its final `{prefix}_HHMM_HHMM.parquet` name. A partial bucket is a first-class outcome,
+not a loss: a process stopped at 18:03 leaves a valid `depth_1800_1803.parquet`, and the next
+process opens its own bucket for the same hour.
+
+The one-hour granularity bounds **ungraceful** loss (SIGKILL, OOM, panic — `panic = "abort"`, no
+unwinding) to the single bucket open at that moment, instead of an entire day (docs/adr/005). That
+bucket is lost whole, not partially: an `ArrowWriter` that never reaches `.finish()` has no Parquet
+footer, so its data is unreadable rather than truncated. This is a bounded-loss design, not full
+crash-safety.
+
+The distinction is operational, not academic: it holds only while the shutdown grant exceeds the
+drain. `main.rs` awaits connection tasks sequentially at 5 s each (so that phase alone scales with
+connection count), then awaits the four writers and the NATS sink with **no timeout** — finalize
+takes as long as flush + `.finish()` + rename take. Deployments must set `stop_grace_period`
+accordingly (30 s in `docker-compose.prod.yml`; Docker's default is 10 s). Too small a grant
+converts every planned deploy into the ungraceful case above. See docs/adr/005 for the full
+worst-case breakdown.
 
 ## Volumes (order of magnitude, current symbol set)
 

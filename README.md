@@ -78,7 +78,8 @@ IMAGE_TAG=latest docker compose -f docker-compose.prod.yml up -d
     └── status.json                   # health/monitoring, updated every 30s
 ```
 
-When deployed with `DATA_DIR` env override, files are written under `{data_dir}/{version}/` for blue-green isolation.
+`DATA_DIR` overrides `data_dir` verbatim — the layout above is written directly under whatever path
+you pass. Point two instances at two different paths and they will not touch each other's files.
 
 ### Raw diff columns
 
@@ -149,35 +150,40 @@ symbols = ["ETHUSDT"]   # optional allowlist — see below
 |----------|-------------|
 | `RUST_LOG` | Tracing filter (e.g. `fathom=info`, `fathom=debug`) |
 | `FATHOM_JSON_LOG` | If set, enables structured JSON logging |
-| `DATA_DIR` | Override `data_dir` from config at runtime (used for blue-green deploy) |
+| `DATA_DIR` | Override `data_dir` from config at runtime (lets a second instance write to its own directory) |
 
 ## Deployment
 
-### Blue-green deploy (zero downtime)
+`ci.yml` runs `cargo test` + `clippy` + `fmt` on pull requests to `main`. `build.yml` produces the
+multi-stage Docker image and pushes it to `ghcr.io` tagged `vYYYYMMDD-{sha7}` — it is
+**`workflow_dispatch` only**, so merging to `main` does not by itself build or publish anything;
+someone runs the build deliberately.
 
-Triggered manually via GitHub Actions (`workflow_dispatch`). The pipeline:
+Deployment is yours to run: pull the image and start it with Compose or `docker run`. See
+`docker-compose.yml` for local development and `docker-compose.prod.yml` as a production reference.
 
-1. **CI** — `cargo test` + `clippy` + `fmt` check
-2. **Build** — Docker multi-stage build, pushed to `ghcr.io` with version tag `vYYYYMMDD-{sha7}`
-3. **Deploy** — SSH to VPS:
-   - Pull new image while old container is still running
-   - Start `fathom-new` alongside `fathom` with versioned `DATA_DIR` (no file conflicts)
-   - Poll `status.json` for up to 120s until healthy
-   - If healthy → gracefully stop old container (`docker stop -t 30`, 30s for writers to flush) → rename new to `fathom`
-   - If unhealthy → rollback (remove new container, exit 1)
+### Graceful shutdown — set `stop_grace_period`
 
-Both containers run simultaneously during the health check window. Versioned data directories prevent file conflicts between old and new instances.
+On SIGTERM/SIGINT the process drains rather than dying where it stands:
 
-### Graceful shutdown
+1. A `CancellationToken` fires; connection tasks stop producing.
+2. Connection tasks are awaited **sequentially, 5 s timeout each**.
+3. Broadcast senders drop; the writers drain what is still queued.
+4. Each writer flushes, calls `.finish()` to emit the Parquet footer, and renames its partial
+   bucket to its final `{prefix}_HHMM_HHMM.parquet` name.
+5. The process exits with **no bucket lost** — a run stopped at 18:03 leaves a valid
+   `depth_1800_1803.parquet`.
 
-On SIGTERM/SIGINT:
-1. Connection tasks abort
-2. Writer channel senders drop → receivers drain remaining messages
-3. Raw writer flushes current buffer and closes files
-4. 1s writer flushes row group and writes Parquet footer
-5. Process exits
+**This depends on your deployment granting enough time.** Docker's default grace is 10 s. Step 2
+alone can cost `5s × connections`, and the writer finalize that follows has no timeout at all, so
+`docker-compose.prod.yml` sets `stop_grace_period: 30s` and any real deployment should do the same.
+If the grant expires mid-drain, Docker sends SIGKILL, the open bucket never gets its footer, and
+that bucket is unreadable in full — not truncated. See [ADR-005](docs/adr/005-acceptable-data-loss-window.md).
 
-Docker `stop_grace_period: 30s` gives writers enough time to complete.
+A planned restart still costs the WebSocket gap (disconnect → reconnect → resync), measured at
+~3 s. If that matters for your use case, `DATA_DIR` overrides `data_dir` at runtime, so a second
+instance can warm up against its own directory before you stop the first; overlapping instances
+produce duplicate rows rather than a gap, which you dedupe when reading.
 
 ### Health check
 

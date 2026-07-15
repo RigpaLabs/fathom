@@ -155,7 +155,7 @@ Data is written to `{data_dir}/` (configured in `config.toml`). When `DATA_DIR` 
 
 ## Deployment
 
-CI builds and pushes Docker images to GHCR on every push to `main`. Deploy to your own infrastructure by pulling the image and running via Docker Compose or `docker run`.
+`ci.yml` runs tests/clippy/fmt on PRs to `main`. `build.yml` pushes the image to GHCR (`vYYYYMMDD-{sha7}`) and is **`workflow_dispatch` only** — merging to `main` publishes nothing on its own. Deploy to your own infrastructure by pulling the image and running via Docker Compose or `docker run`.
 
 See `docker-compose.yml` for local dev and `docker-compose.prod.yml` for production reference.
 

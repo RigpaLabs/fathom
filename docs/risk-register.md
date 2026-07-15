@@ -24,9 +24,9 @@ Known risks, their severity, and mitigations.
 
 | | |
 |---|---|
-| **Risk** | Fathom runs on a single EC2 instance. If the instance goes down, data collection stops for all 22 symbols across 4 exchanges. |
+| **Risk** | Fathom is a single process on a single host. If the host goes down, collection stops for every configured symbol and venue at once. |
 | **Severity** | Medium |
-| **Mitigation** | Blue-green deploy enables quick recovery (< 5 min). `status.json` health check enables external monitoring (Uptime Kuma). Docker `restart: unless-stopped` handles process crashes. NATS streaming provides a secondary data path for consumers that can tolerate gaps. |
+| **Mitigation** | `status.json` (updated every 30 s) exposes health for external monitoring. Docker `restart: unless-stopped` handles process crashes. NATS streaming gives consumers a secondary data path where they can tolerate gaps. A planned restart is cheap by design: writers finalize their buckets on SIGTERM and only the WebSocket resync gap (~3 s) is lost — provided `stop_grace_period` exceeds the drain (docs/adr/005). Host loss itself is unmitigated: there is no standby and no cross-host redundancy. |
 | **Status** | Known, accepted |
 
 ## 4. Exchange WebSocket API changes
