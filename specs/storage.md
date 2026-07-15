@@ -48,10 +48,12 @@ footer, so its data is unreadable rather than truncated. This is a bounded-loss 
 crash-safety.
 
 The distinction is operational, not academic: it holds only while the shutdown grant exceeds the
-drain. `main.rs` awaits connection tasks sequentially at 5 s each, so the worst-case drain scales
-with connection count — deployments must set `stop_grace_period` accordingly (30 s in
-`docker-compose.prod.yml`; Docker's default is 10 s). Too small a grant converts every planned
-deploy into the ungraceful case above.
+drain. `main.rs` awaits connection tasks sequentially at 5 s each (so that phase alone scales with
+connection count), then awaits the four writers and the NATS sink with **no timeout** — finalize
+takes as long as flush + `.finish()` + rename take. Deployments must set `stop_grace_period`
+accordingly (30 s in `docker-compose.prod.yml`; Docker's default is 10 s). Too small a grant
+converts every planned deploy into the ungraceful case above. See docs/adr/005 for the full
+worst-case breakdown.
 
 ## Volumes (order of magnitude, current symbol set)
 

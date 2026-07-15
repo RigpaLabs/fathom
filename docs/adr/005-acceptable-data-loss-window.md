@@ -58,13 +58,26 @@ On SIGTERM/SIGINT:
 6. Partial buckets are renamed to their final `{prefix}_HHMM_HHMM.parquet` names.
 7. Process exits cleanly — **zero bucket loss** on graceful shutdown.
 
-**This requires the deployment to grant enough time — it is a precondition, not a given.** Step 2
-is sequential, so the worst-case drain is `5s × connections`, which grows as venues and symbols are
-added; observed drains are ~1.5 s because connections honour the cancel token immediately. Docker's
-default grace is **10 s**, which is already below the worst case. Deployments must set
-`stop_grace_period: 30s` (as `docker-compose.prod.yml` does). If the grant expires, Docker sends
-SIGKILL mid-drain and the open bucket is lost whole — see the 2026-07-15 erratum, where this
-requirement went unmet in production for months.
+**This requires the deployment to grant enough time — it is a precondition, not a given.**
+
+Only step 2 is time-bounded. Its `5s` timeout is *per connection* and the loop is sequential, so
+that phase alone costs up to `5s × connections` and grows as venues and symbols are added. Steps
+3-6 have **no timeout at all** (`raw_handle.await` and friends in `src/main.rs`): writer finalize
+is bounded only by how long the flush, `.finish()` and rename actually take, which depends on
+buffered rows and disk. Under disk pressure (see `specs/storage.md`, "no retention") that is not
+hypothetical. So the honest worst case is:
+
+```
+(≤5s × connections)  +  (writer finalize + NATS drain, unbounded)
+```
+
+Observed drains are ~1.5 s total, because connections honour the cancel token immediately and the
+writers finalize fast. Docker's default grace is **10 s**, already below the bounded phase alone at
+today's connection count. Deployments must set `stop_grace_period: 30s` (as
+`docker-compose.prod.yml` does). If the grant expires, Docker sends SIGKILL mid-drain and the open
+bucket is lost whole — see the 2026-07-15 erratum, where this requirement went unmet in production
+for months. Note that no grant is a *guarantee* while the finalize phase is unbounded; 30 s buys
+headroom against the drain we can measure, not a proof.
 
 ### NATS sink
 
@@ -148,7 +161,7 @@ configured `raw_rotate_hours` bucket, currently 1h in prod/default.** The 5s/5mi
 tables above remain correct descriptions of steady-state buffering loss for a process that keeps
 running; they are not the restart bound for any writer, not just snap/deriv.
 
-## Erratum (2026-07-15): a planned deploy costs seconds, not a bucket
+## Errata (2026-07-15): a planned deploy costs seconds, not a bucket
 
 The bounds above are so heavily qualified with "restart" that they have been read as *"every
 restart destroys the open bucket"*, and that reading was used to justify designing a two-instance
@@ -157,7 +170,7 @@ is a graceful stop, and a graceful stop loses no bucket.
 
 Measured on a production restart, 2026-07-14 18:03 UTC:
 
-| | |
+| Observation | Value |
 |---|---|
 | Partial bucket, old process | `depth_1800_1803.parquet` — footer intact, **2139 rows**, events 18:00:00.068 → 18:03:38.164 |
 | Drain duration | ~1.5 s (last event 18:03:38.164 → rename 18:03:39.69) |
@@ -165,22 +178,41 @@ Measured on a production restart, 2026-07-14 18:03 UTC:
 | **Actual data gap** | **≈3.2 s** of depth diffs, ~3 rows/symbol of 1s snaps |
 
 The old process closed its 3-minute bucket into a valid file; the new one opened its own for the
-same hour (`depth_1800_1859.parquet`). Both coexist — `Bucket::close_and_rename` handles the
-name collision. The only real cost of a restart is the WebSocket gap: disconnect → connect →
+same hour and closed it at 18:59 (`depth_1800_1859.parquet`). The two coexist naturally: the
+end-HHMM comes from each writer's own last-event time, so same-hour buckets from different
+processes get different names and never collide. (`Bucket::close_and_rename`'s `_2`/`_3` suffix
+branch is for the narrower case of two closes landing on an identical end-HHMM; this restart did
+not exercise it.) The only real cost of a restart is the WebSocket gap: disconnect → connect →
 resync, a few seconds.
 
-**Precondition — the grant must exceed the drain.** This ADR's "Graceful shutdown" section states
+**Precondition — the grant must exceed the drain.** This ADR's "Graceful shutdown" section stated
 `stop_grace_period: 30s` as if it were a fact of the system. It is not; it is a *requirement on the
 deployment*, and it was not met. The production Compose file never set it, so fathom ran with
 Docker's 10 s default (`docker inspect` → `StopTimeout=<nil>`) for its entire life until
-2026-07-15, when it was set to 30 s. The graceful path had been working on luck: `main.rs` awaits
-connection tasks **sequentially at 5 s each**, so the worst-case drain is `5s × connections` (35 s
-at 7 connections) against a 10 s grant. Connections normally exit on the cancel token within
-milliseconds — hence the 1.5 s above — but one hung connection would have turned a routine deploy
-into precisely the unbounded-loss case this ADR warns about.
+2026-07-15, when it was set to 30 s.
 
-`docker-compose.prod.yml` in this repo had the 30 s grant all along. The drift was in the private
-deployment, which is exactly where a doc stating a precondition as a fact stops being checkable.
+The graceful path had been working on luck. The bounded phase alone costs `5s × connections`
+(connections as configured in the private deployment, 7 as of 2026-07-15 — this repo's reference
+`config.toml` enables fewer; the number is a property of a deployment, not of this repo, so treat
+it as a dated observation rather than a constant), and the finalize phase after it is unbounded.
+Against a 10 s grant, either phase could have overrun. It never did, because connections honour
+the cancel token promptly and writers finalize fast — hence the 1.5 s measured above.
+
+"Promptly" is not "always immediately": a connection sitting in a reconnect or rate-limit backoff
+sleep (e.g. `src/connection/binance.rs`'s `sleep_backoff`) does not race that sleep against
+cancellation, so it only notices on wake, capped by its 5 s timeout. A deploy that lands while
+several connections are backing off is the realistic bad case — likelier than the "one hung
+connection" framing suggests, since backoff is normal operation, not a fault.
+
+**Where the 30 s came from — and how it evaporated.** The figure was never arbitrary: the original
+deploy procedure (a GitHub Actions blue-green pipeline, documented in README) stopped the old
+container with an explicit `docker stop -t 30`. This ADR then recorded 30 s as though the system
+had it. When deployment moved to an external Compose-based setup, that procedure and its `-t 30`
+disappeared together, and nothing carried the grant across; the ADR kept asserting it. A number
+that lives in a deploy script and is restated as a fact in a doc has no owner once the script dies.
+`docker-compose.prod.yml` in this repo happened to carry `stop_grace_period: 30s` from its first
+commit, so the reference config stayed correct while the actual deployment drifted — which is
+exactly where a doc that states a precondition as a fact stops being checkable.
 
 **When quoting this ADR:** the bounded-loss figures answer *"what does a crash cost?"*. They do not
 answer *"what does a deploy cost?"* — that answer is ~3 s, and it is bounded by WebSocket resync,

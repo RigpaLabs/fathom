@@ -47,6 +47,8 @@ When `DATA_DIR` is set (typically during deploy), data is written under `{DATA_D
     └── raw/
 ```
 
-During blue-green deploy, both versions coexist. Once the new instance is healthy and the old one is stopped, the old version directory can be archived or left in place for historical queries.
+Point the new instance at the new version directory via `DATA_DIR` and both versions coexist while
+the two instances overlap. Once the new one is healthy and the old one is stopped, the old version
+directory can be archived or left in place for historical queries.
 
 This approach avoids in-place schema migrations entirely — each version is a clean, self-contained dataset.
